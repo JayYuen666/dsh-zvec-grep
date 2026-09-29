@@ -1,0 +1,15 @@
+# zvec-grep（2026-09-01）：工作区语义检索插件（zg）。
+# 3 个工具：zg_search（语义/混合检索，需已建索引）/ zg_index（建/重建/删索引，
+# confirm 强制 true）/ zg_status（索引状态）。后端 zg CLI --mode direct（不经
+# 守护进程），经 ctx.shell 调用；root 走 workdir/转义位置参数，防注入。
+# systemPrompt 规则段 order 1550 + tools.guard 安全兜底；本地 embedding 设置
+# 卡片（defaultEmbedding 默认 local/qwen3-embedding-0.6b，qwen3 需 node-llama-cpp）。
+# hfEndpoint 默认 https://modelscope.cn/models（国内 HF 不可达，已实测可下载 qwen3）。
+#
+# 组合包层（2026-09-05 bundle 化）：本文件由 package.json 的 dsh.bundle.patch
+# 指向，随 `dsh plugin --profile web add/remove ./plugins/zvec-grep` 维护。
+# 行按裸包名引用本包（client-modules 只扫描裸包名条目的 dsh.client 声明）。
+# 注意 pnpm ≥12.3.0：12.0.0 的 add 本地目录有 #14437 bug。
+- insert:
+    - id: zvec-grep
+      name: "@jayyuen666/dsh-zvec-grep"
