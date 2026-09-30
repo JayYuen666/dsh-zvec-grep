@@ -417,7 +417,7 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
     const { ctx, trace } = makeHost(form);
     apply(ctx);
     // 0.1.7 起 settings 命名空间 = 本包 cordis.patch.yml 的裸条目 id（不是
-    // @jayyuen666/dsh-zvec-grep）：configForms.get() 把入参原样当命名空间用（installed
+    // @jayyuen66/dsh-zvec-grep）：configForms.get() 把入参原样当命名空间用（installed
     // dsh-client-ui-settings/lib/client.js:1309-1315）。id 取自 patch 文件，不在测试里抄。
     const bareIds = patchEntryIds();
     assert.deepEqual(bareIds, ["zvec-grep"], "cordis.patch.yml 只声明一行裸条目 id");

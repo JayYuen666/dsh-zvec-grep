@@ -24,8 +24,8 @@ import {
   unlockActive,
 } from "./search-predicates.ts";
 import type { SearchUnlock } from "./search-predicates.ts";
-import { isRecord } from "@jayyuen666/dsh-plugin-shared/lib/record";
-import { errorText } from "@jayyuen666/dsh-plugin-shared/lib/errors";
+import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 
 /** 紧跟 TOOL_GREP(1500) 之后、TOOL_JOBS(1600) 之前。 */
 export const ROUTING_ORDER = 1550;

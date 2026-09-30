@@ -12,7 +12,7 @@
 // 双语说明），但两侧都没有渲染点——卡片的 <select> 只显示「引用（维度）」，于是那行人读
 // 口径回到 lib/embedding-catalog.ts 的注释里：没有消费者的文案不建表。
 
-import type { MessagesCatalog } from "@jayyuen666/dsh-plugin-shared/lib/locale";
+import type { MessagesCatalog } from "@jayyuen66/dsh-plugin-shared/lib/locale";
 
 /** 本包 host 侧产出的全部人读文案（工具描述、工具回显、guard 理由、端点错误）。 */
 export interface ZvecGrepMessages {

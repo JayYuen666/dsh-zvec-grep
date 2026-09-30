@@ -9,7 +9,7 @@
 // 带变量的整行写成 `{name}` 模板（官方 Translate 的插值），片段仍在本表内。
 // lib/card-logic.ts 用到的那几个键在 CardTextKey 里收窄（lib 不反向 import src）。
 import type { TranslateNS as OfficialTranslateNS } from "@deepseek-ai/dsh-client-ui-slots";
-import type { MessagesCatalog } from "@jayyuen666/dsh-plugin-shared/lib/locale";
+import type { MessagesCatalog } from "@jayyuen66/dsh-plugin-shared/lib/locale";
 
 /** 本包设置卡产出的全部界面文案。 */
 export interface UiMessages {

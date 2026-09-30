@@ -15,7 +15,7 @@ import type { ConfigForm, ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-
 // 只管「六个字段各显示什么」。
 import { draftOf, numberText } from "./card-draft.ts";
 import { DEFAULT_EMBEDDING } from "./embedding-catalog.ts";
-import { isRecord } from "@jayyuen666/dsh-plugin-shared/lib/record";
+import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 
 /**
  * 本文件用到的 UI 文案键（字典在 src/ui-messages.ts：漏一个键或名字打错，

@@ -1,4 +1,4 @@
-# @jayyuen666/dsh-zvec-grep
+# @jayyuen66/dsh-zvec-grep
 
 [中文](#中文) · [English](#english)
 
@@ -13,13 +13,11 @@
 ### 安装
 
 ```sh
-npm config --global @jayyuen666:registry=https://npm.pkg.github.com
-printf '//npm.pkg.github.com/:_authToken=<PAT:read:packages>\n' >> ~/.npmrc
-dsh plugin --profile web add @jayyuen666/dsh-zvec-grep
+dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 ```
 
-- GitHub Packages 连「读」也要凭据，故先配 registry 与 token；发布态产物只有 host.js、client.js、cordis.patch.yml（package.json 的 files）。
-- 运行期值 import `@jayyuen666/dsh-plugin-shared`（lib/http、lib/locale）与 `@deepseek-ai/schemastery`（宿主 fork：0.1.7 的 `.volatile()` 解析只有它有实现，公共 schemastery 既没这个方法、解析出的也仍是普通值），两者都在 dependencies 里，装不上就是 ERR_MODULE_NOT_FOUND。
+- 包在公共 npm 上，安装不需要凭据；发布态产物只有 host.js、client.js、cordis.patch.yml（package.json 的 files）。
+- 运行期值 import `@jayyuen66/dsh-plugin-shared`（lib/http、lib/locale）与 `@deepseek-ai/schemastery`（宿主 fork：0.1.7 的 `.volatile()` 解析只有它有实现，公共 schemastery 既没这个方法、解析出的也仍是普通值），两者都在 dependencies 里，装不上就是 ERR_MODULE_NOT_FOUND。
 
 ### 在 dsh 里启用
 
@@ -123,13 +121,11 @@ dsh plugin --profile web add @jayyuen666/dsh-zvec-grep
 ### Installation
 
 ```sh
-npm config --global @jayyuen666:registry=https://npm.pkg.github.com
-printf '//npm.pkg.github.com/:_authToken=<PAT:read:packages>\n' >> ~/.npmrc
-dsh plugin --profile web add @jayyuen666/dsh-zvec-grep
+dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 ```
 
-- GitHub Packages requires credentials even to read, hence the registry + token lines first; the published artifact only carries host.js, client.js and cordis.patch.yml (the files field in package.json).
-- Runtime value imports are `@jayyuen666/dsh-plugin-shared` (lib/http, lib/locale) and `@deepseek-ai/schemastery` (the host's fork — the only one whose resolve wraps `.volatile()` fields into `Volatile` references); both sit in dependencies.
+- The packages are on the public npm registry, so no credentials are needed; the published artifact only carries host.js, client.js and cordis.patch.yml (the files field in package.json).
+- Runtime value imports are `@jayyuen66/dsh-plugin-shared` (lib/http, lib/locale) and `@deepseek-ai/schemastery` (the host's fork — the only one whose resolve wraps `.volatile()` fields into `Volatile` references); both sit in dependencies.
   - Missing either one is `ERR_MODULE_NOT_FOUND` at load, not a graceful downgrade — that is also why the fork cannot be swapped for public `schemastery`.
 
 ### Enabling it in dsh

@@ -89,9 +89,9 @@ import type { TimerService } from "@deepseek-ai/cordis-plugin-timer";
 // 共享 webServer 样板：sendJson/queryParam/guardBody（自家 isCrossOrigin 支在信任闸门
 // 落地后不可达，已随那道闸门收敛）
 // 与 session-rescue/lesson-loop/ocr-review 原来各自复制，现统一由 shared 提供。
-import { sendJson, queryParam, guardBody } from "@jayyuen666/dsh-plugin-shared/lib/http";
+import { sendJson, queryParam, guardBody } from "@jayyuen66/dsh-plugin-shared/lib/http";
 // 信任闸门：三条路由 handler 的第一条语句。
-import { guardTrust } from "@jayyuen666/dsh-plugin-shared/lib/trust";
+import { guardTrust } from "@jayyuen66/dsh-plugin-shared/lib/trust";
 import { DEFAULT_EMBEDDING, isLocalEmbedding } from "./lib/embedding-catalog.ts";
 import {
   assertAbsoluteRoot,
@@ -126,17 +126,17 @@ import {
   LOCALE_SETTINGS_NAMESPACE,
   messagesFor,
   resolveLocalePreference,
-} from "@jayyuen666/dsh-plugin-shared/lib/locale";
+} from "@jayyuen66/dsh-plugin-shared/lib/locale";
 // 代理对安全的定长截断（前切面已交官方 output-retention，后切面仍在本仓；
 // 语义与官方件的实测差异见 shared/lib/text.ts 头注释）：本包的切点
 // 吃的是**仓库文件内容**（CJK 密度最高的那道流），裸 slice 会在切点留下孤立高/低代理，
 // 而这三处的产物都进会话日志（失败消息 / 成功结果里的 stderr 注）。
-import { truncateEnd, truncateStart } from "@jayyuen666/dsh-plugin-shared/lib/text";
-import { isRecord } from "@jayyuen666/dsh-plugin-shared/lib/record";
-import { errorText } from "@jayyuen666/dsh-plugin-shared/lib/errors";
+import { truncateEnd, truncateStart } from "@jayyuen66/dsh-plugin-shared/lib/text";
+import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 // 落定进程 → 官方作业结局的映射与 ocr-review 逐字同构，收在 shared（口径本身
 // 抄的是宿主 bash 工具的 processOutcome，见该文件头）。
-import { jobOutcomeOf } from "@jayyuen666/dsh-plugin-shared/lib/job-outcome";
+import { jobOutcomeOf } from "@jayyuen66/dsh-plugin-shared/lib/job-outcome";
 
 // 官方给生产者的 kind 扩展点（installed dsh-jobs/lib/types/view.d.ts:26 的 JobKindMap，
 // dsh-tool-pwsh / dsh-tool-workflow 同款写法）：kind 既是 id 命名空间也是 id 前缀。

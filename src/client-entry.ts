@@ -1,6 +1,6 @@
 // Client half of the zvec-grep settings card（TS 源码，build-client.mjs 打包）。
 // React 由模块系统 require('react') 提供（rolldown external）；只用 createElement。
-// 卡片注册进 keyed plugins.bundle.config 槽的 **bundle 包名**键（`@jayyuen666/dsh-zvec-grep`，
+// 卡片注册进 keyed plugins.bundle.config 槽的 **bundle 包名**键（`@jayyuen66/dsh-zvec-grep`，
 // 见 BUNDLE_PKG），读写走 ctx.configForms.get('zvec-grep')——0.1.7 起 settings 命名空间
 // 就是 profile 条目 id（host.ts 只导出带 .volatile() 字段的 Config，不再 register），
 // 两侧同一个 id 即同源；
@@ -38,7 +38,7 @@ import {
 import type { CardFields, CardSnapshot, SettingScope } from "../lib/card-logic.ts";
 import { UI_MESSAGES } from "./ui-messages.ts";
 import type { LocaleNs, Translate, UiMessages } from "./ui-messages.ts";
-import { errorText } from "@jayyuen666/dsh-plugin-shared/lib/errors";
+import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 
 export { cardStore, draftFields, parseRebuildPoll, resolveLimitInput } from "../lib/card-logic.ts";
 
@@ -61,7 +61,7 @@ const NS: LocaleNs = "zvec-grep";
  * test/build-client.test.ts 从 `~/.dsh/profiles/web/package.json` 解析校验，不在此处硬抄。
  * 设置命名空间**不跟着改**：`ctx.configForms.get(entryId)` 仍吃裸条目 id（见 apply）。
  */
-const BUNDLE_PKG = "@jayyuen666/dsh-zvec-grep";
+const BUNDLE_PKG = "@jayyuen66/dsh-zvec-grep";
 const REBUILD_ROOTS_URL = "/_dsh/zvec-grep/rebuild-roots";
 const REBUILD_URL = "/_dsh/zvec-grep/rebuild";
 const REBUILD_STATUS_URL = "/_dsh/zvec-grep/rebuild-status";
