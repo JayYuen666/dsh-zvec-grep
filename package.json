@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-zvec-grep",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "dsh 工作区语义检索插件（zg）：zg_search / zg_index / zg_status + 本地 embedding 设置卡片 + systemPrompt 路由规则 + guard 安全兜底。",
   "license": "MIT",
   "author": "JayYuen",
@@ -47,7 +47,7 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "3.18.4",
-    "@jayyuen66/dsh-plugin-shared": "^1.0.0"
+    "@jayyuen66/dsh-plugin-shared": "^0.1.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
