@@ -14,6 +14,7 @@ import {
   DEFAULT_GREP_BUDGET,
   DEFAULT_UNLOCK_WINDOW_MIN,
   INDEX_DIR_NAME,
+  WORKSPACE_MANIFEST_FILE,
 } from "../lib/routing.ts";
 import type { SearchFirstDeps } from "../lib/routing.ts";
 import {
@@ -38,6 +39,8 @@ const zhMessages = MESSAGES.zh;
  * 引过来就等于让常量自己给自己作证，改名再也不会红。
  */
 const EXPECTED_INDEX_DIR = ".zvec-grep";
+/** workspace manifest 文件名：同上，故意不引生产常量。 */
+const EXPECTED_MANIFEST_FILE = "manifest.json";
 
 /**
  * 索引根（`"/repo"`）之下的子目录：会话工作区开在子包、索引建在仓库根的形态，
@@ -279,8 +282,9 @@ describe("hasExternalTarget", () => {
 const probeOf = (dirs: Set<string>) => (dir: string) => dirs.has(dir);
 
 describe("findIndexRoot", () => {
-  it("索引目录名常量与 zg 落盘一致", () => {
+  it("索引目录名与 manifest 文件名常量都与 zg 落盘一致", () => {
     assert.equal(INDEX_DIR_NAME, EXPECTED_INDEX_DIR);
+    assert.equal(WORKSPACE_MANIFEST_FILE, EXPECTED_MANIFEST_FILE);
   });
 
   it("本层命中", () => {

@@ -180,6 +180,15 @@ export function zgGuard(execution: GuardExecution, messages: ZvecGrepMessages): 
 export const INDEX_DIR_NAME = ".zvec-grep";
 
 /**
+ * 工作区索引的判别文件名（上游 `@zvec/zvec` 的 `WORKSPACE_MANIFEST_FILE`，同名同值）：
+ * 写在 `<root>/.zvec-grep/manifest.json`。**只判目录名不足以认出索引**——
+ * `.zvec-grep` 这个名字同时被 zg 自己的全局 home 征用
+ * （`ZVEC_GREP_HOME ?? ~/.zvec-grep`，装的是 config.json / locks / models），
+ * 于是一个从没建过索引、只是祖先目录撞名的普通工作区也会被当成「已建索引」。
+ */
+export const WORKSPACE_MANIFEST_FILE = "manifest.json";
+
+/**
  * 从 startDir 向上找含 zg 索引库的最近祖先（含自身），返回该索引根。
  * 会话工作区可能是索引根的子目录（如索引在仓库根、会话开在子包）——不向上走
  * 会漏拦。probe 注入（宿主用 existsSync），本函数保持纯函数可单测。

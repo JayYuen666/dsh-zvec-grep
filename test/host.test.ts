@@ -10,7 +10,7 @@
 // Promise.withResolvers（运行时 Node≥22 可用；lib=ES2024 无该静态成员故类型借道 cast）。
 import { describe, it, beforeAll, afterAll } from "vitest";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import path from "node:path";
 import vm from "node:vm";
@@ -54,6 +54,18 @@ const ZG_NOT_INSTALLED = "zg: command not found";
  * 引常量等于「造出来的目录名跟着一起改」→ 门禁照样命中，测试就永远不会红。
  */
 const ZG_INDEX_DIR = ".zvec-grep";
+/**
+ * workspace manifest 文件名（<root>/.zvec-grep/manifest.json）。门禁只在**它也在场**时
+ * 才认这个工作区建过索引——`.zvec-grep` 这个名字同时是 zg 全局 home 的目录名，只判目录
+ * 会把祖先撞名的普通工作区误判成已建索引。同值独立抄一份，理由同上。
+ */
+const ZG_MANIFEST_FILE = "manifest.json";
+
+/** 在 root 下造出一个「真建过索引」的索引库（目录 + manifest）。 */
+function makeIndexed(root: string): void {
+  mkdirSync(path.join(root, ZG_INDEX_DIR));
+  writeFileSync(path.join(root, ZG_INDEX_DIR, ZG_MANIFEST_FILE), "{}\n");
+}
 /**
  * 官方输出环的**字节**留存上限（宿主默认值，离线台架实测见 plugins/docs/harness/f3-equiv/probe-jobs.mjs）。
  * 换装前这里是本包自己的 `JOB_OUT_MAX_BYTES`（名义字节、实按 UTF-16 码元）；换装后
@@ -2575,7 +2587,7 @@ describe("zvec-grep 行级 config 与 required 校验", () => {
     const ctx = makeCtx();
     const root = ws("row-off");
     // search-first 只在「该工作区已建索引」时才可能拦，故先造一个索引目录
-    mkdirSync(path.join(root, ZG_INDEX_DIR));
+    makeIndexed(root);
     applyTo(ctx, { defaultLimit: undefined, enforceSearchFirst: false });
     ctx.shell.runResults.push(okRun("RESULT"));
     await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
@@ -2822,7 +2834,7 @@ describe("search-first 门禁", () => {
   function setup(settings?: Record<string, unknown>): (exec: GuardExec) => string | undefined {
     tmp = mkdtempSync(path.join(tmpdir(), "zvec-grep-gate-"));
     createdDirs.push(tmp);
-    mkdirSync(path.join(tmp, ZG_INDEX_DIR));
+    makeIndexed(tmp);
     ctx = makeCtx();
     if (settings) {
       Object.assign(ctx.settingsValue, settings);
@@ -2838,6 +2850,26 @@ describe("search-first 门禁", () => {
   } => ({ session: { id, header: { cwd: tmp } } });
 
   const searchTool = (): CapturedTool => toolOf(ctx, "zg_search");
+
+  it("只有 .zvec-grep/ 而没有 manifest → 不算已建索引，grep 直接放行（撞名回归）", () => {
+    // 回归钉点：`.zvec-grep` 这个目录名同时是 zg **全局 home** 的名字
+    // （`ZVEC_GREP_HOME ?? ~/.zvec-grep`，装 config.json / locks / models）。
+    // 探测若只看目录存在，一个祖先恰好是 zg 全局 home 的工作区会被误判成已建索引——
+    // 门禁随即在无索引可搜的情况下拦下 grep，而 zg_search 也答不出东西。
+    // 分界是 workspace manifest：只有它在场才说明这个工作区真建过索引。
+    tmp = mkdtempSync(path.join(tmpdir(), "zvec-grep-gate-homeonly-"));
+    createdDirs.push(tmp);
+    mkdirSync(path.join(tmp, ZG_INDEX_DIR));
+    writeFileSync(path.join(tmp, ZG_INDEX_DIR, "config.json"), "{}\n");
+    ctx = makeCtx();
+    applyTo(ctx);
+    const reason = guardOf(ctx)({
+      name: "bash",
+      arguments: { command: "grep -r TODO ." },
+      agent: { session: { id: "sess-home", header: { cwd: tmp } } },
+    });
+    assert.equal(reason, undefined, "没有 manifest 就该当没建索引，不拦");
+  });
 
   it("bash grep/rg 未 zg_search 前被拒，消息含索引根与出路", () => {
     const guard = setup();
@@ -3077,7 +3109,7 @@ describe("search-first 门禁", () => {
     // 锁死「读不到」不等于「用户关了门禁」——静默放行检索顺序违规才是更坏的失败。
     tmp = mkdtempSync(path.join(tmpdir(), "zvec-grep-gate-empty-"));
     createdDirs.push(tmp);
-    mkdirSync(path.join(tmp, ZG_INDEX_DIR));
+    makeIndexed(tmp);
     ctx = makeCtx();
     ctx.settingsValue = {};
     applyTo(ctx);

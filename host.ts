@@ -113,6 +113,7 @@ import {
   DEFAULT_GREP_BUDGET,
   DEFAULT_UNLOCK_WINDOW_MIN,
   INDEX_DIR_NAME,
+  WORKSPACE_MANIFEST_FILE,
 } from "./lib/routing.ts";
 import type { GuardExecution } from "./lib/routing.ts";
 // 判据层（解锁额度的形状与 root 归一化）住在 lib/search-predicates.ts：宿主既按索引根建
@@ -693,9 +694,18 @@ function readEnforceSearchFirst(config: Config): boolean {
   return config.enforceSearchFirst.get() ?? true;
 }
 
-/** zg 索引库存在性探测（search-first 门禁与 zg_search 登记共用）。 */
+/** zg 索引库存在性探测（search-first 门禁与 zg_search 登记共用）。
+ *  必须连 workspace manifest 一起看：`<dir>/.zvec-grep/` 这个名字被 zg 自己的**全局
+ *  home** 征用（`ZVEC_GREP_HOME ?? ~/.zvec-grep`，装的是 config.json / locks / models），
+ *  只判目录存在的话，一个从没建过索引的工作区会因祖先目录撞名而被当成「已建索引」——
+ *  门禁随即在没有任何索引可搜的情况下拦下 grep/rg，而 zg_search 也答不出任何东西。
+ *  manifest 是上游写索引时落的那一份（`writeWorkspaceManifest`），只有它在场，
+ *  才说明这个工作区真的建过索引。 */
 function indexProbeOf(dir: string): boolean {
-  return existsSync(`${dir}/${INDEX_DIR_NAME}`);
+  return (
+    existsSync(`${dir}/${INDEX_DIR_NAME}`) &&
+    existsSync(`${dir}/${INDEX_DIR_NAME}/${WORKSPACE_MANIFEST_FILE}`)
+  );
 }
 
 // ── 工具注册辅助 ───────────────────────────────────────────────────────────

@@ -50,6 +50,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - 目录不存在时单报「root 目录不存在」，不冒成 spawn ENOENT。
 - guard 与 execute 用同一套 root 判据，避免「guard 放行、execute 抛错」说两遍。
 - 解锁按「会话 × 索引根」计：每次成功 zg_search 重置为 grepBudgetPerSearch 次、unlockWindowMin 分钟有效；索引根是 root 自身或含索引的最近祖先（最多上溯 8 层）。
+- 「含索引」的判据是 `<root>/.zvec-grep/manifest.json` 在盘上，**只判 `.zvec-grep` 目录名不够**：这个名字同时是 zg 自己的全局 home（`ZVEC_GREP_HOME ?? ~/.zvec-grep`，装的是 config.json / locks / models），只判目录名会让一个从未建索引、只是祖先目录撞名的普通工作区也被门禁拦下。
 - enforceSearchFirst=false 只关掉门禁，zg_* 的安全兜底（confirm、root 判据）不受影响。
 
 ### 外部依赖（rg）
@@ -164,6 +165,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - A missing directory is reported as "root does not exist" instead of a bare spawn ENOENT.
 - The guard and execute share exactly this root predicate, so nothing is refused twice with different wording.
 - Unlocks are counted per "session x index root": each successful zg_search resets to grepBudgetPerSearch calls valid for unlockWindowMin minutes; the index root is the root itself or its nearest indexed ancestor (up to 8 levels up).
+- "Indexed" means `<root>/.zvec-grep/manifest.json` is on disk; **the directory name alone is not enough**: the same `.zvec-grep` name is also zg's own global home (`ZVEC_GREP_HOME ?? ~/.zvec-grep`, holding config.json / locks / models), so a plain workspace that never built an index but merely collides on an ancestor's name would get gated too.
 - enforceSearchFirst=false disables only the gate; the zg_* backstop (confirm, root rules) is unaffected.
 
 ### External dependency (rg)
