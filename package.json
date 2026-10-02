@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-zvec-grep",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "dsh 工作区语义检索插件（zg）：zg_search / zg_index / zg_status + 本地 embedding 设置卡片 + systemPrompt 路由规则 + guard 安全兜底。",
   "license": "MIT",
   "author": "JayYuen",

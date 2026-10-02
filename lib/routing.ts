@@ -52,8 +52,13 @@ type ZgToolName = (typeof ZG_TOOLS)[number];
  */
 const ZG_TOOL_NAMES: ReadonlySet<string> = new Set<string>(ZG_TOOLS);
 
-/** 运行时判定 + 类型窄化：`name` 是否是本包注册的 zg_* 工具。 */
-function isZgToolName(name: unknown): name is ZgToolName {
+/**
+ * 运行时判定 + 类型窄化：`name` 是否是本包注册的 zg_* 工具。
+ *
+ * 也被 host.ts 的 pre-execute 确认闸用（只对 zg_* 发问，别家的工具不该被本插件拦）。
+ * 判据仍只有 ZG_TOOLS 一处来源，故那边不再抄一份工具名单。
+ */
+export function isZgToolName(name: unknown): name is ZgToolName {
   return typeof name === "string" && ZG_TOOL_NAMES.has(name);
 }
 
@@ -91,6 +96,13 @@ export type SessionFace = {
    *  访问钉死；这里把 header 留可选，是因为 agent 无 session 的执行体真实存在。 */
   readonly header?: {
     readonly cwd?: OfficialSession["header"]["cwd"];
+    /**
+     * 官方 `SessionHeader.parentSession?`：「本会话从哪一个会话分叉而来」。子代理会话就是
+     * 这样挂到主会话下面的，故它是「同一棵委派树」的权威依据。
+     * 与 `cwd` 同一口径按 `unknown` 读：宿主从磁盘 header 复原的值不经任何校验，形状未必
+     * 是那个品牌串；真要用时 `rootSessionKeyOf` 先 typeof 收窄，非字符串按「没有父」处理。
+     */
+    readonly parentSession?: unknown;
   };
 };
 
@@ -214,6 +226,9 @@ export function findIndexRoot(
   return found;
 }
 
+/** 无会话身份时的共享桶名（沿用旧常量，不另起一个同义值）。 */
+export const SHARED_SESSION_KEY = "__anonymous__";
+
 /** 会话状态分片键：session.id（字符串/数字）→ 稳定键；无 id 归入共享桶。 */
 export function sessionKeyOf(execution: GuardExecution | undefined): string {
   // 官方是 `Session.id: SessionId`（品牌串），值域按 unknown 读：品牌只是编译期标记，
@@ -225,7 +240,59 @@ export function sessionKeyOf(execution: GuardExecution | undefined): string {
   if (typeof id === "number" && Number.isSafeInteger(id)) {
     return String(id);
   }
-  return "__anonymous__";
+  return SHARED_SESSION_KEY;
+}
+
+/**
+ * 会话沿父链上溯时最多走多少跳。官方把「委派深度」持久化在 header 上，正是为了让递归预算
+ * 跨重启存活；这里自己也要一道上限，因为链是运行时读回来的、可能不完整（中间某个会话已经
+ * 落定不再 live）。到顶就停，退化成「当前这一跳」——宁可共享范围偏小，也不把配额并到一个
+ * 说不清是谁的桶里。
+ */
+export const MAX_PARENT_WALK = 32;
+
+/**
+ * 会话的**根**标识：沿 `header.parentSession` 一路上溯到最顶层那一跳。
+ *
+ * 为什么不用自己的 id 分片：子代理各自持有独立会话，于是「主代理搜过 → 放行 3 次 grep/rg」
+ * 变成「主代理那 3 次」，子代理一次都没有——门禁想建立的「语义检索优先」在多代理下直接失效。
+ * 按根分片后，同一棵委派树共享同一份额度，语义检索的证据也随之共享。
+ *
+ * 降级是三级的，都不抛错：
+ *   - 自身即顶层（没有 parentSession）→ 用自己的 id。
+ *   - 上溯到某一跳时查不到它的父（会话已落定、或 `lookup` 根本不存在——宿主没装会话存储）
+ *     → 停在**已知的最后一跳**，不猜。
+ *   - 链上出现环 → 停在首次重复前的位置。
+ */
+export function rootSessionKeyOf(
+  execution: GuardExecution | undefined,
+  lookup?: (id: string) => { parentSession?: unknown } | undefined,
+): string {
+  const own = sessionKeyOf(execution);
+  if (own === SHARED_SESSION_KEY) {
+    // 连自己的 id 都没有：无从谈父链，直接落共享桶（与旧行为同）。
+    return own;
+  }
+  const parent: unknown = execution?.agent?.session?.header?.parentSession;
+  if (typeof parent !== "string" || parent.length === 0) {
+    return own;
+  }
+  // 已见到过的 id：既防环，也天然给出跳数上限。
+  const seen = new Set<string>([own, parent]);
+  let cursor = parent;
+  for (let hop = 0; hop < MAX_PARENT_WALK; hop += 1) {
+    if (lookup === undefined) {
+      // 宿主没有会话查询面：无从再往上，退回已知的最后一跳。
+      return cursor;
+    }
+    const next: unknown = lookup(cursor)?.parentSession;
+    if (typeof next !== "string" || next.length === 0 || seen.has(next)) {
+      return cursor;
+    }
+    seen.add(next);
+    cursor = next;
+  }
+  return cursor;
 }
 
 /** 内置默认阈值（可在设置里覆盖：grepBudgetPerSearch / unlockWindowMin）。 */
@@ -250,6 +317,13 @@ export interface SearchFirstDeps {
    * 「两次查表结果不一致」这种伪分支要防。
    */
   consumeGrep: (unlock: SearchUnlock) => void;
+  /**
+   * 该索引根当前是否有一次活跃重建（宿主注入，读统一状态源）。
+   * 为真时门禁放行根内检索：重建持有写锁期间语义检索必然失败，若门禁仍要求
+   * 「先成功检索」，模型会被两个方向同时堵死——检索报错、grep/rg 也被拦。
+   * 只放宽配额这一道，索引根范围与外部路径判定仍由本门禁自己把关。
+   */
+  rebuildBypass?: (indexRoot: string) => boolean;
 }
 
 /**
@@ -282,8 +356,16 @@ function buildSearchFirstReason(
     indexRoot !== undefined &&
     (command === undefined || !hasExternalTarget(indexRoot, command, messages));
   if (inScope) {
-    const unlock = deps.lookupUnlock(indexRoot);
-    if (unlock !== undefined && unlockActive(unlock, deps.now())) {
+    // 重建期放行先于配额判定：那条重建占着这棵树的写锁，此刻无论有没有配额都该放行，
+    // 因为语义检索根本读不到索引。且这一放行**不消耗**既有配额——重建造成的等待不该
+    // 记在用户的检索额度上。
+    const rebuilding = deps.rebuildBypass?.(indexRoot) === true;
+    const unlock = rebuilding ? undefined : deps.lookupUnlock(indexRoot);
+    if (rebuilding) {
+      // 这一支**必须是一个空 if**：把 unlock 置空并不会「不扣额度」，而是让它落进下面的
+      // else —— 那里 `unlock === undefined` 会被译成「从未检索过」并**拒绝**。真正让这次调用
+      // 放行的就是这个空分支本身。写成注释说明，是为了不让下一个人把它当冗余删掉。
+    } else if (unlock !== undefined && unlockActive(unlock, deps.now())) {
       // 有解锁额度：放行并把这份记录扣减一次（同一对象，无需二次查表）。
       deps.consumeGrep(unlock);
     } else {

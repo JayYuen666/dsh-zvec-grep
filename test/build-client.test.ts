@@ -299,6 +299,41 @@ await declareSchemaCoverage(import.meta.url, {
       field: "stdoutMaxBytes",
       reason: "非 volatile 部署值（cordis.yml config: 改）：执行器 stdout 缓冲上限，无卡位",
     },
+    {
+      field: "clientMode",
+      reason:
+        "非 volatile 部署值（cordis.yml config: 改）：zg 传输模式随部署是否启用守护进程而定，默认自动即最优，故不设卡位",
+    },
+    {
+      field: "rebuildWaitMs",
+      reason:
+        "非 volatile 部署值（cordis.yml config: 改）：检索等待同根重建落定的上限，随部署的索引规模调整",
+    },
+    {
+      field: "allowRemoteEmbedding",
+      reason:
+        "非 volatile 部署值（cordis.yml config: 改）：远程 embedding 授权闸。刻意不给卡位——它是" +
+        "「允许把工作区内容送出本机」的安全开关，放到设置卡上等于让任何能开设置的人顺手打开。" +
+        "要开就改部署配置，那条改动会留在 git 里",
+    },
+    {
+      field: "remoteEmbeddingEndpoint",
+      reason:
+        "非 volatile 部署值（cordis.yml config: 改）：远程 embedding 端点，与 allowRemoteEmbedding 同批开放；无卡位",
+    },
+    {
+      field: "requireApprovalForExplicitRoot",
+      reason:
+        "非 volatile 部署值（cordis.yml config: 改）：官方用户确认开关。刻意不给卡位——" +
+        "打开后每次越界检索都会弹确认，而在 danger-full-access 预设与委派子代理下宿主会把它" +
+        "确定性拒掉（approvalPolicy: never），放进设置卡只会让人以为开关生效了",
+    },
+    {
+      field: "remoteEmbeddingApiKeyFrom",
+      reason:
+        "非 volatile 部署值（cordis.yml config: 改）：只记宿主进程里那个装凭据的环境变量**名字**，" +
+        "不是密钥本身。绝不能落进设置卡（那会把密钥写进 profile 配置并同步到客户端）",
+    },
   ],
 });
 

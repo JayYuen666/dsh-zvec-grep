@@ -244,3 +244,21 @@ export interface SearchUnlock {
 export function unlockActive(unlock: SearchUnlock | undefined, now: number): boolean {
   return unlock !== undefined && unlock.grepsLeft > 0 && now < unlock.expiresAt;
 }
+
+/**
+ * 两个路径是否落在**同一棵树**里（互为祖先/后代，按路径段比）。
+ *
+ * 授权判据用它：会话工作区是 `/repo/packages/app` 时，模型显式指定 `/repo` 或
+ * `/repo/packages/app/src` 都属「这棵树之内」，不该被当成越界；而 `/etc`、用户家目录
+ * 或另一棵仓都与它无祖先关系，据此拒掉。
+ *
+ * 与门禁那边的 `pathInsideRoot` 是反向的一问：那边判「目标是否在 root 之内」，
+ * 这边判「两者是否相关」，任一方向成立即可。
+ * @param left 第一个路径
+ * @param right 第二个路径
+ * @param messages 文案表（归一化异常时喂给它，异常文本在此被丢弃，出界才是结论）
+ * @returns 是否互为祖先/后代
+ */
+export function pathsRelated(left: string, right: string, messages: ZvecGrepMessages): boolean {
+  return pathInsideRoot(left, right, messages) || pathInsideRoot(right, left, messages);
+}

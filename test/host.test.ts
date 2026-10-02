@@ -8,7 +8,7 @@
 // （root 现在要过 existsSync 预检，桩路径 /ws 会被判「目录不存在」），
 // 对应同步方法名已列入 oxlint.config.ts 的 node/no-sync ignores。可控延迟用
 // Promise.withResolvers（运行时 Node≥22 可用；lib=ES2024 无该静态成员故类型借道 cast）。
-import { describe, it, beforeAll, afterAll } from "vitest";
+import { describe, it, beforeAll, afterAll, vi } from "vitest";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
@@ -20,15 +20,20 @@ import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
 // 命名导入：缓存工厂是导出面（单测直接钉命中/TTL/LRU 行为，不必经 fs 间接观测）。
 import plugin, {
   createIndexProbeCache,
+  createRootLedger,
+  hitSummary,
+  signalStderr,
   INDEX_PROBE_CACHE_MAX,
   INDEX_PROBE_TTL_MS,
 } from "../host.ts";
 import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import { MESSAGES, fill } from "../lib/messages.ts";
+import { MINIMUM_ZG_VERSION } from "../lib/zg-version.ts";
 import { SECRET_EXCLUDE_GLOBS } from "../lib/argv-guard.ts";
 
 // 默认密钥排除的命令行形态（由 lib/argv-guard.ts 单一来源派生，避免两处硬编码漂移）。
-const SECRET_ARGS = SECRET_EXCLUDE_GLOBS.map((globStr) => `--glob '${globStr}'`).join(" ");
+// 旗标是 --iglob 而非 --glob：大小写不敏感、且排在用户 iglob 之后，理由见 lib/cli.ts 的 pushIndexGlobs。
+const SECRET_ARGS = SECRET_EXCLUDE_GLOBS.map((globStr) => `--iglob '${globStr}'`).join(" ");
 
 const REBUILD_PATH = "/_dsh/zvec-grep/rebuild";
 const REBUILD_STATUS_PATH = "/_dsh/zvec-grep/rebuild-status";
@@ -61,10 +66,58 @@ const ZG_INDEX_DIR = ".zvec-grep";
  */
 const ZG_MANIFEST_FILE = "manifest.json";
 
+/** 版本门槛的探测命令（字面量与 host.ts 的 probeZgVersion 同源，改一处两边都红）。 */
+const ZG_VERSION_COMMAND = "zg --version";
+/** 健康的本机 zg：恰好等于门槛值，故默认放行（实机 stdout 就是这一行 + 换行）。 */
+const ZG_VERSION_OK = `${MINIMUM_ZG_VERSION}\n`;
+
+/** 一次健康的版本探测执行（stdout 只有版本号一行，实测形态）。 */
+function versionOkRun(): ShellRunResult {
+  return { exitCode: 0, stdout: { text: ZG_VERSION_OK }, stderr: { text: "" } };
+}
+
+/** 一次「探到太老的 zg」的执行：退出 0、stdout 是那个旧版本号。 */
+function oldVersionRun(version: string): ShellRunResult {
+  return { exitCode: 0, stdout: { text: `${version}\n` }, stderr: { text: "" } };
+}
+
+/** 本组反复用到的三个字面量：远程引用、端点、凭据所在环境变量名。 */
+const REMOTE_EMBEDDING = "qwen/text-embedding-v4";
+const REMOTE_ENDPOINT = "https://api.example.com/v1";
+const EMBED_KEY_ENV = "ZGTEST_EMBED_KEY";
+/** 凭据的字面值（一次性测试夹具，不是任何真实凭据）。 */
+const FAKE_KEY = "sk-forwarded";
+
+/**
+ * 临时设一个环境变量，交回还原函数。
+ * 还原走 Reflect.deleteProperty 而不是 `delete env[name]`：后者是动态键删除
+ * （本仓 lint 明令禁止），而前者正是官方 scrubbedParentEnv 清理同名变量的写法。
+ */
+function withEnv(name: string, value: string): () => void {
+  process.env[name] = value;
+  return () => {
+    Reflect.deleteProperty(process.env, name);
+  };
+}
+
 /** 在 root 下造出一个「真建过索引」的索引库（目录 + manifest）。 */
+/**
+ * 在 root 下造出一个「真建过索引」的索引库（目录 + 清单）。
+ *
+ * 清单按**真实** workspace manifest 的形状写（实测上游形状），且 `rootPaths` 真的指回这个
+ * root：探测判据现在要校验清单结构与根路径覆盖，`{}` 那种占位会被判成「这不是一份索引」，
+ * 于是所有依赖「已建索引」前提的用例都会掉进穷举通道。
+ */
 function makeIndexed(root: string): void {
-  mkdirSync(path.join(root, ZG_INDEX_DIR));
-  writeFileSync(path.join(root, ZG_INDEX_DIR, ZG_MANIFEST_FILE), "{}\n");
+  mkdirSync(path.join(root, ZG_INDEX_DIR), { recursive: true });
+  writeFileSync(
+    path.join(root, ZG_INDEX_DIR, ZG_MANIFEST_FILE),
+    `${JSON.stringify({
+      manifestVersion: 1,
+      path: path.join(root, ZG_INDEX_DIR),
+      rootPaths: [{ absolutePath: root, recursive: true }],
+    })}\n`,
+  );
 }
 /**
  * 官方输出环的**字节**留存上限（宿主默认值，离线台架实测见 plugins/docs/harness/f3-equiv/probe-jobs.mjs）。
@@ -138,7 +191,11 @@ function assertBareCutBites(cut: string): void {
 
 interface MockExec {
   signal?: AbortSignal;
-  agent?: { session?: { id?: unknown; header?: { cwd?: unknown } } } | null;
+  // header 的形状与官方 SessionHeader 对齐到本包真读的那两位：cwd（会话工作区）与
+  // parentSession（子代理挂在谁下面，配额按根会话分片要用）。
+  agent?: {
+    session?: { id?: unknown; header?: { cwd?: unknown; parentSession?: unknown } };
+  } | null;
 }
 
 interface GuardExec extends MockExec {
@@ -248,6 +305,16 @@ interface ResolveRequest {
 
 interface ShellMock {
   resolveCalls: ResolveRequest[];
+  /**
+   * 版本门槛探测（`zg --version`）的请求单。**刻意不排进 resolveCalls**：那是各用例断言
+   * 命令形态（命令文本/workdir/env）的地方，把基础设施探测混进去会让这些断言被一次
+   * 与被测行为无关的调用顶掉。单独记账，断言探测行为时看这里。
+   */
+  versionProbeCalls: ResolveRequest[];
+  /** 版本探测这一次执行要交回的结果；undefined = 健康的本机 zg（门槛值本身）。 */
+  zgVersionResult: ShellRunResult | undefined;
+  /** 版本探测这一次执行直接抛错（模拟执行器缺席/spawn 失败）：同样必须按「读不懂」放行。 */
+  versionProbeThrows: boolean;
   runResults: ShellRunResult[];
   startCalls: ResolveRequest[];
   startedProcs: MockProc[];
@@ -290,6 +357,10 @@ interface MockCtx {
   noJobs: boolean;
   /** 官方注册表的实现本身（见 makeJobRegistry）；重建作业的真身都在它里面。 */
   jobs: LocalJobRegistry;
+  /** 官方会话存储的活会话表：`id -> 它的父会话 id`（无父不出现在表里）。 */
+  sessionLinks: Record<string, string>;
+  /** true ⇒ ctx.get("sessions") 交不出会话存储（宿主没装 dsh-session 的那一档）。 */
+  noSessions: boolean;
   shell: ShellMock;
   settings: {
     /** 页面策略登记：宿主用它决定要不要自动生成表单页（0.1.7 起本包唯一的 settings 写侧动作）。 */
@@ -305,6 +376,13 @@ interface MockCtx {
   timerCalls: { fn: () => void; ms: number }[];
   timer: { timeout: (fn: () => void, ms: number) => () => void };
   get: (name: string) => unknown;
+  /** ctx.on(event, handler)：登记事件监听；替身按事件名分桶保存，供 preExecuteOf 串联瀑布。 */
+  on: (
+    event: string,
+    handler: (exec: GuardExec, next: () => Promise<unknown>) => unknown,
+  ) => () => void;
+  /** 取某个事件名下的监听器（按注册顺序）：preExecuteOf 串联瀑布用。 */
+  eventHandlers: (event: string) => ((exec: GuardExec, next: () => Promise<unknown>) => unknown)[];
   effect: (factory: () => (() => void) | undefined) => void;
   /** ctx.inject(deps, fn)：cordis 立即用带齐依赖的子上下文回调一次（这里就是 ctx 自己）。 */
   inject: (deps: readonly string[], attach: (child: unknown) => void) => void;
@@ -484,6 +562,7 @@ function incompleteHosts(): unknown[] {
     systemPrompt: { section: noop },
     timer: { timeout: noop },
     get: noop,
+    on: () => noop,
   };
   return [
     null,
@@ -503,21 +582,37 @@ function incompleteHosts(): unknown[] {
 }
 
 function makeCtx(): MockCtx {
+  /** ctx.on 登记的事件监听（按事件名分桶）：pre-execute 那道用户确认闸就落在这里。 */
+  const eventListeners = new Map<
+    string,
+    ((exec: GuardExec, next: () => Promise<unknown>) => unknown)[]
+  >();
   const shell: ShellMock = {
     resolveCalls: [],
+    versionProbeCalls: [],
+    zgVersionResult: undefined,
+    versionProbeThrows: false,
     runResults: [],
     startCalls: [],
     startedProcs: [],
     startThrows: "none",
     vanishJobsAfterExecute: 0,
     resolve(spec) {
-      shell.resolveCalls.push(spec);
+      if (spec.command === ZG_VERSION_COMMAND) {
+        shell.versionProbeCalls.push(spec);
+      } else {
+        shell.resolveCalls.push(spec);
+      }
       return spec;
     },
     // 0.1.7：execute 是前后台唯一入口。判据沿用宿主自身的分工——runForeground 必带
     // timeoutMs（deadline），后台 rebuild 不带（shell 契约：后台不应用超时）。
-    async execute(spec) {
-      const isBackground = (spec as { timeoutMs?: number }).timeoutMs === undefined;
+    async execute(rawSpec) {
+      // 官方 execute 的入参在替身上是 unknown（官方 abstract Service 的方法面投影），
+      // 这里只读两个字段，故先收成最小形状而不是断言成某个具体请求类型。
+      const spec = rawSpec as { command: string; timeoutMs?: number };
+      const isVersionProbe = spec.command === ZG_VERSION_COMMAND;
+      const isBackground = spec.timeoutMs === undefined;
       if (isBackground) {
         if (shell.startThrows === "error") {
           throw new Error("no such executor");
@@ -526,7 +621,10 @@ function makeCtx(): MockCtx {
           // 跨 realm 抛出的 Error：本域 `instanceof Error` 为 false，走 String() 兜底
           vm.runInNewContext("throw new Error('boom from another realm')");
         }
-        shell.startCalls.push(spec as ResolveRequest);
+        shell.startCalls.push(rawSpec as ResolveRequest);
+      }
+      if (isVersionProbe && shell.versionProbeThrows) {
+        throw new Error("no such executor");
       }
       const dfr = deferred();
       // 两条流各自的"已捕获全文"与故障开关：形状对齐官方 SubprocessOutputReader，
@@ -572,12 +670,15 @@ function makeCtx(): MockCtx {
         },
         killCount: 0,
         // 前台投影：队列按序消费（保持旧 run() 「发起时 shift」的取值次序）。
+        // 版本探测**不吃这条队列**：它不是被测命令的结果，是基础设施的一次自检。
         result: async () =>
-          shell.runResults.shift() ?? {
-            exitCode: 0,
-            stdout: { text: "OK" },
-            stderr: { text: "" },
-          },
+          isVersionProbe
+            ? (shell.zgVersionResult ?? versionOkRun())
+            : (shell.runResults.shift() ?? {
+                exitCode: 0,
+                stdout: { text: "OK" },
+                stderr: { text: "" },
+              }),
       };
       if (isBackground) {
         shell.startedProcs.push(proc);
@@ -600,6 +701,8 @@ function makeCtx(): MockCtx {
     noWebServer: false,
     noJobs: false,
     jobs: makeJobRegistry(),
+    sessionLinks: {},
+    noSessions: false,
     shell,
     settings: {
       configure: (presentation: { auto?: boolean }, owner?: unknown) => {
@@ -612,6 +715,18 @@ function makeCtx(): MockCtx {
       // localeDocument 缺省 = 该行不存在（没装 client-locale）→ 中文默认。
       describe: () =>
         ctx.localeDocument === undefined ? [] : [{ ns: "locale", value: ctx.localeDocument }],
+    },
+    eventHandlers: (event: string) => eventListeners.get(event) ?? [],
+    on(event: string, handler: (exec: GuardExec, next: () => Promise<unknown>) => unknown) {
+      const bucket = eventListeners.get(event) ?? [];
+      bucket.push(handler);
+      eventListeners.set(event, bucket);
+      return () => {
+        const at = bucket.indexOf(handler);
+        if (at !== -1) {
+          bucket.splice(at, 1);
+        }
+      };
     },
     tools: {
       register(def) {
@@ -646,6 +761,20 @@ function makeCtx(): MockCtx {
         // 官方那一位是 getter（`get host(): string | undefined`），替身给同形的普通成员。
         host: ctx.webServerHost,
       };
+      if (name === "sessions") {
+        // 复刻「宿主没装会话存储」那一档：rootSessionKeyOf 随之退化成「有父用父、无父用自己」。
+        // 官方会话存储的最小替身：活会话表 `id -> header.parentSession`。默认空表
+        // （等价于「没有子代理」）；要测委派树时用 ctx.sessionLinks 填。
+        return ctx.noSessions
+          ? undefined
+          : {
+              list: () =>
+                Object.entries(ctx.sessionLinks).map(([id, parent]) => ({
+                  id,
+                  header: { parentSession: parent },
+                })),
+            };
+      }
       if (name === "jobs") {
         // 官方注册表的实现本身（不是假件，理由见 makeJobRegistry）；noJobs 那一条
         // 复刻"宿主没装 dsh-jobs-local"的档，此时重建端点必须回答不可用而不是抛穿。
@@ -699,10 +828,27 @@ function liveConfigRefs(ctx: MockCtx): Record<string, unknown> {
 
 const createdDirs: string[] = [];
 
-/** 一个真实存在的目录（zg 要求 root 落盘存在）。 */
-function ws(name = "root"): string {
+/** 索引通道的缺省命令行：既有断言反复引用，抽成常量避免三处硬编码漂移。 */
+const INDEXED_SEARCH_COMMAND =
+  "zg query 'hi' --limit 10 --preview short --refresh wait --device 'auto' --mode auto";
+
+/** 一个真实存在但**没有** zg 索引的目录（穷举检索路径的前提）。 */
+function bareWs(name = "bare"): string {
   const created = mkdtempSync(path.join(tmpdir(), `zvec-${name}-`));
   createdDirs.push(created);
+  return created;
+}
+
+/**
+ * 一个真实存在的目录（zg 要求 root 落盘存在）。
+ *
+ * 默认**已建索引**：检索工具在无索引时会自动改走穷举词法通道（见 host.ts 的
+ * pickExhaustive），所以绝大多数用例要的是「有索引」这一前提，否则构造出来的命令形态
+ * 与被断言的东西对不上。确需「无索引」工作区时用 bareWs()。
+ */
+function ws(name = "root"): string {
+  const created = bareWs(name);
+  makeIndexed(created);
   return created;
 }
 
@@ -745,6 +891,71 @@ function guardOf(ctx: MockCtx): (exec: GuardExec) => string | undefined {
   const [guard] = ctx.guardFns;
   assert.ok(guard, "expected one guard");
   return guard;
+}
+
+/**
+ * 跑一次 pre-execute 瀑布：按注册顺序把每个监听器串起来，任一监听器不给 `next()`
+ * 就以它的返回值收口。返回的 `allow` 表示整条瀑布放行。
+ * 返回 `{ allow: false }` 那一支就是「被问/被拒/被取消」——本包只关心"没放行"。
+ */
+async function preExecuteOf(
+  ctx: MockCtx,
+  exec: GuardExec,
+): Promise<{ allow: boolean; decision: unknown }> {
+  const handlers = ctx.eventHandlers("tools/pre-execute");
+  const run = async (index: number): Promise<unknown> => {
+    const handler = handlers[index];
+    if (handler === undefined) {
+      return { kind: "allow" };
+    }
+    return handler(exec, () => run(index + 1));
+  };
+  const decision = await run(0);
+  const kind = (decision as { kind?: unknown } | undefined)?.kind;
+  return { allow: kind === "allow", decision };
+}
+
+/** 一个待决 Promise 的结局文本：兑现时给空串，抛错时给错误消息（供并行断言收口）。 */
+async function reasonOf(pending: Promise<unknown>): Promise<string> {
+  try {
+    await pending;
+    return "";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/**
+ * 一条最小可路由的 pre-execute 入参：带 agent 才有会话工作区可读。
+ * 官方 ToolExecution.arguments 是 unknown，这里按调用点真实形态给。
+ */
+function askExec(
+  name: string,
+  root: unknown,
+  cwd: string | undefined,
+  rawArguments?: unknown,
+): GuardExec {
+  const { signal } = new AbortController();
+  const session = cwd === undefined ? undefined : { id: "s1", header: { cwd } };
+  return {
+    name,
+    arguments: rawArguments ?? (root === undefined ? {} : { root }),
+    signal,
+    ...(session === undefined ? {} : { agent: { session } }),
+  };
+}
+
+/** 批量跑若干条 pre-execute，只取「有没有放行」这一位（各条互不相关，可并行）。 */
+async function allowVerdicts(
+  ctx: MockCtx,
+  cases: { name: string; root: unknown; cwd: string | undefined }[],
+): Promise<boolean[]> {
+  return Promise.all(
+    cases.map(async (one): Promise<boolean> => {
+      const verdict = await preExecuteOf(ctx, askExec(one.name, one.root, one.cwd));
+      return verdict.allow;
+    }),
+  );
 }
 
 /** 官方 ToolExecution 最小替身：signal 契约必填。 */
@@ -890,6 +1101,369 @@ function okRun(stdoutText = "OK"): ShellRunResult {
 
 // ── 注册面 ────────────────────────────────────────────────────────────────
 
+describe("zg 版本门槛", () => {
+  it("版本够新：放行，且探测不吃命令结果队列", async () => {
+    const root = ws();
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("HITS"));
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.match((out as { text: string }).text, /^HITS/u);
+    assert.equal(ctx.shell.versionProbeCalls.length, 1, "第一次调用探一次版本");
+    assert.equal(ctx.shell.versionProbeCalls[0]?.command, ZG_VERSION_COMMAND);
+  });
+
+  it("三个工具与后台索引都先过这道门槛（口径只有一处）", async () => {
+    const root = ws();
+    const ctx = makeCtx();
+    ctx.shell.zgVersionResult = oldVersionRun("0.2.1");
+    applyTo(ctx);
+    // 前台三条 + 工具/卡片共用的后台 spawn：每条都必须在**起 zg 之前**停住。
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /zg 版本过低/u,
+    );
+    assert.equal(ctx.shell.resolveCalls.length, 0, "门槛没过就不该发任何 zg 命令");
+    await assert.rejects(
+      () => toolOf(ctx, "zg_status").execute({ root }, execOf(root)),
+      /zg 版本过低/u,
+    );
+    assert.equal(ctx.shell.resolveCalls.length, 0);
+    await assert.rejects(
+      () => toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root)),
+      /zg 版本过低/u,
+    );
+    assert.equal(ctx.shell.resolveCalls.length, 0, "前台索引同样没过门槛");
+    assert.equal(ctx.shell.startCalls.length, 0);
+  });
+
+  it("后台索引（设置卡重建端点那条路）也过门槛：一条 zg 都不起", async () => {
+    const root = ws();
+    const ctx = makeCtx();
+    ctx.shell.zgVersionResult = oldVersionRun("0.2.1");
+    applyTo(ctx);
+    trackRoot(ctx, root);
+    const res = await postRebuild(ctx, root);
+    assert.notEqual(res.statusCode, 200, "版本太老时端点不得回答 200");
+    // 卡片只看得到响应体，所以可行动的文案必须真的落在 body 里（不是被吞进日志）。
+    assert.match(res.body, /zg 版本过低/u, "响应体要带回门槛文案");
+    assert.match(res.body, /0\.2\.1/u, "并回显实际版本");
+    assert.equal(ctx.shell.startCalls.length, 0, "一条后台 zg 都不该起");
+    // 门禁那一侧同样不消费配额：门槛没过就没有「已检索」这回事。
+    assert.equal(ctx.shell.startedProcs.length, 0);
+  });
+
+  it('分支用的布尔按严格取值读：1 / "true" 静默变 false 是本仓点名要避免的失败', async () => {
+    // 参数面声明着 type: "boolean"，但宿主对 parameters 只做注册期的「输出」schema 检查，
+    // 入参原样交给 execute —— 框架不替我们兜。所以这三处分支决策必须自己严格取值。
+    const root = ws("strictbool");
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const tool = toolOf(ctx, "zg_index");
+    const status = toolOf(ctx, "zg_status");
+    // 三个分支的调用面：[工具名, 入参, 期望被点名的参数名]。
+    const surfaces: [typeof tool, Record<string, unknown>, string][] = [
+      [tool, { root, confirm: true, rebuild: null }, "rebuild"],
+      [tool, { root, confirm: true, background: null }, "background"],
+      [status, { root, checkReady: null }, "checkReady"],
+    ];
+    const badValues: unknown[] = [1, "true", "yes", {}, []];
+    const verdicts = await Promise.all(
+      badValues.map(async (bad): Promise<string[]> => {
+        const calls = surfaces.map(async ([target, args, name]) =>
+          reasonOf(target.execute({ ...args, [name]: bad }, execOf(root))),
+        );
+        return Promise.all(calls);
+      }),
+    );
+    for (const [index, row] of verdicts.entries()) {
+      const bad = JSON.stringify(badValues[index]);
+      // 三个分支各抛一次，且每次都要点名自己那个参数——不能是同一个泛化错误。
+      for (const [slot, thrown] of row.entries()) {
+        const name = surfaces[slot]?.[2] ?? "";
+        assert.match(
+          thrown,
+          new RegExp(`${name} 必须是布尔值`, "u"),
+          `${bad}：${name} 那一支应当被拒且点名自己（实得 ${JSON.stringify(row)}）`,
+        );
+      }
+    }
+  });
+
+  it("命令**构造**失败也不泄漏重建占位（构造期 allowlist 拒非本地 embedding 是模型够得着的）", async () => {
+    // 回归护栏：buildIndexCommand 曾被放在 try 之外，而它在 allowlist 那条路上会抛。
+    // 抛出绕过 finally ⇒ 占位永不交还 ⇒ 这棵树被永久标成「重建中」。
+    const root = ws("leak2");
+    const ctx = makeCtx();
+    applyTo(ctx);
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_index").execute(
+          { root, confirm: true, rebuild: true, embedding: "evil/http://attacker/x" },
+          execOf(root),
+        ),
+      /allowRemoteEmbedding/u,
+    );
+    // 占位已交还：同根应当还能再起一次重建，而不是被「已有一条重建在进行中」挡回。
+    const again = await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, rebuild: true },
+      execOf(root),
+    );
+    assert.doesNotMatch(
+      (again as { text: string }).text,
+      /已有一条重建/u,
+      "构造失败把占位带走了：同根再也起不了重建",
+    );
+    assert.equal(ctx.shell.resolveCalls.length, 1, "第二次应当真的起了一条 zg index");
+  });
+
+  it("门槛失败不泄漏重建占位：否则这棵树会被永久标成「重建中」", async () => {
+    // 回归护栏：门槛曾被放在 claim **之后**，而它的失败出口不在那几条 finally 覆盖范围内
+    // ——zg 过老时占位永不交还，之后每次重建都只得到「已有一条重建在进行中」。
+    const root = ws("leak");
+    const ctx = makeCtx();
+    ctx.shell.zgVersionResult = oldVersionRun("0.2.1");
+    applyTo(ctx);
+    await assert.rejects(
+      () => toolOf(ctx, "zg_index").execute({ root, confirm: true, rebuild: true }, execOf(root)),
+      /zg 版本过低/u,
+    );
+    // 占位交还了吗？把时钟推过门槛的 TTL，让第二次调用真的重新探一次版本——
+    // 只有占位已交还，它才可能走到「起一条重建」而不是被「已有一条重建在进行中」挡回。
+    vi.useFakeTimers({ now: Date.now() });
+    try {
+      ctx.shell.zgVersionResult = undefined;
+      vi.advanceTimersByTime(11 * 60_000);
+      const again = await toolOf(ctx, "zg_index").execute(
+        { root, confirm: true, rebuild: true },
+        execOf(root),
+      );
+      assert.doesNotMatch(
+        (again as { text: string }).text,
+        /已有一条重建/u,
+        "占位没交还：zg 过老一次就把这棵树永久标成「重建中」了",
+      );
+      assert.equal(ctx.shell.resolveCalls.length, 1, "第二次应当真的起了一条 zg index");
+      assert.match(ctx.shell.resolveCalls[0]?.command ?? "", /^zg index/u);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("门槛文案回显实际版本与门槛值，并给出唯一出路", async () => {
+    const root = ws();
+    const ctx = makeCtx();
+    ctx.shell.zgVersionResult = oldVersionRun("0.1.9");
+    applyTo(ctx);
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      (error: unknown) => {
+        const text = error instanceof Error ? error.message : String(error);
+        assert.match(text, /0\.1\.9/u, "要回显装的是哪个版本");
+        assert.ok(text.includes(MINIMUM_ZG_VERSION), "要回显门槛值");
+        assert.match(text, /npm install -g @zvec\/zvec-grep@latest/u, "要给出可照做的出路");
+        return true;
+      },
+    );
+  });
+
+  it("探测结果按 TTL 缓存：同一轮里只探一次", async () => {
+    const root = ws();
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("A"), okRun("B"), okRun("C"));
+    // 三条工具顺序调用（它们共享同一张 runResults 队列，顺序即消费次序）。
+    await toolOf(ctx, "zg_search").execute({ root, query: "a" }, execOf(root));
+    await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
+    assert.equal(
+      ctx.shell.versionProbeCalls.length,
+      1,
+      "缓存期内不得为每次调用各探一次（那会让每次检索都多一个子进程）",
+    );
+  });
+
+  it("探测失败一律按「版本未知」放行，绝不拿读不懂的输出去拦真实用户", async () => {
+    // 四种「探测不出来」：非零退出、形状不认识、带 v 前缀的版本号、stdout 空。
+    // 「读不懂」与「太老」必须分开——混在一起就成了拿猜出来的版本去拦真实用户。
+    const unreadable = [
+      { exitCode: 1, stdout: { text: "" }, stderr: { text: "boom" } },
+      { exitCode: 0, stdout: { text: "not a version" }, stderr: { text: "" } },
+      { exitCode: 0, stdout: { text: "v0.2.1" }, stderr: { text: "" } },
+      { exitCode: 0, stdout: { text: "" }, stderr: { text: "" } },
+    ];
+    // 四种并行跑（各自一套 ctx，互不相干）：顺序无关，且不必在循环里 await。
+    const verdicts = await Promise.all(
+      unreadable.map(async (probeResult): Promise<string> => {
+        const root = ws();
+        const ctx = makeCtx();
+        ctx.shell.zgVersionResult = probeResult;
+        applyTo(ctx);
+        ctx.shell.runResults.push(okRun("STILL-WORKS"));
+        const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+        return (out as { text: string }).text;
+      }),
+    );
+    for (const [index, text] of verdicts.entries()) {
+      assert.match(
+        text,
+        /^STILL-WORKS/u,
+        `探测不出来时必须照常放行：${JSON.stringify(unreadable[index]?.stdout)}`,
+      );
+    }
+  });
+
+  it("探测本身抛错（执行器缺席/spawn 失败）：照样放行，绝不阻断主流程", async () => {
+    const root = ws();
+    const ctx = makeCtx();
+    ctx.shell.versionProbeThrows = true;
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("UNBLOCKED"));
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.match(
+      (out as { text: string }).text,
+      /^UNBLOCKED/u,
+      "探测抛错与探测不到同义：都不该把用户的检索挡下来",
+    );
+  });
+
+  it("探测命令挂在系统临时目录：不借会话工作区、不碰 root 授权", async () => {
+    const root = ws();
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("OK"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    const [probe] = ctx.shell.versionProbeCalls;
+    assert.ok(probe !== undefined, "探测发生过");
+    assert.notEqual(probe.workdir, root, "探测是纯打印，不能挂在被检索的工作区上");
+    assert.ok(typeof probe.timeoutMs === "number", "探测自带短超时，不借检索超时");
+  });
+});
+
+describe("官方用户确认（tools/pre-execute → ctx.approval）", () => {
+  /** 本组反复出现的两个路径：一个未登记的 root、一个本会话工作区。 */
+  const CWD = "/repo";
+  const UNREGISTERED_ROOT = "/elsewhere";
+
+  it("默认关：任何显式 root 都直接放行（不打扰用户，也不改变既有行为）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const roots = [UNREGISTERED_ROOT, "/a/b/c"];
+    const verdicts = await allowVerdicts(
+      ctx,
+      roots.map((root) => ({ name: "zg_search", root, cwd: CWD })),
+    );
+    for (const [index, allow] of verdicts.entries()) {
+      assert.equal(allow, true, `默认部署不该发问（root=${roots[index]}）`);
+    }
+  });
+
+  it("打开后：显式 root 既不是会话工作区、也未登记 → 返回 ask", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    const { allow, decision } = await preExecuteOf(ctx, askExec("zg_search", "/repo/pkg", CWD));
+    assert.equal(allow, false, "该问的要问");
+    const ask = decision as {
+      kind: string;
+      reason?: string;
+      displayReason?: { en: string; zh: string };
+    };
+    assert.equal(ask.kind, "ask");
+    assert.match(ask.reason ?? "", /\/repo\/pkg/u, "理由要回显那个 root");
+    assert.match(ask.displayReason?.zh ?? "", /\/repo\/pkg/u);
+    assert.match(ask.displayReason?.en ?? "", /\/repo\/pkg/u);
+    // 相对路径：归一那一步解析不了（assertAbsoluteRoot 抛错），于是按「需要问」处理——
+    // 问错一次的代价是一句提示，漏问的代价是把某个目录的内容读进上下文。
+    const relative = await preExecuteOf(ctx, askExec("zg_search", "some/relative", CWD));
+    assert.equal(relative.allow, false, "解析不了的 root 也要问，而不是当作会话工作区放行");
+  });
+
+  it("会话工作区本身、以及已登记的 root：不问（最不该被打扰的两类）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    // 同一个会话工作区：归一后相等（含尾部斜杠这种写法）。
+    const sameRoots = [CWD, `${CWD}/`];
+    const sameVerdicts = await allowVerdicts(
+      ctx,
+      sameRoots.map((root) => ({ name: "zg_search", root, cwd: CWD })),
+    );
+    for (const [index, allow] of sameVerdicts.entries()) {
+      assert.equal(allow, true, `会话工作区不该被问（root=${sameRoots[index]}）`);
+    }
+    // 先跑一次工具把 root 登记进 ledger，再问同一个 root。
+    const registered = ws("registered");
+    const child = path.join(registered, "pkg");
+    mkdirSync(child, { recursive: true });
+    ctx.shell.runResults.push(okRun("OK"));
+    await toolOf(ctx, "zg_status").execute({ root: child }, execOf(registered));
+    const after = await preExecuteOf(ctx, askExec("zg_status", child, "/somewhere-else"));
+    assert.equal(after.allow, true, "本会话已登记过的 root 不该再问");
+  });
+
+  it("三个 zg 工具都问；别家工具一个字都不拦", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    const toolNames = ["zg_search", "zg_index", "zg_status"];
+    const toolVerdicts = await allowVerdicts(
+      ctx,
+      toolNames.map((tool) => ({ name: tool, root: UNREGISTERED_ROOT, cwd: CWD })),
+    );
+    for (const [index, allow] of toolVerdicts.entries()) {
+      assert.equal(allow, false, `${toolNames[index]} 应当发问`);
+    }
+    const foreign = await preExecuteOf(ctx, askExec("read", UNREGISTERED_ROOT, CWD));
+    assert.equal(foreign.allow, true, "本插件不该对别家工具发问");
+  });
+
+  it("没给 root（走缺省）或给了非字符串：都不问", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    // arguments 根本不是对象（官方面就是 unknown）：读不出 root，同样不问。
+    const oddArgs: unknown[] = [null, "not-an-object", 7, ["/elsewhere"]];
+    const oddVerdicts = await Promise.all(
+      oddArgs.map(async (raw): Promise<boolean> => {
+        const odd = await preExecuteOf(ctx, askExec("zg_search", undefined, CWD, raw));
+        return odd.allow;
+      }),
+    );
+    for (const [index, allow] of oddVerdicts.entries()) {
+      assert.equal(allow, true, `arguments 不是对象时不该问（${JSON.stringify(oddArgs[index])}）`);
+    }
+    const noRoots: unknown[] = [undefined, 42, "", "   ", null];
+    const noVerdicts = await allowVerdicts(
+      ctx,
+      noRoots.map((root) => ({ name: "zg_search", root, cwd: CWD })),
+    );
+    for (const [index, allow] of noVerdicts.entries()) {
+      assert.equal(allow, true, `没有可判的显式 root 就别问（root=${String(noRoots[index])}）`);
+    }
+  });
+
+  it("无会话工作区（agent 缺席）时的显式 root：照问（此时最需要人看一眼）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    const { allow, decision } = await preExecuteOf(
+      ctx,
+      askExec("zg_search", UNREGISTERED_ROOT, undefined),
+    );
+    assert.equal(allow, false);
+    const ask = decision as { reason?: string };
+    assert.match(ask.reason ?? "", /无会话工作区/u, "理由要说清没有会话工作区可作参照");
+  });
+
+  it("这道闸只加不减：批准之后 rootOf 的授权判据一字未改", async () => {
+    // 越界的 root 即便假装「用户已批准」，rootOf 照旧拒——确认面不扩大可操作范围。
+    const root = ws("strict");
+    const ctx = makeCtx();
+    applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    ctx.shell.runResults.push(okRun("OK"));
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root: "/etc", query: "hi" }, execOf(root)),
+      /未获授权|root/u,
+    );
+  });
+});
+
 describe("host.apply 注册面", () => {
   it("隐式注册：Config schema 逐字段默认 = 0.1.6 交给 register 的内置底座", () => {
     // 0.1.7 删了 settings.register(ns, schema, { base })：命名空间 = profile 条目 id，
@@ -913,6 +1487,17 @@ describe("host.apply 注册面", () => {
       statusTimeoutMs: 60_000,
       indexTimeoutMs: 10 * 60_000,
       stdoutMaxBytes: 400_000,
+      // 传输模式缺省自动：有守护进程就走守护进程，没有就直连，两种状态实测均正常。
+      clientMode: "auto",
+      // 等待同根重建落定的上限：默认两分钟，覆盖常规重建又不至于让检索无限期挂着。
+      rebuildWaitMs: 2 * 60_000,
+      // 远程 embedding 三件套默认**全关**：关着的时候构造期就拒掉一切非本地引用。
+      // 字面值手写不自证：schema 的 .default() 改了，这里先红。
+      allowRemoteEmbedding: false,
+      remoteEmbeddingEndpoint: "",
+      remoteEmbeddingApiKeyFrom: "",
+      // 官方用户确认开关：默认关（关着时 pre-execute 那道闸一行都不执行）。
+      requireApprovalForExplicitRoot: false,
     });
   });
 
@@ -939,6 +1524,44 @@ describe("host.apply 注册面", () => {
       : [];
     assert.deepEqual(requiredList, ["confirm"]);
     assert.ok(index.description.includes("confirm"));
+  });
+
+  it("参数面：preview / refresh 带闭集 enum，符号类型逐项带 enum 且与取值器同源", () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const props = toolOf(ctx, "zg_search").parameters["properties"] as Record<
+      string,
+      { enum?: unknown; oneOf?: unknown; items?: { enum?: unknown } }
+    >;
+    assert.deepEqual(props["preview"]?.enum, ["none", "short", "full"]);
+    assert.deepEqual(props["refresh"]?.enum, ["background", "wait", "off"]);
+    assert.deepEqual(props["symbolTypes"]?.items?.enum, [
+      "module",
+      "class",
+      "interface",
+      "function",
+      "value",
+      "alias",
+    ]);
+  });
+
+  it("参数面：路径过滤项用 oneOf 表达单值或数组（宿主子集不收 anyOf）", () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const search = toolOf(ctx, "zg_search").parameters["properties"] as Record<string, unknown>;
+    const index = toolOf(ctx, "zg_index").parameters["properties"] as Record<string, unknown>;
+    for (const name of ["globs", "insensitiveGlobs", "fileTypes", "excludedFileTypes"]) {
+      for (const [tool, props] of [
+        ["zg_search", search],
+        ["zg_index", index],
+      ] as const) {
+        const node = props[name] as { oneOf?: unknown; anyOf?: unknown };
+        assert.ok(Array.isArray(node.oneOf) && node.oneOf.length === 2, `${tool}.${name} 缺 oneOf`);
+        assert.equal(node.anyOf, undefined, `${tool}.${name} 不该用宿主不收的 anyOf`);
+      }
+    }
+    const ignoreFiles = index["ignoreFiles"] as { oneOf?: unknown };
+    assert.ok(Array.isArray(ignoreFiles.oneOf), "index.ignoreFiles 也接受单值");
   });
 
   it("注册 systemPrompt 规则段（order 1550）", () => {
@@ -1011,6 +1634,14 @@ describe("host.apply 注册面", () => {
 
 // ── 工具执行 ──────────────────────────────────────────────────────────────
 
+/** 真实 zg 在 --check-ready 判出未就绪时写在 stderr 上的那一行（逐字抄）。 */
+const NOT_READY_STDERR = "Error: Workspace index is not ready (state: undecided)";
+
+/** 双路查询输出里重复出现的组头三行，抽成常量避免三处硬编码漂移。 */
+const GROUP_HEADER_1 = "query groups (2):";
+const GROUP_LINE_1 = "Q1 [supplemental]: parseConfig";
+const GROUP_LINE_2 = "Q2 [supplemental]: parse a config file";
+
 describe("zg_search 执行", () => {
   let ctx: MockCtx;
   let root: string;
@@ -1022,23 +1653,20 @@ describe("zg_search 执行", () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("RESULT"));
-    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf());
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
     assert.equal(ctx.shell.resolveCalls.length, 1);
-    assert.equal(
-      ctx.shell.resolveCalls[0]?.command,
-      "zg query 'hi' --limit 10 --preview short --refresh wait --device 'auto' --mode direct",
-    );
+    assert.equal(ctx.shell.resolveCalls[0]?.command, INDEXED_SEARCH_COMMAND);
     assert.equal(ctx.shell.resolveCalls[0].workdir, root);
     assert.deepEqual(out, { text: "RESULT" });
   });
 
-  it("stdout 带 hits 计数行 → 尾部追加命中摘要（多组求和；未触顶不提上限）", async () => {
+  it("stdout 带 hits 计数行 → 尾部追加命中摘要（分组求和；未触顶不提上限）", async () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(
       okRun("query groups (2):\nQ1: q\nhits: 3\n#1 a\nQ2: b\nhits: 2\n#1 c"),
     );
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf())) as {
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
       text: unknown;
     };
     assert.ok(
@@ -1046,7 +1674,8 @@ describe("zg_search 执行", () => {
         out.text.endsWith(
           `\n${fill(MESSAGES.zh.hitSummary, {
             groups: 2,
-            hits: 5,
+            grouped: 5,
+            dedup: "",
             limit: 10,
             capped: "",
             truncated: "",
@@ -1055,13 +1684,13 @@ describe("zg_search 执行", () => {
     );
   });
 
-  it("命中数达 --limit → 摘要带「已达上限」片段；截尾 → 带「只含保留部分」片段", async () => {
+  it("命中数达 --limit → 摘要带上限观察片段；截尾 → 带「只含保留部分」片段", async () => {
     ctx = makeCtx();
     applyTo(ctx);
     const cappedRun = okRun("Q1: q\nhits: 10\n#1 a");
     cappedRun.stdout.truncated = true;
     ctx.shell.runResults.push(cappedRun);
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf())) as {
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
       text: unknown;
     };
     assert.ok(
@@ -1076,7 +1705,7 @@ describe("zg_search 执行", () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("nothing recognizable"));
-    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf());
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
     assert.deepEqual(out, { text: "nothing recognizable" });
   });
 
@@ -1084,7 +1713,7 @@ describe("zg_search 执行", () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("hits: N/A\nQ1: q\nhits: 2\n#1 a"));
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf())) as {
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
       text: unknown;
     };
     assert.ok(
@@ -1092,13 +1721,60 @@ describe("zg_search 执行", () => {
         out.text.includes(
           fill(MESSAGES.zh.hitSummary, {
             groups: 1,
-            hits: 2,
+            grouped: 2,
+            dedup: "",
             limit: 10,
             capped: "",
             truncated: "",
           }),
         ),
       "摘要只数有效组",
+    );
+  });
+
+  it("多组命中同一处代码 → 分组计数合计与去重后位置数分别给出（求和不再冒充命中总数）", async () => {
+    ctx = makeCtx();
+    applyTo(ctx);
+    // 真实 zg 双组输出（--fts + --vector，未 fuse）：src/beta.ts:1-3 在 fts 组排第 4、
+    // 在 vector 组排第 1，matchedBy 也不同——同一处位置被两组各命中一次。
+    ctx.shell.runResults.push(
+      okRun(
+        [
+          GROUP_HEADER_1,
+          GROUP_LINE_1,
+          "hits: 5",
+          "#1 matchedBy=fts docs/gamma.md:1-4",
+          "#2 matchedBy=fts README.md:1-2",
+          "#3 matchedBy=fts src/delta.ts:1",
+          "#4 matchedBy=fts src/beta.ts:1-3",
+          "#5 matchedBy=fts src/alpha.ts:1-3",
+          GROUP_LINE_2,
+          "hits: 5",
+          "#1 matchedBy=vector src/beta.ts:1-3",
+          "#2 matchedBy=vector src/alpha.ts:1-3",
+          "#3 matchedBy=vector docs/gamma.md:1-4",
+          "#4 matchedBy=vector src/alpha.ts:5-7",
+          "#5 matchedBy=vector src/delta.ts:1",
+        ].join("\n"),
+      ),
+    );
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: unknown;
+    };
+    const dedup = fill(MESSAGES.zh.hitDedup, { unique: 6 });
+    assert.ok(
+      typeof out.text === "string" &&
+        out.text.endsWith(
+          `\n${fill(MESSAGES.zh.hitSummary, {
+            groups: 2,
+            grouped: 10,
+            dedup,
+            limit: 10,
+            capped: "",
+            truncated: "",
+          })}`,
+        ),
+      "10 条分组计数对应 6 处不同位置",
     );
   });
 
@@ -1137,7 +1813,7 @@ describe("zg_search 执行", () => {
     applyTo(ctx);
     const ghost = path.join(ws(), "never-created");
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root: ghost, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root: ghost, query: "x" }, execOf(root)),
       /root 目录不存在/u,
     );
     assert.equal(ctx.shell.resolveCalls.length, 0);
@@ -1147,8 +1823,14 @@ describe("zg_search 执行", () => {
     ctx = makeCtx();
     applyTo(ctx);
     const search = toolOf(ctx, "zg_search");
-    await assert.rejects(() => search.execute(null, execOf()), /参数必须是一个 JSON 对象.*null/u);
-    await assert.rejects(() => search.execute(5, execOf()), /参数必须是一个 JSON 对象.*number/u);
+    await assert.rejects(
+      () => search.execute(null, execOf(root)),
+      /参数必须是一个 JSON 对象.*null/u,
+    );
+    await assert.rejects(
+      () => search.execute(5, execOf(root)),
+      /参数必须是一个 JSON 对象.*number/u,
+    );
   });
 
   it("冻结的模型参数（官方 deepFreeze）不抛错且默认 limit 生效", async () => {
@@ -1156,7 +1838,7 @@ describe("zg_search 执行", () => {
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("RESULT"));
     const frozen = Object.freeze({ root, query: "hi" });
-    const out = await toolOf(ctx, "zg_search").execute(frozen, execOf());
+    const out = await toolOf(ctx, "zg_search").execute(frozen, execOf(root));
     assert.deepEqual(out, { text: "RESULT" });
     assert.match(String(ctx.shell.resolveCalls[0]?.command), /--limit 10/u);
     assert.ok(!("limit" in frozen));
@@ -1167,11 +1849,8 @@ describe("zg_search 执行", () => {
     ctx.settingsValue = {};
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("RESULT"));
-    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf());
-    assert.equal(
-      ctx.shell.resolveCalls[0]?.command,
-      "zg query 'hi' --limit 10 --preview short --refresh wait --device 'auto' --mode direct",
-    );
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.equal(ctx.shell.resolveCalls[0]?.command, INDEXED_SEARCH_COMMAND);
     assert.equal(ctx.shell.resolveCalls[0].env, undefined);
   });
 
@@ -1182,7 +1861,7 @@ describe("zg_search 执行", () => {
     ctx.shell.runResults.push(okRun("RESULT"));
     await toolOf(ctx, "zg_search").execute(
       Object.freeze({ root, query: "hi", limit: 3 }),
-      execOf(),
+      execOf(root),
     );
     assert.match(String(ctx.shell.resolveCalls[0]?.command), /--limit 3/u);
   });
@@ -1196,7 +1875,7 @@ describe("zg_search 执行", () => {
       stderr: { text: "boom", truncated: false },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       /exit=2.*boom/u,
     );
   });
@@ -1212,7 +1891,7 @@ describe("zg_search 执行", () => {
       stderr: { text: long, truncated: false },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       /中间省略.*原因：磁盘满/u,
     );
   });
@@ -1226,7 +1905,7 @@ describe("zg_search 执行", () => {
       stderr: { text: "killed by signal", truncated: false },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       /exit=null/u,
     );
   });
@@ -1240,7 +1919,7 @@ describe("zg_search 执行", () => {
       stderr: { text: ZG_NOT_INSTALLED, truncated: false },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       /zg 未安装/u,
     );
   });
@@ -1255,7 +1934,7 @@ describe("zg_search 执行", () => {
       stderr: { text: "", truncated: false },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       /zg 执行超时/u,
     );
     ctx.shell.runResults.push({
@@ -1265,7 +1944,7 @@ describe("zg_search 执行", () => {
       stderr: { text: "", truncated: false },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       /zg 执行被中止/u,
     );
   });
@@ -1306,7 +1985,7 @@ describe("zg_search 执行", () => {
     await Promise.all(
       cases.map(([, pattern]) =>
         assert.rejects(
-          () => search.execute({ root, query: "x" }, execOf()),
+          () => search.execute({ root, query: "x" }, execOf(root)),
           (error: unknown) => {
             const message = error instanceof Error ? error.message : String(error);
             assert.match(message, pattern);
@@ -1329,7 +2008,7 @@ describe("zg_search 执行", () => {
       sandbox: { mode: SANDBOX_WORKSPACE_WRITE, denied: false, runnerFailed: true },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         assert.match(message, /runner 启动失败/u);
@@ -1346,7 +2025,7 @@ describe("zg_search 执行", () => {
       sandbox: { mode: "read-only", denied: true, enforcement: "partial" },
     });
     await assert.rejects(
-      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf()),
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
       /策略拒绝.*enforcement=partial/u,
     );
   });
@@ -1360,7 +2039,7 @@ describe("zg_search 执行", () => {
       stderr: { text: "", truncated: false },
       sandbox: { mode: "read-only", denied: true },
     });
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf())) as {
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root))) as {
       text: string;
     };
     assert.ok(out.text.includes("HITS"));
@@ -1375,7 +2054,7 @@ describe("zg_search 执行", () => {
       stdout: { text: "PART", truncated: true },
       stderr: { text: "", truncated: false },
     });
-    const plain = (await toolOf(ctx, "zg_search").execute({ root, query: "a" }, execOf())) as {
+    const plain = (await toolOf(ctx, "zg_search").execute({ root, query: "a" }, execOf(root))) as {
       text: string;
     };
     assert.ok(plain.text.includes("已截断") && !plain.text.includes("落盘"));
@@ -1384,7 +2063,10 @@ describe("zg_search 执行", () => {
       stdout: { text: "PART", truncated: true, spillPath: "/tmp/spill.log" },
       stderr: { text: "", truncated: false },
     });
-    const spilled = (await toolOf(ctx, "zg_search").execute({ root, query: "b" }, execOf())) as {
+    const spilled = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "b" },
+      execOf(root),
+    )) as {
       text: string;
     };
     assert.ok(spilled.text.includes("/tmp/spill.log"));
@@ -1398,7 +2080,7 @@ describe("zg_search 执行", () => {
       stdout: { text: "HITS", truncated: false },
       stderr: { text: "embedding 拉取失败，退化为纯词法检索", truncated: false },
     });
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf())) as {
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root))) as {
       text: string;
     };
     assert.ok(out.text.includes("zg stderr"));
@@ -1408,7 +2090,7 @@ describe("zg_search 执行", () => {
       stdout: { text: "HITS", truncated: false },
       stderr: { text: "跳过 --refresh", truncated: true },
     });
-    const marked = (await toolOf(ctx, "zg_search").execute({ root, query: "y" }, execOf())) as {
+    const marked = (await toolOf(ctx, "zg_search").execute({ root, query: "y" }, execOf(root))) as {
       text: string;
     };
     assert.ok(marked.text.includes("：[…]跳过 --refresh"));
@@ -1418,7 +2100,7 @@ describe("zg_search 执行", () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("CLEAN"));
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf())) as {
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root))) as {
       text: string;
     };
     assert.equal(out.text, "CLEAN");
@@ -1429,7 +2111,7 @@ describe("zg_search 执行", () => {
     ctx.settingsValue["hfEndpoint"] = "   ";
     applyTo(ctx);
     ctx.shell.runResults.push(okRun());
-    await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf());
+    await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root));
     assert.equal(ctx.shell.resolveCalls[0]?.env, undefined);
   });
 
@@ -1454,7 +2136,7 @@ describe("zg_search 执行", () => {
       stderr: { text: detail, truncated: false },
     });
     const rejected = await toolOf(ctx, "zg_search")
-      .execute({ root, query: "x" }, execOf())
+      .execute({ root, query: "x" }, execOf(root))
       .catch((error: unknown) => error);
     assert.ok(rejected instanceof Error, "exit=1 必须失败");
     // 期望串由文案模板逐层填出来（不抄中文句子），两半各少一枚 ⇒ 399 + 399。
@@ -1483,7 +2165,7 @@ describe("zg_search 执行", () => {
       stdout: { text: "HITS", truncated: false },
       stderr: { text: stderrText, truncated: false },
     });
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf())) as {
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root))) as {
       text: string;
     };
     // 成功路径也要断全文：注脚是**拼在成功结果尾部**进会话日志的那一段。
@@ -1505,7 +2187,7 @@ describe("zg_index / zg_status 执行", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     await assert.rejects(
-      () => toolOf(ctx, "zg_index").execute({ root }, execOf()),
+      () => toolOf(ctx, "zg_index").execute({ root }, execOf(root)),
       /缺少必填参数 confirm/u,
     );
     assert.equal(ctx.shell.resolveCalls.length, 0);
@@ -1515,10 +2197,10 @@ describe("zg_index / zg_status 执行", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("INDEXED"));
-    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf());
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
     assert.equal(
       ctx.shell.resolveCalls[0]?.command,
-      `zg index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode direct`,
+      `zg index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
     );
   });
 
@@ -1529,13 +2211,13 @@ describe("zg_index / zg_status 执行", () => {
     ctx.shell.runResults.push(okRun(), okRun());
     await toolOf(ctx, "zg_index").execute(
       { root, confirm: true, embedding: "local/potion-code-16m-v2" },
-      execOf(),
+      execOf(root),
     );
     assert.match(String(ctx.shell.resolveCalls[0]?.command), /--embedding 'local\/potion/u);
-    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf());
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
     assert.equal(
       ctx.shell.resolveCalls[1]?.command,
-      `zg index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode direct`,
+      `zg index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
     );
   });
 
@@ -1544,12 +2226,12 @@ describe("zg_index / zg_status 执行", () => {
     applyTo(ctx);
     ctx.shell.runResults.push(okRun(), okRun());
     await assert.rejects(
-      () => toolOf(ctx, "zg_index").execute({ root, confirm: true, rebuild: 1 }, execOf()),
+      () => toolOf(ctx, "zg_index").execute({ root, confirm: true, rebuild: 1 }, execOf(root)),
       /rebuild 必须是布尔值/u,
     );
     // drop=true 短路：其它非法布尔也要在构造前报错
     await assert.rejects(
-      () => toolOf(ctx, "zg_index").execute({ root, confirm: true, drop: "true" }, execOf()),
+      () => toolOf(ctx, "zg_index").execute({ root, confirm: true, drop: "true" }, execOf(root)),
       /drop 必须是布尔值/u,
     );
   });
@@ -1560,9 +2242,9 @@ describe("zg_index / zg_status 执行", () => {
     applyTo(ctx);
     const wanted = { HF_ENDPOINT: MODELSCOPE_MIRROR };
     ctx.shell.runResults.push(okRun(), okRun(), okRun());
-    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf());
-    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf());
-    await toolOf(ctx, "zg_status").execute({ root }, execOf());
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
     assert.deepEqual(ctx.shell.resolveCalls[0]?.env, wanted);
     assert.deepEqual(ctx.shell.resolveCalls[1]?.env, wanted);
     assert.deepEqual(ctx.shell.resolveCalls[2]?.env, wanted);
@@ -1572,18 +2254,236 @@ describe("zg_index / zg_status 执行", () => {
     assert.equal(started.proc.killCount, 0);
   });
 
+  it("默认部署：远程 embedding 三个开关都不下发 env，也不放开引用", async () => {
+    const ctx = makeCtx();
+    const restore = withEnv(EMBED_KEY_ENV, "sk-should-not-leak");
+    try {
+      applyTo(ctx);
+      // 端点/凭据都没配 ⇒ env 里只有 HF 镜像，一个远程相关的名字都没有。
+      ctx.shell.runResults.push(okRun());
+      await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
+      const env = ctx.shell.resolveCalls[0]?.env ?? {};
+      assert.equal(env["ZVEC_GREP_ENDPOINT"], undefined, "默认不得下发端点");
+      assert.equal(env["ZVEC_GREP_API_KEY"], undefined, "默认不得下发凭据");
+      assert.ok(!JSON.stringify(env).includes("sk-should-not-leak"), "默认不得读任何凭据");
+      // 显式远程引用在构造期就被拒。
+      await assert.rejects(
+        () =>
+          toolOf(ctx, "zg_index").execute(
+            { root, confirm: true, embedding: REMOTE_EMBEDDING },
+            execOf(root),
+          ),
+        /allowRemoteEmbedding/u,
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("部署开放后：端点与凭据经 env 下发，argv 里两者都不出现", async () => {
+    const ctx = makeCtx();
+    const restore = withEnv(EMBED_KEY_ENV, FAKE_KEY);
+    try {
+      applyTo(ctx, {
+        allowRemoteEmbedding: true,
+        remoteEmbeddingEndpoint: REMOTE_ENDPOINT,
+        remoteEmbeddingApiKeyFrom: EMBED_KEY_ENV,
+      });
+      ctx.shell.runResults.push(okRun());
+      await toolOf(ctx, "zg_index").execute(
+        { root, confirm: true, embedding: REMOTE_EMBEDDING },
+        execOf(root),
+      );
+      const [call] = ctx.shell.resolveCalls;
+      const env = call?.env ?? {};
+      assert.equal(env["ZVEC_GREP_ENDPOINT"], REMOTE_ENDPOINT);
+      assert.equal(env["ZVEC_GREP_API_KEY"], FAKE_KEY);
+      assert.equal(env["HF_ENDPOINT"], MODELSCOPE_MIRROR, "HF 镜像那一路不受影响");
+      // 关键：命令行（= 作业 label、卡片回显、ps 进程表）里不得有端点或密钥。
+      const command = String(call?.command);
+      assert.ok(!command.includes(FAKE_KEY), "argv 里不得出现凭据");
+      assert.ok(!command.includes("api.example.com"), "argv 里不得出现端点");
+      assert.ok(!command.includes("--api-key"), "本包不构造 --api-key");
+      assert.ok(!command.includes("--endpoint"), "本包不构造 --endpoint");
+    } finally {
+      restore();
+    }
+  });
+
+  it("部署值被塞成非字符串（绕过 schema）：按「没配」处理，不在命令构造中途抛", async () => {
+    // 这两个字段是**非 volatile** 部署值，正常装载下必有值；但行 config 若绕过 schema
+    // 直接塞进非字符串，这里必须判成「没配」而不是让 undefined.trim() 抛在半路。
+    // 走行 config 而不是 settingsValue 直写：非 volatile 字段是**装载期快照**，
+    // apply 之后再改 settingsValue 已经来不及了（本仓替身复刻的就是这个语义）。
+    // 而替身的 applyTo 不跑 schema 校验，正好把「绕过 schema」这件事复现出来。
+    const ctx = makeCtx();
+    applyTo(ctx, {
+      allowRemoteEmbedding: true,
+      remoteEmbeddingEndpoint: 42,
+      remoteEmbeddingApiKeyFrom: null,
+    });
+    ctx.shell.runResults.push(okRun("OK"));
+    const out = await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, embedding: REMOTE_EMBEDDING },
+      execOf(root),
+    );
+    assert.match((out as { text: string }).text, /^OK/u);
+    const env = ctx.shell.resolveCalls[0]?.env ?? {};
+    assert.equal(env["ZVEC_GREP_ENDPOINT"], undefined, "非字符串端点 = 没配");
+    assert.equal(env["ZVEC_GREP_API_KEY"], undefined, "非字符串凭据名 = 没配");
+  });
+
+  it("点名的那个环境变量没设/是空白：不下发凭据，但端点照发", async () => {
+    const ctx = makeCtx();
+    const restore = withEnv(EMBED_KEY_ENV, "   ");
+    try {
+      applyTo(ctx, {
+        allowRemoteEmbedding: true,
+        remoteEmbeddingEndpoint: REMOTE_ENDPOINT,
+        remoteEmbeddingApiKeyFrom: EMBED_KEY_ENV,
+      });
+      ctx.shell.runResults.push(okRun());
+      await toolOf(ctx, "zg_index").execute(
+        { root, confirm: true, embedding: REMOTE_EMBEDDING },
+        execOf(root),
+      );
+      const env = ctx.shell.resolveCalls[0]?.env ?? {};
+      assert.equal(env["ZVEC_GREP_ENDPOINT"], REMOTE_ENDPOINT);
+      assert.equal(
+        env["ZVEC_GREP_API_KEY"],
+        undefined,
+        "空白凭据等于没配：发一个空的 ZVEC_GREP_API_KEY 只会覆盖 zg 侧的真值",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("只开 allowRemoteEmbedding、没配端点与凭据名：引用放行，env 一个远程项都不加", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { allowRemoteEmbedding: true });
+    ctx.shell.runResults.push(okRun());
+    await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, embedding: REMOTE_EMBEDDING },
+      execOf(root),
+    );
+    const env = ctx.shell.resolveCalls[0]?.env ?? {};
+    assert.equal(env["ZVEC_GREP_ENDPOINT"], undefined);
+    assert.equal(env["ZVEC_GREP_API_KEY"], undefined);
+  });
+
   it("zg_status 构造 status 命令、root 缺省回会话工作区", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("STATUS"), okRun("STATUS2"));
-    await toolOf(ctx, "zg_status").execute({ root }, execOf());
-    assert.equal(ctx.shell.resolveCalls[0]?.command, `zg status '${root}' --mode direct`);
+    await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    assert.equal(ctx.shell.resolveCalls[0]?.command, `zg status '${root}' --mode auto`);
     // 回归护栏的另一侧：前台必须保留宿主 deadline 的缺省 kill 语义，不得被
     // onExpiry:'none' 变成无界（那是后台重建专用）。
     assert.equal(ctx.shell.resolveCalls[0].onExpiry, undefined);
     assert.ok(typeof ctx.shell.resolveCalls[0].timeoutMs === "number", "前台请求必须带 timeoutMs");
     await toolOf(ctx, "zg_status").execute({}, execOf(root));
     assert.equal(ctx.shell.resolveCalls[1]?.workdir, root);
+  });
+});
+
+// ── 就绪判定（--check-ready）与后台重建作业状态整合 ──
+//
+// 真实 zg 的契约是「preserves the normal output and exits non-zero unless the Workspace
+// index is ready」：就绪报告打在 stdout，退出码只表达就绪与否。走普通失败路径会把报告丢掉、
+// 只留一句 stderr，恰好扔掉用户最需要的输出。
+describe("zg_status 就绪判定", () => {
+  it("checkReady=true 透传 --check-ready", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ready");
+    ctx.shell.runResults.push(okRun("STATUS"));
+    await toolOf(ctx, "zg_status").execute({ root, checkReady: true }, execOf(root));
+    assert.equal(
+      ctx.shell.resolveCalls[0]?.command,
+      `zg status '${root}' --check-ready --mode auto`,
+    );
+  });
+
+  it("就绪：退出码 0 时照常返回报告", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ready");
+    ctx.shell.runResults.push(okRun("READY"));
+    const out = (await toolOf(ctx, "zg_status").execute(
+      { root, checkReady: true },
+      execOf(root),
+    )) as { text: string };
+    assert.equal(out.text, "READY");
+  });
+
+  it("未就绪：非零退出仍交回完整报告，并明说这不是执行失败", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ready");
+    // 照抄真实 zg：stdout 是「? Workspace index is not configured …」那份报告，
+    // stderr 是「Error: Workspace index is not ready (state: undecided)」。
+    const notReady = okRun(
+      "? Workspace index is not configured\n\n  Next        zg index or zg query --rg",
+    );
+    notReady.exitCode = 1;
+    notReady.stderr.text = NOT_READY_STDERR;
+    ctx.shell.runResults.push(notReady);
+    const out = (await toolOf(ctx, "zg_status").execute(
+      { root, checkReady: true },
+      execOf(root),
+    )) as { text: string };
+    assert.ok(out.text.startsWith("? Workspace index is not configured"), "报告必须交回");
+    assert.ok(out.text.includes(root), "注脚要带上根");
+    assert.ok(out.text.includes("未就绪"), "要明说未就绪");
+    assert.ok(out.text.includes("这不是执行失败"), "要区分「未就绪」与「执行失败」");
+    assert.ok(out.text.includes("is not ready"), "要把 zg 的原始判据一并交回");
+  });
+
+  it("未就绪但 stdout 为空：仍按失败抛（不凭空造一份报告）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ready");
+    const failed = okRun("");
+    failed.exitCode = 1;
+    failed.stderr.text = NOT_READY_STDERR;
+    ctx.shell.runResults.push(failed);
+    await assert.rejects(
+      () => toolOf(ctx, "zg_status").execute({ root, checkReady: true }, execOf(root)),
+      /is not ready/u,
+    );
+  });
+
+  it("未开 checkReady 时不吸收失败：非零退出照旧抛错", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ready");
+    const notReady = okRun("REPORT");
+    notReady.exitCode = 1;
+    notReady.stderr.text = NOT_READY_STDERR;
+    ctx.shell.runResults.push(notReady);
+    await assert.rejects(
+      () => toolOf(ctx, "zg_status").execute({ root }, execOf(root)),
+      /is not ready/u,
+    );
+  });
+
+  it("重建进行中：就绪判定让位给重建投影（此刻「是否就绪」的答案本就是否定的）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ready");
+    trackRoot(ctx, root);
+    const res = await postRebuild(ctx, root);
+    assert.equal(res.statusCode, 200, res.body);
+    // 重建本身已经起过后台进程，基线要记在状态查询之前。
+    const before = ctx.shell.resolveCalls.length;
+    const out = (await toolOf(ctx, "zg_status").execute(
+      { root, checkReady: true },
+      execOf(root),
+    )) as { text: string };
+    assert.ok(out.text.includes(root), "重建投影要带上根");
+    assert.match(out.text, /正在重建中/u);
+    assert.equal(ctx.shell.resolveCalls.length, before, "重建投影期间不另起子进程");
   });
 });
 
@@ -2677,6 +3577,166 @@ describe("部署值：超时与 stdout 上限走 Config", () => {
   });
 });
 
+// ── 命中摘要的口径（分组计数 vs 去重后位置数）──
+//
+// 断言面全是真实 zg 输出形状：`#<名次> matchedBy=<来源> <相对路径>:<行号范围>`。身份键
+// 取 `matchedBy=` 之后的整段原样文本——名次与匹配来源逐组变化，入键即失效；路径本身
+// 可以含空格与冒号，拆行号范围反而会误判。
+describe("hitSummary", () => {
+  const { zh } = MESSAGES;
+
+  it("同一条位置被多组命中、名次与来源都不同 → 只算一处位置", () => {
+    const out = hitSummary(
+      [
+        GROUP_HEADER_1,
+        GROUP_LINE_1,
+        "hits: 1",
+        "#1 matchedBy=fts src/beta.ts:1-3",
+        GROUP_LINE_2,
+        "hits: 1",
+        "#1 matchedBy=vector src/beta.ts:1-3",
+      ].join("\n"),
+      10,
+      false,
+      zh,
+    );
+    assert.equal(
+      out,
+      fill(zh.hitSummary, {
+        groups: 2,
+        grouped: 2,
+        dedup: fill(zh.hitDedup, { unique: 1 }),
+        limit: 10,
+        capped: "",
+        truncated: "",
+      }),
+    );
+  });
+
+  it("fuse 输出（matchedBy=fts+vector、单组）照常给出口径", () => {
+    const out = hitSummary(
+      "query groups (1):\nQ1 [supplemental]: parseConfig | parse a config file\nhits: 1\n" +
+        "#1 matchedBy=fts+vector src/beta.ts:1-3",
+      10,
+      false,
+      zh,
+    );
+    assert.ok(out?.includes(fill(zh.hitDedup, { unique: 1 })) === true, "fuse 单组也要给去重口径");
+  });
+
+  it("路径含空格与冒号 → 原样入键，不被拆错", () => {
+    const out = hitSummary(
+      "query groups (1):\nQ1: q\nhits: 2\n" +
+        "#1 matchedBy=fts deep/a/b/c d/we:ird file.ts:1-2\n" +
+        "#2 matchedBy=fts deep/a/b/c d/we:ird file.ts:9-9",
+      10,
+      false,
+      zh,
+    );
+    assert.ok(
+      out?.includes(fill(zh.hitDedup, { unique: 2 })) === true,
+      "两处行号不同 → 两处位置；含冒号的路径不能被截断成同一个键",
+    );
+  });
+
+  // 追踪开启后条目头行多出两段装饰（真实 zg 输出照抄）。回归点：分值逐组不同，
+  // 带它入键会让同一处位置在两个组里各成"新位置"，去重彻底失效。
+  it("--trace 头行的 score= 与选择理由都不入键，同一位置仍只算一处", () => {
+    const out = hitSummary(
+      [
+        GROUP_HEADER_1,
+        GROUP_LINE_1,
+        "hits: 2",
+        "#1 matchedBy=fts score=0.0164 src/beta.ts:1-2",
+        "#2 [global_fill] matchedBy=fts score=0.0161 src/alpha.ts:1",
+        'trace: query "parseConfig": fts #1, vector #2; fused #1',
+        GROUP_LINE_2,
+        "hits: 2",
+        "#1 matchedBy=vector score=0.0161 src/alpha.ts:1",
+        "#2 matchedBy=vector score=0.0164 src/beta.ts:1-2",
+      ].join("\n"),
+      10,
+      false,
+      zh,
+    );
+    assert.ok(
+      out?.includes(fill(zh.hitDedup, { unique: 2 })) === true,
+      `分值与名次都变了，同一处位置仍应是 2 处：${String(out)}`,
+    );
+  });
+
+  it("score 形态两种都收：整数与四位小数", () => {
+    const out = hitSummary(
+      "Q1: q\nhits: 2\n#1 matchedBy=fts score=1 src/a.ts:1-2\n#2 matchedBy=fts score=0.0325 src/a.ts:1-2",
+      10,
+      false,
+      zh,
+    );
+    assert.ok(out?.includes(fill(zh.hitDedup, { unique: 1 })) === true, String(out));
+  });
+
+  it("路径真以 score= 开头时不被误剥（纯数字才当分值）", () => {
+    const out = hitSummary(
+      "Q1: q\nhits: 2\n#1 matchedBy=fts score=1.txt:1-2\n#2 matchedBy=fts score=2.txt:1-2",
+      10,
+      false,
+      zh,
+    );
+    assert.ok(out?.includes(fill(zh.hitDedup, { unique: 2 })) === true, String(out));
+  });
+
+  it("preview 的源码行、标题行不误判成命中条目", () => {
+    const out = hitSummary(
+      [
+        "query groups (1):",
+        "Q1: q",
+        "hits: 1",
+        "#1 matchedBy=fts docs/gamma.md:1-4",
+        "heading: Config",
+        "heading_level: 1",
+        "source:",
+        "1\t# Config",
+        "2\t",
+        "3\tUse parseConfig.",
+      ].join("\n"),
+      10,
+      false,
+      zh,
+    );
+    assert.ok(
+      out?.includes(fill(zh.hitDedup, { unique: 1 })) === true,
+      "只有 #n matchedBy= 开头的行才入键",
+    );
+  });
+
+  it("有命中条目但无 hits 计数行 → 不出摘要（没有组口径就不编）", () => {
+    assert.equal(hitSummary("#1 matchedBy=fts src/beta.ts:1-3", 10, false, zh), null);
+  });
+
+  it("输出被截尾 → 去重口径只覆盖保留部分，与截尾片段一并出现", () => {
+    const out = hitSummary("Q1: q\nhits: 4\n#1 matchedBy=fts src/beta.ts:1-3", 10, true, zh);
+    assert.ok(
+      out !== null && out.includes(fill(zh.hitTruncated, {})) && out.includes("1"),
+      "截尾事实要显式化",
+    );
+  });
+
+  it("英文口径同源：分组与去重两栏都在", () => {
+    const out = hitSummary(
+      "Q1: q\nhits: 2\n#1 matchedBy=fts src/beta.ts:1-3\n#2 matchedBy=fts src/alpha.ts:1-3",
+      10,
+      false,
+      MESSAGES.en,
+    );
+    assert.ok(
+      out !== null &&
+        out.includes("2 hit(s) in grouped counts") &&
+        out.includes("2 distinct location(s) after dedup"),
+      `英文摘要缺口径：${String(out)}`,
+    );
+  });
+});
+
 // ── 索引探测的按目录缓存（guard 每次调用至多 9 层 existsSync → 命中后 0 次）──
 //
 // 缓存实例在 apply 闭包里，工集成路径不可见 existsSync 次数；工厂是导出面，用注入的
@@ -3222,9 +4282,11 @@ describe("0.1.7 隐式注册验收", () => {
     assert.deepEqual(form.toSorted(), EDITABLE, "投影字段集与设置卡预期可编辑项不一致");
   });
 
-  it("schema 字段全集 = 投影可编辑六项 + 四项非 volatile 部署值（W4）", () => {
-    // 部署值（超时三项 + stdout 上限）不该标 volatile：标了会挤上设置卡。这里拿
-    // schema 的字段全集对照两个期望清单，新增字段漏改期望时先红（ctx-observe 同款）。
+  it("schema 字段全集 = 投影可编辑六项 + 十项非 volatile 部署值（W4）", () => {
+    // 部署值（超时三项 + stdout 上限 + 传输模式 + 重建等待 + 远程 embedding 三件）
+    // 不该标 volatile：标了会挤上设置卡——尤其远程 embedding 那三项，一个是「允许把
+    // 工作区内容送出本机」的安全闸、一个是端点、一个是凭据的环境变量名，都不该由
+    // 设置卡写。这里拿 schema 的字段全集对照两个期望清单，新增字段漏改期望时先红。
     assert.deepEqual(
       Object.keys(configDict()).toSorted(),
       [
@@ -3233,6 +4295,12 @@ describe("0.1.7 隐式注册验收", () => {
         "statusTimeoutMs",
         "indexTimeoutMs",
         "stdoutMaxBytes",
+        "clientMode",
+        "rebuildWaitMs",
+        "allowRemoteEmbedding",
+        "remoteEmbeddingEndpoint",
+        "remoteEmbeddingApiKeyFrom",
+        "requireApprovalForExplicitRoot",
       ].toSorted(),
     );
   });
@@ -3370,5 +4438,1124 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
     );
     assert.equal(res.statusCode, 403);
     assert.match(res.body, /cross-origin/u);
+  });
+});
+
+/**
+ * 让出若干轮微任务（递归链，不在循环里 await）。
+ * @param remaining 还剩几轮
+ * @returns 全部让出后的兑现
+ */
+async function drainMicrotasks(remaining: number): Promise<void> {
+  if (remaining <= 0) {
+    return;
+  }
+  await Promise.resolve();
+  return drainMicrotasks(remaining - 1);
+}
+
+/** 让出若干轮微任务：把调用方推进到「下一次 await」之后的那个位置。 */
+async function microTicks(count: number): Promise<undefined> {
+  await drainMicrotasks(count);
+  return undefined;
+}
+
+/** 造一个带索引库的临时工作区（供重建期门禁用例）。 */
+function makeIndexedTemp(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "zvec-grep-idx-"));
+  makeIndexed(dir);
+  return dir;
+}
+
+/** zg 重建持锁时的一次失败执行（锁名、操作名、进程号都按实测抄）。 */
+function lockBusyRun(ownerOperation = "index.rebuild"): ShellRunResult {
+  const stderr = [
+    "Error: Index unavailable",
+    "Code: ZVEC_GREP.ENGINE.LOCK.BUSY",
+    "Details:",
+    "  lock: /ws/.zvec-grep/locks/home.write",
+    "  operation: info",
+    `  ownerOperation: ${ownerOperation}`,
+    "  ownerPid: 14962",
+  ].join("\n");
+  return {
+    exitCode: 1,
+    stdout: { text: "", truncated: false },
+    stderr: { text: stderr, truncated: false },
+  };
+}
+
+/**
+ * 在被测插件里登记一条「正在重建」的占位并把落定开关交回测试。
+ * 走的是重建端点那条真实接线（卡片发起），不是直接摸内部状态——否则这条用例
+ * 自己就成了自证。
+ */
+async function rebuildInFlight(
+  ctx: MockCtx,
+  root: string,
+): Promise<{ release: () => Promise<void> }> {
+  trackRoot(ctx, root);
+  const before = ctx.shell.startedProcs.length;
+  const res = await postRebuild(ctx, root);
+  assert.equal(res.statusCode, 200, res.body);
+  return { release: () => settleRebuilds(ctx, before) };
+}
+
+// ── 穷举词法检索通道（无索引时的首选路径）──
+//
+// 三条判据各自有实测支撑：zg 在索引根的**子目录**里同样检索得到（所以判据用 findIndexRoot
+// 向上找，不是「根自身有没有」）；--rg 的合法旗标集合与索引通道不同（见 lib/cli.ts 的
+// assertExhaustiveArgs）；穷举不发放 grep/rg 配额（不读索引就不构成「先用过语义检索」）。
+// ── 子代理与主代理共享一份检索解锁 ──
+//
+// 分片键取的是会话沿 `header.parentSession` 上溯到的**根**：主代理搜过一次，同一棵委派树上的
+// 子代理随即就能用那几次 grep/rg。否则「语义检索优先」在多代理下等于失效——每个子代理都得
+// 自己搜一次才解锁，而它们搜的往往是同一棵树。
+/**
+ * 一次 grep 裁决：放行返回 undefined，被拦返回拒绝理由。
+ * `parent` 即该会话 header 上的 `parentSession`（子代理会话挂在谁下面）。
+ */
+function grepVerdict(
+  ctx: MockCtx,
+  cwd: string,
+  id: string,
+  parent?: string,
+  command = "grep foo",
+): string | undefined {
+  return guardOf(ctx)({
+    name: "bash",
+    arguments: { command },
+    agent: {
+      session: { id, header: { cwd, ...(parent === undefined ? {} : { parentSession: parent }) } },
+    },
+  });
+}
+
+// ── 模型侧后台索引 ──
+//
+// 一次 zg_index(background=true) 应当把「起进程 + 登记作业 + 挂超时回收」全做完，把可轮询的
+// 作业号交回后立刻返回；起的作业与设置卡那条重建在名册上同形，所以卡片也能看见。
+describe("模型侧后台索引", () => {
+  it("返回可轮询的作业号，且本次调用不挂着", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs("bg");
+    const out = (await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, background: true },
+      execOf(root),
+    )) as { text: string };
+    assert.match(out.text, /root|后台/u);
+    assert.ok(out.text.includes(root), "要带上根");
+    assert.match(out.text, /zg index/u, "要把实际命令交回，便于模型复述");
+    assert.equal(ctx.shell.resolveCalls.length, 1, "只起一条 zg");
+    assert.equal(ctx.shell.resolveCalls[0]?.onExpiry, "none", "后台路径要无界执行");
+  });
+
+  it("起的作业进了官方注册表：卡片轮询能读到同一条", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs("bg");
+    const out = (await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, background: true },
+      execOf(root),
+    )) as { text: string };
+    const started = ctx.jobs.list();
+    assert.equal(started.length, 1, "应登记进官方名册");
+    const polled = await fetchStatus(ctx, started[0]?.id ?? "");
+    assert.equal(polled.statusCode, 200, `卡片轮询端点要认这条作业：${polled.body}`);
+    assert.ok(out.text.includes(started[0]?.id ?? "x"), "交回的作业号要与名册一致");
+  });
+
+  it("占位互斥跨入口成立：卡片那条跟随模型起的同根作业，绝不另起第二条 zg", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs("bg");
+    trackRoot(ctx, root);
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true, background: true }, execOf(root));
+    const mine = ctx.jobs.list()[0]?.id;
+    const before = ctx.shell.startedProcs.length;
+    const res = await postRebuild(ctx, root);
+    assert.equal(res.statusCode, 200, "同根已在跑，卡片应跟随而不是拒绝");
+    const followed: unknown = JSON.parse(res.body);
+    assert.equal(
+      typeof followed === "object" && followed !== null
+        ? Reflect.get(followed, "jobId")
+        : undefined,
+      mine,
+      "跟随的正是模型起的那条",
+    );
+    assert.equal(ctx.shell.startedProcs.length, before, "绝不能另起第二条 zg");
+  });
+
+  it("同根第二次后台索引：拒并交回在飞提示，不起第二条", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs("bg");
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true, background: true }, execOf(root));
+    const before = ctx.shell.startedProcs.length;
+    const again = (await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, background: true },
+      execOf(root),
+    )) as { text: string };
+    assert.ok(again.text.length > 0, "要答完，不能静默");
+    assert.equal(ctx.shell.startedProcs.length, before, "不起第二条");
+  });
+
+  it("宿主没装作业注册表时：答不可用、交还占位，绝不起一条没人管的 zg", async () => {
+    const ctx = makeCtx();
+    ctx.noJobs = true;
+    applyTo(ctx);
+    const root = bareWs("bg");
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_index").execute({ root, confirm: true, background: true }, execOf(root)),
+      /ctx\.jobs/u,
+    );
+    assert.equal(ctx.shell.startedProcs.length, 0, "起一条没人收的 zg 比不起更糟");
+    // 占位已交还：随后走前台重建不再被「在飞」挡住。
+    ctx.noJobs = false;
+    ctx.shell.runResults.push(okRun("DONE"));
+    const out = await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, rebuild: true },
+      execOf(root),
+    );
+    assert.ok(out !== undefined);
+  });
+
+  it("spawn 抛错：交还占位并把原因交给模型，绝不留下永久「在飞」", async () => {
+    const ctx = makeCtx();
+    ctx.shell.startThrows = "error";
+    applyTo(ctx);
+    const root = bareWs("bg");
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_index").execute({ root, confirm: true, background: true }, execOf(root)),
+      /启动重建失败/u,
+    );
+    // 占位必须已交还：同一棵树随后仍能正常起一次前台重建。
+    ctx.shell.startThrows = "none";
+    ctx.shell.runResults.push(okRun("DONE"));
+    const out = await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, rebuild: true },
+      execOf(root),
+    );
+    assert.ok(out !== undefined);
+  });
+
+  it("登记时注册表已被换掉：收掉刚起的 zg、拒登记，并交还占位", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs("bg");
+    trackRoot(ctx, root);
+    // spawn 那一拍之后 jobs 消失 → 登记时才发现服务没了。
+    ctx.shell.vanishJobsAfterExecute = 1;
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_index").execute({ root, confirm: true, background: true }, execOf(root)),
+      /ctx\.jobs/u,
+    );
+    assert.equal(ctx.shell.startedProcs[0]?.killCount, 1, "没人管的 zg 要收掉");
+  });
+
+  it("后台建索引同样与设置卡的重建互斥（占位在第一个 await 之前就抢）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs("bg");
+    trackRoot(ctx, root);
+    const res = await postRebuild(ctx, root);
+    assert.equal(res.statusCode, 200, res.body);
+    const before = ctx.shell.startedProcs.length;
+    const out = (await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, background: true },
+      execOf(root),
+    )) as { text: string };
+    assert.ok(out.text.length > 0, "要答完");
+    assert.equal(ctx.shell.startedProcs.length, before, "卡片那条已在跑，不得另起");
+  });
+});
+
+describe("宿主没有会话存储时的降级", () => {
+  it("上溯停在已知的最后一跳，功能不中断（仍不阻断任何调用）", async () => {
+    const ctx = makeCtx();
+    ctx.noSessions = true;
+    applyTo(ctx);
+    const root = ws("nosess");
+    // 查不到任何父 → 键就是自己的 id，主代理自己搜自己用得着。
+    ctx.shell.runResults.push(okRun("HITS"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root, "main"));
+    const verdict = guardOf(ctx)({
+      name: "bash",
+      arguments: { command: "grep foo" },
+      agent: { session: { id: "main", header: { cwd: root } } },
+    });
+    assert.equal(verdict, undefined, "没有会话存储也不该把功能关掉");
+  });
+
+  it("子代理带 parentSession 时退到父会话，而不是无视它", async () => {
+    const ctx = makeCtx();
+    ctx.noSessions = true;
+    applyTo(ctx);
+    const root = ws("nosess");
+    ctx.shell.runResults.push(okRun("HITS"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root, "main"));
+    const verdict = guardOf(ctx)({
+      name: "bash",
+      arguments: { command: "grep foo" },
+      agent: { session: { id: "child", header: { cwd: root, parentSession: "main" } } },
+    });
+    assert.equal(verdict, undefined, "一跳之内仍能对上主代理的额度");
+  });
+});
+
+const ROOT_SESSION = "root-session";
+/** 兄弟子代理树：两个子代理都挂在 mid 下，mid 再挂到根会话。 */
+const SIBLING_TREE: Record<string, string> = { kidA: "mid", kidB: "mid", mid: ROOT_SESSION };
+
+// ── 常驻表的有效期与最近使用淘汰 ──
+//
+// 两张表原来都按插入序淘汰。一张「每次成功检索都重置同一批键」的表永远淘汰不掉真正冷掉
+// 的项，而一条很久没被碰过的键一直占位；且一个上月开过的工作区不该今天还占着白名单名额。
+// 改成「命中即触摸 + 先按有效期、再按最近使用淘汰」。
+/** 非法 root 的样本：相对路径（非绝对）。 */
+const RELATIVE_ROOT = "relative/path";
+
+/** 白名单用例里的第 n 号工作区路径。 */
+function wsRoot(index: number): string {
+  return `/ws/root-${String(index)}`;
+}
+
+describe("工作区白名单的有效期与最近使用", () => {
+  const root = wsRoot;
+
+  it("命中即触摸：常被查到的那条不会被更早插入的冷条挤掉", () => {
+    const now = 1000;
+    const ledger = createRootLedger(MESSAGES.zh, 2, () => now, 60_000);
+    ledger.add(root(1));
+    ledger.add(root(2));
+    assert.equal(ledger.has(root(1)), true, "先碰一下 1，把它挪到队尾");
+    ledger.add(root(3));
+    assert.equal(ledger.has(root(1)), true, "1 最近用过，不该被 2 挤掉");
+    assert.equal(ledger.has(root(2)), false, "2 最久没用过，先走");
+  });
+
+  it("有效期：很久没被提到的条目直接失效，且不再占名额", () => {
+    let now = 1000;
+    const ledger = createRootLedger(MESSAGES.zh, 8, () => now, 500);
+    ledger.add(root(1));
+    now = 1400;
+    assert.equal(ledger.has(root(1)), true, "还没到有效期");
+    now = 1600;
+    assert.equal(ledger.has(root(1)), false, "过了有效期");
+  });
+
+  it("有效期与容量两条同时成立：过期先被清掉，冷条才轮到最近使用淘汰", () => {
+    let now = 1000;
+    const ledger = createRootLedger(MESSAGES.zh, 2, () => now, 200);
+    ledger.add(root(1));
+    now = 1150;
+    ledger.add(root(2));
+    // root(1) 已过期，root(2) 仍有效
+    now = 1300;
+    ledger.add(root(3));
+    assert.equal(ledger.has(root(2)), true, "仍有效的条不该被过期清理误伤");
+    assert.deepEqual(ledger.list().length, 2, "上界仍是 2");
+  });
+
+  it("非法 root 不进表（相对路径 / 越界）", () => {
+    const ledger = createRootLedger(MESSAGES.zh, 8, () => 1000, 60_000);
+    ledger.add(RELATIVE_ROOT);
+    ledger.add("/ws/../..");
+    assert.deepEqual(ledger.list(), []);
+    assert.equal(ledger.has(RELATIVE_ROOT), false);
+    assert.equal(ledger.has("/ws/ok"), false);
+  });
+});
+
+describe("解锁表的最近使用淘汰", () => {
+  it("重新检索即刷新时效：额度在窗内一直可用", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("lru");
+    const search = async (id: string): Promise<unknown> => {
+      ctx.shell.runResults.push(okRun("HITS"));
+      return toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root, id));
+    };
+    await search("s1");
+    await search("s3");
+    await search("s1");
+    const canGrep = (id: string): boolean =>
+      guardOf(ctx)({
+        name: "grep",
+        arguments: { path: root },
+        agent: { session: { id, header: { cwd: root } } },
+      }) === undefined;
+    assert.equal(canGrep("s1"), true, "s1 有额度");
+    assert.equal(canGrep("s3"), true, "s3 有额度");
+  });
+});
+
+/** 造一个「有 .zvec-grep 目录」但清单内容任给的工作区。 */
+function withWorkspaceManifest(name: string, body: string): string {
+  const dir = bareWs(name);
+  mkdirSync(path.join(dir, ZG_INDEX_DIR), { recursive: true });
+  writeFileSync(path.join(dir, ZG_INDEX_DIR, ZG_MANIFEST_FILE), body);
+  return dir;
+}
+
+/** 起一个已 apply 的上下文。 */
+function appliedCtx(): MockCtx {
+  const ctx = makeCtx();
+  applyTo(ctx);
+  return ctx;
+}
+
+/** 在一个已建索引的工作区上跑一次检索，stdout 固定为 OUT，stderr 任给。 */
+async function searchWithStderr(stderr: string): Promise<string> {
+  const ctx = appliedCtx();
+  const root = ws("stderr");
+  const result = okRun("OUT");
+  result.stderr.text = stderr;
+  ctx.shell.runResults.push(result);
+  const out = (await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root))) as {
+    text: string;
+  };
+  return out.text;
+}
+
+// ── 成功执行的 stderr 分类 ──
+//
+// zg 在成功时也往 stderr 写索引进度（非 TTY 下逐行落盘）。这些行每次建索引都在，写进回执
+// 只是噪声；真正要交回的是降级提示、锁冲突与任何**不认识**的新告警——所以判据是「只丢
+// 认得的进度行」，而不是「只留认得的告警」。
+describe("成功执行的 stderr 分类", () => {
+  const runWithStderr = searchWithStderr;
+
+  it("整段都是索引进度 → 一句注脚都不加", async () => {
+    const text = await runWithStderr(
+      ["Scanning files...", "Preparing local/qwen3-embedding-0.6b", "Indexing complete", ""].join(
+        "\n",
+      ),
+    );
+    assert.equal(text, "OUT", `不该有任何注脚：${text}`);
+  });
+
+  it("降级提示原样交回（进度行滤掉、告警留下）", async () => {
+    const text = await runWithStderr(
+      [
+        "Scanning files...",
+        "warning: --refresh background requires Server mode; Direct mode uses --refresh off",
+      ].join("\n"),
+    );
+    assert.ok(text.includes("refresh background requires Server mode"), text);
+    assert.ok(!text.includes("Scanning files"), "进度行要滤掉");
+  });
+
+  it("部分文件失败的信号必须留着：Indexing completed with N failed file(s)", async () => {
+    const text = await runWithStderr(
+      ["Indexing complete", "Indexing completed with 3 failed files"].join("\n"),
+    );
+    assert.ok(
+      text.includes("3 failed files"),
+      `字面上以「Indexing complete」开头，不能被前缀误伤：${text}`,
+    );
+  });
+
+  it("不认识的新告警一律留下（只丢认得的进度行，不做白名单式过滤）", async () => {
+    const text = await runWithStderr(
+      ["Something Entirely New Appeared In zg 9.9", "Downloading model · 42% · 1.0 MB/2.0 MB"].join(
+        "\n",
+      ),
+    );
+    assert.ok(text.includes("Entirely New"), text);
+    assert.ok(!text.includes("Downloading"), "下载进度是噪声");
+  });
+
+  it("signalStderr 直测：空白行一并去掉，保留顺序", () => {
+    assert.equal(signalStderr(""), "");
+    assert.equal(signalStderr("\n\n  \n"), "");
+    assert.equal(signalStderr("Model ready: m\nwarning: w\n"), "warning: w");
+    assert.equal(signalStderr("Indexing complete\nIndexing complete\n"), "");
+  });
+});
+
+// ── 索引探测：清单结构与根路径覆盖 ──
+//
+// 只判「文件在不在」会把两种实况误判成有索引：文件在但不是一份清单，以及清单在但根路径
+// 不覆盖这个目录（此时在该目录检索必然失败，而门禁却按「已建索引」拦着 grep/rg）。
+describe("索引探测的清单校验", () => {
+  const withManifest = withWorkspaceManifest;
+  const makeApplied = appliedCtx;
+
+  it("结构完整的清单且根路径覆盖本目录 → 判为有索引", () => {
+    const dir = bareWs("ok");
+    makeIndexed(dir);
+    // 有索引 ⇒ 门禁拦 grep（尚未检索过）。
+    const ctx = makeApplied();
+    const reason = guardOf(ctx)({
+      name: "grep",
+      arguments: { path: dir },
+      agent: { session: { id: "probe", header: { cwd: dir } } },
+    });
+    assert.notEqual(reason, undefined, "合法清单应被认成已建索引");
+  });
+
+  it("清单不是 JSON / 缺字段 / rootPaths 为空 → 判为无索引（不因为坏文件把门禁关死）", () => {
+    for (const body of [
+      "not json at all",
+      "{}",
+      JSON.stringify({ manifestVersion: 1 }),
+      JSON.stringify({ manifestVersion: 1, rootPaths: [] }),
+      JSON.stringify({ manifestVersion: 1, rootPaths: [{ recursive: true }] }),
+    ]) {
+      const dir = withManifest("bad", body);
+      const ctx = makeApplied();
+      const reason = guardOf(ctx)({
+        name: "grep",
+        arguments: { path: dir },
+        agent: { session: { id: "probe", header: { cwd: dir } } },
+      });
+      assert.equal(reason, undefined, `这份清单不该被认成索引：${body}`);
+    }
+  });
+
+  it("清单在但根路径指向别处 → 判为无索引（在该目录检索本来就会失败）", () => {
+    const dir = withManifest(
+      "other",
+      JSON.stringify({
+        manifestVersion: 1,
+        rootPaths: [{ absolutePath: "/somewhere/else", recursive: true }],
+      }),
+    );
+    const ctx = makeApplied();
+    const reason = guardOf(ctx)({
+      name: "grep",
+      arguments: { path: dir },
+      agent: { session: { id: "probe", header: { cwd: dir } } },
+    });
+    assert.equal(reason, undefined, "覆盖不到本目录就不算有索引");
+  });
+
+  it("清单写的是解析过的 /private 前缀、调用方给的是未解析形式", () => {
+    const dir = bareWs("private");
+    mkdirSync(path.join(dir, ZG_INDEX_DIR), { recursive: true });
+    // 实测上游清单里的 absolutePath 是**未解析**那一支，而调用方完全可能交来解析过的形式。
+    // 两边都再剥一次 /private 前缀再比，故两种写法都能对上。
+    writeFileSync(
+      path.join(dir, ZG_INDEX_DIR, ZG_MANIFEST_FILE),
+      JSON.stringify({
+        manifestVersion: 1,
+        rootPaths: [{ absolutePath: `/private${dir}`, recursive: true }],
+      }),
+    );
+    const ctx = makeApplied();
+    const reason = guardOf(ctx)({
+      name: "grep",
+      arguments: { path: dir },
+      agent: { session: { id: "probe", header: { cwd: dir } } },
+    });
+    assert.notEqual(reason, undefined, "两种写法指同一处，不该判成无索引");
+  });
+
+  it("清单在但缺 manifestVersion → 判为无索引", () => {
+    const dir = withManifest(
+      "noversion",
+      JSON.stringify({ rootPaths: [{ absolutePath: "/x", recursive: true }] }),
+    );
+    const ctx = makeApplied();
+    const reason = guardOf(ctx)({
+      name: "grep",
+      arguments: { path: dir },
+      agent: { session: { id: "probe", header: { cwd: dir } } },
+    });
+    assert.equal(reason, undefined, "不是本包认的清单版本");
+  });
+
+  it("清单版本不是当前认的那一版 → 判为无索引（上游读它会硬失败，索引一次也读不了）", () => {
+    // 上游 isWorkspaceManifest 要求 manifestVersion 严格等于 CURRENT_MANIFEST_VERSION，
+    // 不等就抛 MANIFEST.INVALID。此处若宽松放行，门禁会按「已建索引」拦住 grep/rg，
+    // 而 zg_search 每次都只会撞上那个硬失败——用户等于被卡死在没有出口的状态。
+    // 根路径一律写成本目录，确保命中的判据只有版本这一条。
+    for (const version of [2, 0, "1", null, undefined]) {
+      const dir = bareWs(`ver${String(version)}`);
+      const body: Record<string, unknown> = {
+        rootPaths: [{ absolutePath: dir, recursive: true }],
+      };
+      if (version !== undefined) {
+        body["manifestVersion"] = version;
+      }
+      mkdirSync(path.join(dir, ZG_INDEX_DIR), { recursive: true });
+      writeFileSync(path.join(dir, ZG_INDEX_DIR, ZG_MANIFEST_FILE), JSON.stringify(body));
+      const ctx = makeApplied();
+      const reason = guardOf(ctx)({
+        name: "grep",
+        arguments: { path: dir },
+        agent: { session: { id: "probe", header: { cwd: dir } } },
+      });
+      assert.equal(reason, undefined, `版本 ${String(version)} 不该被认成可检索索引`);
+    }
+  });
+});
+
+describe("子代理共享检索解锁", () => {
+  it("主代理搜过之后，它的子代理立刻能用那份额度（不必自己再搜一次）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("deleg");
+    // child -> main（子代理会话挂在主会话下）
+    ctx.sessionLinks = { child: "main" };
+    ctx.shell.runResults.push(okRun("HITS"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root, "main"));
+    assert.equal(
+      grepVerdict(ctx, root, "child", "main"),
+      undefined,
+      "子代理应共享主代理那次检索解锁的额度",
+    );
+  });
+
+  it("额度在整棵树上一起扣，不是每个子代理各得一份", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("deleg");
+    ctx.sessionLinks = SIBLING_TREE;
+    ctx.shell.runResults.push(okRun("HITS"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root, ROOT_SESSION));
+    // 默认额度 3：三个身份（两个兄弟子代理 + 它们的父）连用三次，第四次该被拦。
+    assert.equal(grepVerdict(ctx, root, "kidA", "mid"), undefined);
+    assert.equal(grepVerdict(ctx, root, "kidB", "mid"), undefined);
+    assert.equal(grepVerdict(ctx, root, "mid", ROOT_SESSION), undefined);
+    assert.notEqual(grepVerdict(ctx, root, "kidA", "mid"), undefined, "总额度用尽后应被拦");
+  });
+
+  it("另一棵委派树不共享（各有各的额度）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("deleg");
+    ctx.sessionLinks = { childA: "mainA", childB: "mainB" };
+    ctx.shell.runResults.push(okRun("HITS"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root, "mainA"));
+    assert.equal(grepVerdict(ctx, root, "childA", "mainA"), undefined);
+    assert.notEqual(grepVerdict(ctx, root, "childB", "mainB"), undefined, "另一棵树没有检索证据");
+  });
+
+  it("穷举检索仍不发配额：子代理也一样拿不到", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("deleg");
+    ctx.sessionLinks = { child: "main" };
+    ctx.shell.runResults.push(okRun("RESULT"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "x", rg: true }, execOf(root, "main"));
+    assert.notEqual(grepVerdict(ctx, root, "child", "main"), undefined);
+  });
+});
+
+describe("穷举词法检索通道", () => {
+  it("无索引：自动改走 --rg，并在结果前显式声明这次是字面匹配", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs();
+    ctx.shell.runResults.push(okRun("src/a.ts\n  1: hit"));
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hit" }, execOf(root))) as {
+      text: string;
+    };
+    assert.equal(
+      ctx.shell.resolveCalls[0]?.command,
+      "zg query --rg 'hit' --limit 10 --device 'auto' --mode auto",
+    );
+    assert.ok(
+      out.text.startsWith(MESSAGES.zh.exhaustiveFallbackNote),
+      "自动改道必须声明，否则就是静默给出与请求不符的答案",
+    );
+    assert.ok(out.text.endsWith("src/a.ts\n  1: hit"));
+  });
+
+  it("有索引：照常走索引检索，不加那条声明", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.equal(ctx.shell.resolveCalls[0]?.command, INDEXED_SEARCH_COMMAND);
+    assert.ok(!out.text.includes("穷举"), "有索引就不该出现穷举声明");
+  });
+
+  it("祖先目录有索引时也算「有索引」（与 zg 向上找索引的行为一致）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const child = path.join(root, "packages", "app");
+    mkdirSync(child, { recursive: true });
+    ctx.shell.runResults.push(okRun("RESULT"));
+    await toolOf(ctx, "zg_search").execute({ root: child, query: "hi" }, execOf(child));
+    assert.ok(
+      !(ctx.shell.resolveCalls[0]?.command ?? "").includes("--rg"),
+      "子目录应沿用祖先索引，不该退化成穷举",
+    );
+  });
+
+  it("rg=true 显式要求穷举：即使有索引也走 --rg，且不加自动改道声明", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi", rg: true },
+      execOf(root),
+    )) as { text: string };
+    assert.ok((ctx.shell.resolveCalls[0]?.command ?? "").startsWith("zg query --rg 'hi'"));
+    assert.equal(out.text, "RESULT", "模型自己要的就不要再加旁白");
+  });
+
+  it("rg=false 显式只要索引检索：无索引时不静默改道，交给 zg 报未建索引", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs();
+    ctx.shell.runResults.push(okRun("RESULT"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    assert.ok(!(ctx.shell.resolveCalls[0]?.command ?? "").includes("--rg"));
+  });
+
+  it("穷举模式不发放 grep/rg 配额：不读索引就不构成「先用过语义检索」", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    // 索引在祖先上、穷举发生在子目录：配额发放的唯一判据就是「这次走的是索引检索」，
+    // 所以这里 indexRoot 明明找得到，仍不该发。
+    const root = ws();
+    const child = path.join(root, "pkg");
+    mkdirSync(child, { recursive: true });
+    ctx.shell.runResults.push(okRun("RESULT"));
+    await toolOf(ctx, "zg_search").execute({ root: child, query: "hi", rg: true }, execOf(child));
+    const reason = guardOf(ctx)({
+      name: "bash",
+      arguments: { command: "grep foo" },
+      agent: { session: { id: "sess-1", header: { cwd: child } } },
+    });
+    assert.notEqual(reason, undefined, "穷举检索后 grep/rg 仍应被门禁拦住");
+  });
+
+  it("索引检索成功仍照常发放配额（穷举那条不误伤正常路径）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    ctx.shell.runResults.push(okRun("RESULT"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    const reason = guardOf(ctx)({
+      name: "bash",
+      arguments: { command: "grep foo" },
+      agent: { session: { id: "sess-1", header: { cwd: root } } },
+    });
+    assert.equal(reason, undefined, "索引检索成功后 grep/rg 应被放行");
+  });
+
+  it("穷举模式收到索引侧参数即在构造阶段拒绝（不静默丢弃，也不丢给 zg 去失败）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs();
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_search").execute(
+          { root, query: "hi", rg: true, preview: "full" },
+          execOf(root),
+        ),
+      /穷举检索（rg=true）与下列索引侧参数互斥：preview/u,
+    );
+    assert.equal(ctx.shell.resolveCalls.length, 0, "构造阶段就该停，不该起子进程");
+  });
+});
+
+// ── root 授权 ──
+
+/** 在指定会话工作区下检索一个根；结果直接交回调用方断言。 */
+async function searchIn(ctx: MockCtx, root: string, cwd?: string): Promise<unknown> {
+  ctx.shell.runResults.push(okRun("OK"));
+  return toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(cwd));
+}
+
+describe("root 授权", () => {
+  it("缺省 root（会话工作区本身）：放行", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const out = await searchIn(ctx, root, root);
+    assert.deepEqual(out, { text: "OK" });
+  });
+
+  it("显式 root 与会话工作区相同：放行", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const out = await searchIn(ctx, root, root);
+    assert.deepEqual(out, { text: "OK" });
+  });
+
+  it("显式 root 是会话工作区的下级：放行（同一棵树）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const base = ws();
+    const child = path.join(base, "packages");
+    mkdirSync(child, { recursive: true });
+    const out = await searchIn(ctx, child, base);
+    assert.deepEqual(out, { text: "OK" });
+  });
+
+  it("显式 root 是会话工作区的上级：放行（同一棵树）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const base = ws();
+    const child = path.join(base, "sub");
+    mkdirSync(child, { recursive: true });
+    const out = await searchIn(ctx, base, child);
+    assert.deepEqual(out, { text: "OK" });
+  });
+
+  it("显式 root 与会话工作区毫无关系：拒", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const here = ws("here");
+    const elsewhere = ws("elsewhere");
+    await assert.rejects(() => searchIn(ctx, elsewhere, here), /未获授权/u);
+  });
+
+  it("没有会话工作区时，显式 root 一律拒（无从判断可操作范围）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const elsewhere = ws("elsewhere");
+    await assert.rejects(() => searchIn(ctx, elsewhere), /未获授权/u);
+  });
+
+  it("前缀相同但不是祖先关系（/fo 与 /foo）：判为无关", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    // 造一对真实存在、且其中一个是另一个名字前缀的目录（/fo… 与 /fo…-x）。
+    const base = mkdtempSync(path.join(tmpdir(), "zvec-fo-"));
+    createdDirs.push(base);
+    const prefixed = `${base}-x`;
+    mkdirSync(prefixed, { recursive: true });
+    createdDirs.push(prefixed);
+    await assert.rejects(() => searchIn(ctx, prefixed, base), /未获授权/u);
+  });
+
+  it("被拒的调用不会把自己写进白名单：下一次仍然拒", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const here = ws("here");
+    const elsewhere = ws("elsewhere");
+    await assert.rejects(() => searchIn(ctx, elsewhere, here), /未获授权/u);
+    await assert.rejects(() => searchIn(ctx, elsewhere, here), /未获授权/u);
+  });
+
+  it("授权通过后即入白名单：另一个会话可用同一根", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const first = ws("first");
+    const second = ws("second");
+    await searchIn(ctx, first, first);
+    // 第二个会话并没有把 second 当工作区，但 first 已进白名单 ⇒ 放行。
+    const out = await searchIn(ctx, first, second);
+    assert.deepEqual(out, { text: "OK" });
+  });
+
+  it("工具实际用过的 root 进入重建候选列表", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    await searchIn(ctx, root, root);
+    const access = fetchAccess(ctx);
+    assert.ok(access.roots.includes(root), "显式用过的根应出现在重建候选里");
+  });
+
+  it("等价的路径写法归到同一个白名单键", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const base = ws();
+    await searchIn(ctx, `${base}/./`, base);
+    await searchIn(ctx, `${base}//`, base);
+    const access = fetchAccess(ctx);
+    assert.equal(access.roots.filter((entry) => entry === base).length, 1);
+  });
+
+  it("建索引同样受授权约束", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const here = ws("here");
+    const elsewhere = ws("elsewhere");
+    await assert.rejects(
+      () => toolOf(ctx, "zg_index").execute({ root: elsewhere, confirm: true }, execOf(here)),
+      /未获授权/u,
+    );
+  });
+});
+
+// ── 重建期检索通道 ──────────────────────────────────────────────────────────
+
+describe("重建期检索通道", () => {
+  it("等待期间被取消：按中止收口而不是继续挂着", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const started = await rebuildInFlight(ctx, root);
+    ctx.shell.runResults.push(lockBusyRun());
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_search").execute(
+          { root, query: "hi" },
+          { ...execOf(), signal: controller.signal },
+        ),
+      /中止|aborted/iu,
+    );
+    await started.release();
+  });
+
+  it("占锁方不是重建（如别的进程在索引）：不排队，直接报原失败", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    await rebuildInFlight(ctx, root);
+    ctx.shell.runResults.push(lockBusyRun("index"));
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /索引不可用|Index unavailable|exit/iu,
+    );
+  });
+
+  it("重建期状态查询：合成投影而不是再问一次 zg", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const started = await rebuildInFlight(ctx, root);
+    const out = await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    assert.match((out as { text: string }).text, /正在重建/u);
+    assert.equal(ctx.shell.runResults.length, 0, "锁忙期不该再起一条 zg status");
+    await started.release();
+  });
+
+  it("祖先根在重建：子目录的状态查询也给合成投影（等待与门禁必须是同一个口径）", async () => {
+    // 门禁那一侧先 findIndexRoot 找到祖先索引根，本来就会放行；等待/投影若还按精确键查，
+    // 子目录查询就会漏掉那条重建、撞一条裸 LOCK.BUSY。
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("anc");
+    const child = path.join(root, "pkg");
+    mkdirSync(child, { recursive: true });
+    const started = await rebuildInFlight(ctx, root);
+    const out = await toolOf(ctx, "zg_status").execute({ root: child }, execOf(root));
+    const { text } = out as { text: string };
+    assert.match(text, /正在重建/u);
+    // 投影里点名的是**真正在重建的那个根**，不是提问的那个子目录。
+    assert.ok(text.includes(root), "投影应点名重建根");
+    assert.equal(ctx.shell.runResults.length, 0, "锁忙期不该再起一条 zg status");
+    await started.release();
+  });
+
+  it("兄弟目录在重建：另一个子目录既不合成投影也不等待（不同树互不影响）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const base = ws("tree");
+    const left = path.join(base, "left");
+    const right = path.join(base, "right");
+    mkdirSync(left, { recursive: true });
+    mkdirSync(right, { recursive: true });
+    const started = await rebuildInFlight(ctx, left);
+    ctx.shell.runResults.push(okRun("RIGHT-OK"));
+    const out = await toolOf(ctx, "zg_status").execute({ root: right }, execOf(base));
+    assert.doesNotMatch((out as { text: string }).text, /正在重建/u);
+    assert.match((out as { text: string }).text, /RIGHT-OK/u);
+    await started.release();
+  });
+
+  it("同根正在重建：检索等其落定后自动重试一次", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const started = await rebuildInFlight(ctx, root);
+    ctx.shell.runResults.push(lockBusyRun(), okRun("AFTER"));
+    const pending = toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    // 先让检索跑到「等重建落定」那一步，再落定：顺序反了它根本不会走等待分支
+    // （占位一交还，重建就不再「活跃」，检索会直接原样失败）。
+    await microTicks(8);
+    await started.release();
+    const out = await pending;
+    assert.match((out as { text: string }).text, /^AFTER/u);
+    // 两次结果都被消费掉才说明「锁忙 → 等 → 重试」整条路真的走过一遍。
+    assert.equal(ctx.shell.runResults.length, 0, "重试那一次应当把第二条结果也用掉");
+  });
+
+  it("祖先根在重建：子目录的检索同样等它落定后自动重试一次", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ancq");
+    const child = path.join(root, "pkg");
+    mkdirSync(child, { recursive: true });
+    const started = await rebuildInFlight(ctx, root);
+    ctx.shell.runResults.push(lockBusyRun(), okRun("AFTER"));
+    const pending = toolOf(ctx, "zg_search").execute({ root: child, query: "hi" }, execOf(root));
+    await microTicks(8);
+    await started.release();
+    const out = await pending;
+    assert.match((out as { text: string }).text, /^AFTER/u);
+    assert.equal(ctx.shell.runResults.length, 0, "子目录也该走完「锁忙 → 等 → 重试」");
+  });
+
+  it("无关根在重建：本目录的锁忙原样抛出，不替别人的重建干等", async () => {
+    // covering 只认「重建根是查询根的祖先或同一处」：别的树上那条重建占的锁与本次无关，
+    // 替它等只会把一次快速失败拖成一次长超时。
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const base = ws("trees");
+    const left = path.join(base, "left");
+    const right = path.join(base, "right");
+    mkdirSync(left, { recursive: true });
+    mkdirSync(right, { recursive: true });
+    const started = await rebuildInFlight(ctx, left);
+    ctx.shell.runResults.push(lockBusyRun());
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root: right, query: "hi" }, execOf(base)),
+      /索引不可用|Index unavailable|exit/iu,
+    );
+    await started.release();
+  });
+
+  it("等待落定超时：不发放配额，给出可行动文案", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { rebuildWaitMs: 1 });
+    const root = ws();
+    const started = await rebuildInFlight(ctx, root);
+    ctx.shell.runResults.push(lockBusyRun());
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /重建/iu,
+    );
+    await started.release();
+  });
+
+  it("同根第二次重建：复用已在跑的那条，不再起第二条进程", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const other = ws("other");
+    trackRoot(ctx, other);
+    const first = await postRebuild(ctx, other);
+    assert.equal(first.statusCode, 200, first.body);
+    const root = ws();
+    trackRoot(ctx, root);
+    const second = await postRebuild(ctx, root);
+    assert.equal(second.statusCode, 200, second.body);
+    const before = ctx.shell.startedProcs.length;
+    const secondBody = JSON.parse(second.body) as { jobId?: string };
+    const secondJobId = String(secondBody.jobId);
+    const again = await postRebuild(ctx, root);
+    assert.equal(again.statusCode, 200, again.body);
+    const reusedBody = JSON.parse(again.body) as {
+      ok?: boolean;
+      jobId?: string;
+      reused?: boolean;
+    };
+    assert.equal(reusedBody.reused, true, "第二次应复用已在跑的那条");
+    assert.equal(reusedBody.jobId, secondJobId, "复用的应是上一条作业，不是新起的");
+    assert.equal(reusedBody.ok, true);
+    assert.equal(ctx.shell.startedProcs.length, before, "并发重建不得再 spawn 一条");
+    await settleRebuilds(ctx, 0);
+  });
+
+  it("两条重建请求真正并发：占位互斥，第二条要么复用要么明确答复", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    trackRoot(ctx, root);
+    // 不逐个 await：两条请求会各自跨过 spawn 的那次让出，正是竞态窗口本身。
+    const both = Promise.all([postRebuild(ctx, root), postRebuild(ctx, root)]);
+    const pair = await both;
+    for (const res of pair) {
+      assert.ok(res.statusCode === 200 || res.statusCode === 409, res.body);
+    }
+    // 无论走复用还是在飞未就绪，都必须**有应答**：无应答会让卡片停止轮询，
+    // 那条重建就在界面上凭空消失。
+    assert.equal(ctx.shell.startedProcs.length, 1, "并发只允许起一条 zg");
+    await settleRebuilds(ctx, 0);
+  });
+
+  it("重建刚占位、作业号还没签发时：状态投影明说在启动而不是报个空号", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    trackRoot(ctx, root);
+    // 与重建请求并发地问状态：查询落在「占位已登记、作业号尚未签发」那一档。
+    const [res] = await Promise.all([
+      postRebuild(ctx, root),
+      toolOf(ctx, "zg_status").execute({ root }, execOf(root)),
+    ]);
+    assert.equal(res.statusCode, 200);
+    await settleRebuilds(ctx, 0);
+  });
+
+  it("前台 zg_index 重建：同根已在重建时明确拒绝，不再起第二条", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const started = await rebuildInFlight(ctx, root);
+    const before = ctx.shell.runResults.length;
+    const rejected = await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, rebuild: true },
+      execOf(root),
+    );
+    assert.match((rejected as { text: string }).text, /已有一条重建/u);
+    assert.equal(ctx.shell.runResults.length, before, "被拒的调用不该起 zg");
+    await started.release();
+  });
+
+  it("前台 zg_index 重建落定后：占位已交还，同根可再次重建", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    ctx.shell.runResults.push(okRun("INDEXED"));
+    const out = await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, rebuild: true },
+      execOf(root),
+    );
+    assert.deepEqual(out, { text: "INDEXED" });
+    // 占位已交还 ⇒ 状态查询走真读索引，而不是被「重建中」投影挡住。
+    ctx.shell.runResults.push(okRun("READY"));
+    const again = await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    assert.deepEqual(again, { text: "READY" });
+  });
+
+  it("重建落定后状态查询回到真读索引", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    const started = await rebuildInFlight(ctx, root);
+    await started.release();
+    ctx.shell.runResults.push(okRun("READY"));
+    const out = await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    assert.deepEqual(out, { text: "READY" });
+  });
+
+  it("重建期放行根内 grep/rg：这是「检索失败 + grep 也被拦」双重死锁的出口", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = makeIndexedTemp();
+    await rebuildInFlight(ctx, root);
+    const reason = guardOf(ctx)({
+      name: "bash",
+      arguments: { command: "grep foo src" },
+      agent: { session: { id: "sess-1", header: { cwd: root } } },
+    });
+    assert.equal(reason, undefined, "重建期该根内检索应放行");
+  });
+
+  it("重建放行不越过索引根：换一棵树仍按原门禁拦", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const rebuilt = makeIndexedTemp();
+    const other = makeIndexedTemp();
+    await rebuildInFlight(ctx, rebuilt);
+    const reason = guardOf(ctx)({
+      name: "bash",
+      arguments: { command: "grep foo" },
+      agent: { session: { id: "sess-1", header: { cwd: other } } },
+    });
+    assert.notEqual(reason, undefined, "另一棵索引树没有活跃重建，仍应被拦");
   });
 });
