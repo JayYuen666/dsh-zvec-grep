@@ -10,13 +10,15 @@ import {
   zgGuard,
   findIndexRoot,
   searchFirstGuard,
+  MAX_PARENT_WALK,
+  rootSessionKeyOf,
   sessionKeyOf,
   DEFAULT_GREP_BUDGET,
   DEFAULT_UNLOCK_WINDOW_MIN,
   INDEX_DIR_NAME,
   WORKSPACE_MANIFEST_FILE,
 } from "../lib/routing.ts";
-import type { SearchFirstDeps } from "../lib/routing.ts";
+import type { GuardExecution, SearchFirstDeps } from "../lib/routing.ts";
 import {
   isGrepRgCommand,
   normalizeRoot,
@@ -619,6 +621,94 @@ describe("searchFirstGuard", () => {
     assert.equal(sessionKeyOf({ agent: { session: { id: 42 } } }), "42");
     assert.equal(sessionKeyOf({ agent: { session: {} } }), "__anonymous__");
     assert.equal(sessionKeyOf(undefined), "__anonymous__");
+  });
+});
+
+/** 一条会话表：`id -> 它的父会话 id`（无父则查不到）。 */
+function table(
+  links: Record<string, string>,
+): (id: string) => { parentSession?: unknown } | undefined {
+  return (id: string) => {
+    const parent = links[id];
+    return parent === undefined ? undefined : { parentSession: parent };
+  };
+}
+
+/** 造一个执行面：会话 id + 可选的父会话 id（子代理挂在谁下面）。 */
+function at(id: string, parent?: string): GuardExecution {
+  return {
+    agent: { session: { id, header: parent === undefined ? {} : { parentSession: parent } } },
+  };
+}
+
+describe("rootSessionKeyOf（子代理与主代理共享一份配额）", () => {
+  it("自身即顶层：没有 parentSession 就用自己的 id", () => {
+    assert.equal(rootSessionKeyOf(at("s1"), table({})), "s1");
+    assert.equal(rootSessionKeyOf(at("s1")), "s1");
+  });
+
+  it("一级子代理：退到父会话", () => {
+    assert.equal(rootSessionKeyOf(at("child", "parent"), table({})), "parent");
+  });
+
+  it("多级子代理：一路上溯到最顶层", () => {
+    assert.equal(
+      rootSessionKeyOf(at("child", "mid"), table({ child: "mid", mid: "grand", grand: "root" })),
+      "root",
+    );
+  });
+
+  it("同一棵树上的兄弟子代理得到同一个键（这正是共享配额的前提）", () => {
+    const lookup = table({ kidA: "mid", kidB: "mid", mid: "root" });
+    assert.equal(
+      rootSessionKeyOf(at("kidA", "mid"), lookup),
+      rootSessionKeyOf(at("kidB", "mid"), lookup),
+    );
+  });
+
+  it("缺席会话查询面：停在已知的最后一跳，不猜", () => {
+    assert.equal(rootSessionKeyOf(at("child", "mid"), undefined), "mid");
+  });
+
+  it("链上某一跳查不到：停在那一跳，不越过去", () => {
+    assert.equal(rootSessionKeyOf(at("child", "mid"), table({ mid: "root" })), "root");
+    assert.equal(rootSessionKeyOf(at("child", "mid"), table({})), "mid");
+  });
+
+  it("链成环时停住，不无限上溯", () => {
+    const lookup = table({ hopA: "hopB", hopB: "hopA" });
+    const key = rootSessionKeyOf(at("entry", "hopA"), lookup);
+    assert.ok(["hopA", "hopB"].includes(key));
+  });
+
+  it("跳数有上限：超长链停在上限处", () => {
+    const links: Record<string, string> = {};
+    for (let index = 0; index < MAX_PARENT_WALK + 10; index += 1) {
+      links[`s${String(index)}`] = `s${String(index + 1)}`;
+    }
+    assert.equal(rootSessionKeyOf(at("s0", "s1"), table(links)), `s${String(MAX_PARENT_WALK + 1)}`);
+  });
+
+  it("非字符串的 parentSession 一律按「没有父」处理（复原值未经校验）", () => {
+    assert.equal(
+      rootSessionKeyOf(
+        { agent: { session: { id: "s1", header: { parentSession: 42 } } } },
+        table({}),
+      ),
+      "s1",
+    );
+    assert.equal(
+      rootSessionKeyOf(
+        { agent: { session: { id: "s1", header: { parentSession: null } } } },
+        table({}),
+      ),
+      "s1",
+    );
+  });
+
+  it("无会话身份：仍落共享桶（与旧口径同）", () => {
+    assert.equal(rootSessionKeyOf(undefined, table({})), "__anonymous__");
+    assert.equal(rootSessionKeyOf({ agent: { session: {} } }, table({})), "__anonymous__");
   });
 });
 

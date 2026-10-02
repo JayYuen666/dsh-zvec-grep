@@ -83,3 +83,42 @@ describe("两语字典同源", () => {
     );
   });
 });
+
+describe("root 参数描述与实际放行范围一致", () => {
+  // 三个工具走同一个 rootOf()，放行路径是同三条：会话工作区本身、其上级/下级、
+  // 本会话已登记过的工作区。描述少写一条，模型就会以为某条合法路径被拒而绕路。
+  it("zh 三个 root 描述逐字相同", () => {
+    assert.equal(MESSAGES.zh.rootStatusDescription, MESSAGES.zh.rootSearchDescription);
+    assert.equal(MESSAGES.zh.rootIndexDescription, MESSAGES.zh.rootSearchDescription);
+  });
+
+  it("en 三个 root 描述逐字相同", () => {
+    assert.equal(MESSAGES.en.rootStatusDescription, MESSAGES.en.rootSearchDescription);
+    assert.equal(MESSAGES.en.rootIndexDescription, MESSAGES.en.rootSearchDescription);
+  });
+
+  it("三条放行路径在两语文案里都点名了", () => {
+    for (const name of ["zh", "en"] as const) {
+      const text = MESSAGES[name].rootSearchDescription;
+      assert.match(text, /本会话已登记|already registered/u, `${name} 缺「已登记」这条`);
+      assert.match(text, /上级或下级|parents or children/u, `${name} 缺「上级或下级」这条`);
+    }
+  });
+});
+
+describe("hitCapped 只陈述计数，不推断是否还有更多", () => {
+  // zg 的 indexed 通道不输出任何截断标记（agentContextLines 对命中列表不打标），
+  // 「某组 count === limit」只说明这一组取满了，不能据此宣称还有未显示的命中。
+  it("zh / en 都不出现「可能还有 / more may exist」这类推断措辞", () => {
+    for (const name of ["zh", "en"] as const) {
+      assert.doesNotMatch(MESSAGES[name].hitCapped, /可能还有/u, `zh 仍含「可能还有」`);
+      assert.doesNotMatch(MESSAGES[name].hitCapped, /more may exist/iu, `en 仍含 "more may exist"`);
+    }
+  });
+
+  it("两语都保留了「该组正好等于 --limit」这个纯观察", () => {
+    for (const name of ["zh", "en"] as const) {
+      assert.match(MESSAGES[name].hitCapped, /--limit/u, `${name} 没提 --limit`);
+    }
+  });
+});

@@ -109,9 +109,6 @@ overrides:
   "@deepseek-ai/schemastery": 3.18.4
   "@deepseek-ai/dsh-client-shortcuts": 0.2.0-rc.2
 # esbuild 由 vite 传递引入，其安装脚本负责落下当前平台的二进制；本仓没有包直接依赖它。
-# open-code-review 的 postinstall 是原生二进制的下载兜底（平台二进制已由它的
-# optionalDependencies 选一，下载路径通常走不到）——授权它，是为了让 ocr-review 装上即可用。
 allowBuilds:
   esbuild: true
-  "@alibaba-group/open-code-review": true
 minimumReleaseAge: 0
