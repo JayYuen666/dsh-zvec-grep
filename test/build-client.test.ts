@@ -33,7 +33,7 @@ const PKG_DIR = path.resolve(import.meta.dirname, "..");
  *
  * 必须**解析**而不是在测试里抄一份字符串：上一版把 key 写成裸条目 id（`zvec-grep`），
  * 而宿主派发的是 bundle 包名（installed dsh-client-ui-plugin-manager/lib/client.js:1821
- * `renderSlot(..., { entryKey: pkg.name })`；slot-contract.d.ts:96-98「keyed by the
+ * `renderSlot(..., { entryKey: pkg.name })`；slot-contract.d.ts「keyed by the
  * bundle's package name」），测试跟着硬抄同一个错值就一直绿，插件页面上却什么都没渲染。
  * 顺带钉住两件事：清单里确有这一条（否则改名的漂移没人拦）、profile 的 link 目标就是
  * 本目录（否则比的是另一份残留副本）。
@@ -434,7 +434,7 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
   it("factory 可求值并导出 inject/apply（注入面按 0.1.7 交 configForms）", async () => {
     // configForms 取代 0.1.6 的 settingsScope：后者在 installed 0.1.7 全树零命中，继续
     // 注入它 = 必填服务缺失 = 整条 client 入口挂不上（卡片静默消失）。契约源 installed
-    // dsh-client-ui-settings/lib/types/client/config-form.d.ts:94-98（Context 增强）与
+    // dsh-client-ui-settings/lib/types/client/config-form.d.ts（Context 增强）与
     // :142（get<T>(entryId): ConfigForm<T>）。仍是**精确全等**清单，不放宽为包含判定。
     const { inject } = await loadClientExports();
     assert.deepEqual(inject, ["slots", "configForms", "locale"]);

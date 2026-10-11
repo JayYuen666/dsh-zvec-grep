@@ -56,11 +56,11 @@ export type CardText = (
  * 读面与旧的 `settingsScope` 同名，故卡片侧的降级逻辑原样可用。
  * ⚠ 旧 `ctx.settingsScope.bind({ namespace })` 连同 `settingsScope` 服务已被宿主移除
  * （installed 全树零命中），入口是 `ctx.configForms.get(entryId)`（installed
- * `.../client/config-form.d.ts:142`），见 src/client-entry.ts。
+ * `.../client/config-form.d.ts`），见 src/client-entry.ts。
  * ⚠ `set`/`unset`/`mutate` 的受理位（true = 宿主受理，false = 拒绝或被跳过，只有
  * 传输失败才 reject）本包刻意思不消费，见 src/client-entry.ts 的 `writeField`。
  * ⚠ 消费者面上没有 dispose：`configForms.get(entryId)` 交回的是 provider 自己持有的
- * 那张共享表单（installed `.../client/config-form.d.ts:138-142` "The entry's form,
+ * 那张共享表单（installed `.../client/config-form.d.ts` "The entry's form,
  * owned by this provider"；provider 在自己的 teardown 里统一销毁全部表单，installed
  * `dsh-client-ui-settings/lib/client.js:1290-1293`），`ConfigForm` 面上根本没有
  * dispose 可消费。slot「折叠 → 再声明」会重跑注册工厂并拿回同一张长活表单，所以
@@ -80,7 +80,7 @@ type FormSnapshot = ConfigFormSnapshot<Record<string, unknown>>;
  * 本卡自己的渲染视模型（官方快照的有用子集 + 兜底值）。
  * `status` 与 `writable` 两位**不**再手写联合：它们取自属主包交给配置页的那份官方状态
  * （`ConfigPageForm['state']`，installed `dsh-client-ui-plugin-manager/lib/types/client/
- * slot-contract.d.ts:150-155`，其类型本身就是官方
+ * slot-contract.d.ts`，其类型本身就是官方
  * `ConfigFormSnapshot<Record<string, unknown>>` 的再投影）。宿主把 status 的取值域或
  * writable 的必选性一改，这一位当场红（原来抄的是 `status: "loading" | "ready" |
  * "unavailable"` + `writable: boolean`，改了就悄悄漂移）。
@@ -89,7 +89,7 @@ type FormSnapshot = ConfigFormSnapshot<Record<string, unknown>>;
  * ⚠ 顶部那条 `import type { ConfigPageForm }` 同时是把 plugin-manager 的
  * `declare module '@deepseek-ai/dsh-client-ui-slots' { interface SlotMap }` 载入本 program
  * 的入口：src/client-entry.ts 的 `ctx.slots.inject("plugins.bundle.config", …)` 编译得过，
- * 靠的就是这里（属主契约原文：installed slot-contract.d.ts:96-104「A bundle's own
+ * 靠的就是这里（属主契约原文：installed slot-contract.d.ts「A bundle's own
  * configuration, **keyed by the bundle's package name**」→ `key` 必填）。
  */
 export interface CardSnapshot extends Pick<ConfigPageForm["state"], "status" | "writable"> {
@@ -249,7 +249,7 @@ export interface RebuildPoll {
 /**
  * 轮询应答 → 卡片状态。
  * 关键：harness 的 bash-local 对**任何自然退出**都置 `status:'completed'`
- * （packages/shell/bash-local/src/index.ts:308 只在信号终止/调用方 abort 时给
+ * （packages/shell/bash-local/src/index.ts 给 `proc.status` 的那一分支：只在信号终止/调用方 abort 时给
  * 'killed'），exit 127「zg 没装」也是 completed。只看 status 会把失败显示成
  * 「重建完成」，故成功判据 = completed 且 exit 0。
  * 状态词现取自官方作业注册表（ctx.jobs），比原先的进程态多两枚：

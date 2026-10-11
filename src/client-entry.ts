@@ -50,7 +50,7 @@ const NS: LocaleNs = "zvec-grep";
  *     { view: "page" }, { entryKey: pkg.name })`——pkg.name 是 bundle 包名；
  *   · 同文件 :2698 `configured: ledger.bundles.has(openPkg.name)`，:306/:320 的
  *     `packageView()` 里 `name: bundle.name`（= bundle 包），所以没有第二条可匹配的 key；
- *   · 同包 lib/types/client/slot-contract.d.ts:96-100「A bundle's own configuration,
+ *   · 同包 lib/types/client/slot-contract.d.ts「A bundle's own configuration,
  *     **keyed by the bundle's package name**」，且 kind 为 `keyed` → `key` 必填；
  *   · dsh-client-ui-renderer/lib/client.js:1154 逐字相等匹配 `entry.options.key === entryKey`，
  *     错一个字符就是「整张卡不渲染」（不是回落、不是报错）；
@@ -195,7 +195,8 @@ interface CardSlotProps {
   /**
    * 注入面由本文件自己构造（见 apply 的 writeField / unsetField）：0.1.7 的
    * `ConfigForm.set/unset` 回 Promise<boolean> 受理位（installed
-   * config-form-types.d.ts:65 / :73；true=宿主受理，false=拒绝或写入被跳过，传输失败
+   * config-form-types.d.ts 的 `set(field: string, value: unknown): Promise<boolean>` 与
+   * `unset(field: string): Promise<boolean>` 两位；true=宿主受理，false=拒绝或写入被跳过，传输失败
    * 才 reject）——受理位**原样透传**给卡片，由 save() 消费（false → saveRejected 文案
    * 且不清 touched，fail-closed 不静默丢修改；reject → saveFailed）。unset 必带
    *（清空即回组合层 / schema 的 .default(...)）。
@@ -895,7 +896,7 @@ export type LocaleCatalog = Record<BuiltInLocaleId, LocaleDictOf<typeof NS>>;
 
 export interface ClientCtx {
   /**
-   * cordis 官方效应面（installed `@deepseek-ai/cordis/lib/types/fiber.d.ts:8-11` 的
+   * cordis 官方效应面（installed `@deepseek-ai/cordis/lib/types/fiber.d.ts` 的
    * `interface Context extends Pick<Fiber, 'effect'>`，同文件 :157/:159 两个重载）。
    * 原先这里抄的是 `(factory: () => (() => void) | undefined, label?: string) => void`：
    * 官方的工厂只收 `SyncEffect` / `Effect`（同文件 :49-51），两者都**不含** `undefined`
@@ -906,20 +907,20 @@ export interface ClientCtx {
   effect: Context["effect"];
   /**
    * 官方 `SlotRegistry`（renderer 把它增强进 cordis `Context`，installed
-   * `dsh-client-ui-renderer/lib/types/client/index.d.ts:27`）的**方法面投影**。取 `Pick`
+   * `dsh-client-ui-renderer/lib/types/client/index.d.ts`）的**方法面投影**。取 `Pick`
    * 而不是 `Context["slots"]` 整类型：`SlotRegistry` 是带 private 字段的 cordis
-   * `Service` 类（同目录 `registry.d.ts:46-47` 的 `private readonly _core` 等），TS 对它
+   * `Service` 类（同目录 `registry.d.ts` 的 `private readonly _core` 等），TS 对它
    * 做名义比较，测试桩件无法满足。`register` 逐字复用 `SlotCore['register']`（同文件 :85
    * `readonly register: SlotCore['register']`，两个重载），`inject` 是「按槽位声明生命
    * 周期装 effect」那一位（disposer 随 collapse 重跑工厂的语义就写在它的 doc 里）。
    * 合并进 `SlotMap` 的槽位键在这里是**编译期受检**的：`inject` 的 key 参数域就是
    * `keyof SlotMap & string`，`KindOptions`（`@deepseek-ai/dsh-client-ui-slots` 的
-   * index.d.ts:560-583）再按 `SlotMap[K]['kind']` 分发——`plugins.bundle.config` 是
+   * index.d.ts）再按 `SlotMap[K]['kind']` 分发——`plugins.bundle.config` 是
    * keyed 槽 → 注册项的 `key` **必填**（原来手抄的 `{ name: string; key?: string }`
    * 允许漏 key，而漏 key 的注册在宿主里根本匹配不上）。
    * ⚠ 本包不 merge 任何槽位：`plugins.bundle.config` 这条 key 由**属主包**
    * plugin-manager 交出（installed `dsh-client-ui-plugin-manager/lib/types/client/
-   * slot-contract.d.ts:96-104`，文件头明写「A registrant merges this contract with
+   * slot-contract.d.ts`，文件头明写「A registrant merges this contract with
    * `import type` and registers through `ctx.slots`; it never imports this package at
    * runtime」）。本包把它载入 program 的入口是 `lib/card-logic.ts` 顶部那条
    * `import type { ConfigPageForm }`（本卡的快照状态位就从那里取，见其 `CardSnapshot`）；
@@ -931,12 +932,12 @@ export interface ClientCtx {
   slots: Pick<SlotRegistry, "inject" | "register">;
   /**
    * 0.1.7 的配置表单服务（installed
-   * `dsh-client-ui-settings/lib/types/client/config-form.d.ts:94-98` 交出
+   * `dsh-client-ui-settings/lib/types/client/config-form.d.ts` 交出
    * `Context.configForms`，`get:142` 按 profile 条目 id 取那张共享表单，实现见
    * installed `dsh-client-ui-settings/lib/client.js:1309-1315`——它把 entryId 原样当作
    * settings 命名空间，与本包 host 侧的隐式命名空间同源）：取代已被宿主移除的
    * `settingsScope`（installed 全树零命中）。注入只需 `configForms` 本身——写侧的
-   * `remote.settings` 由 provider 自己的 fiber 承担（`config-form.d.ts:113-118` 明写
+   * `remote.settings` 由 provider 自己的 fiber 承担（`config-form.d.ts` 明写
    * 「letting a shared form write through the caller's context would make every caller
    * declare `remote.settings`」，故此处不必声明）。
    *
@@ -1027,11 +1028,11 @@ function apply(ctx: ClientCtx): void {
       {
         // 0.1.6：settings.plugin.item 已删除；plugins.bundle.config 按 bundle 包名 keyed。
         // 0.1.7 复核：槽位仍在（installed dsh-client-ui-plugin-manager/lib/types/client/
-        // slot-contract.d.ts:100），故本段仍在——换掉的只是它读写的表单来源。
+        // slot-contract.d.ts），故本段仍在——换掉的只是它读写的表单来源。
         // 键值已定案（此处曾留 `⚠ 键值待议`）：owner 派发的是
         // `entryKey: pkg.name`，pkg.name 就是 bundle 的 npm 包名（installed
         // dsh-client-ui-plugin-manager/lib/client.js:1821 与 :2698
-        // `ledger.bundles.has(openPkg.name)`；slot-contract.d.ts:96-98「keyed by the
+        // `ledger.bundles.has(openPkg.name)`；slot-contract.d.ts「keyed by the
         // bundle's package name」；官方占位者
         // dsh-experimental-client-ui-voice-input/lib/client.js:5659-5661 也用了包名
         // `@deepseek-ai/dsh-experimental-voice-input-bundle`）。按裸条目 id 注册 =
@@ -1051,11 +1052,11 @@ function apply(ctx: ClientCtx): void {
       ZgCard,
     );
     // 只注销这一次声明：slots.inject 的回调在槽「折叠 → 再声明」时会再次运行（installed
-    // dsh-client-ui-renderer/lib/types/client/registry.d.ts:100 "Collapse disposes the
+    // dsh-client-ui-renderer/lib/types/client/registry.d.ts "Collapse disposes the
     // effect and a later declaration runs it again"），而 scope/store 是每次 apply 只建
     // 一次的共享物。0.1.7 里也无从 dispose：`configForms.get()` 交回的是 provider 持有
-    // 的共享表单（installed config-form.d.ts:138-142 "The entry's form, owned by this
-    // provider"），`ConfigForm` 接口（config-form-types.d.ts:36-74）没有 dispose，销毁
+    // 的共享表单（installed config-form.d.ts "The entry's form, owned by this
+    // provider"），`ConfigForm` 接口（config-form-types.d.ts）没有 dispose，销毁
     // 由 provider 在自己的 teardown 统一做（installed
     // dsh-client-ui-settings/lib/client.js:1290-1293）。表单共享且长活，所以工厂重跑后
     // 写入依然落盘；旧 `settingsScope` 那种「离开插件页一次之后 scope 永久 disposed、

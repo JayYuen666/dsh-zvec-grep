@@ -8,7 +8,7 @@
 //
 // 入参校验为什么全在这里：harness 的 tools 注册面对 `parameters` JSON Schema
 // 只做「输出」校验，`ToolRegistry` 直接把 `exec.arguments` 原样交给
-// `execute`（packages/core/tools/src/index.ts:1580 `tool.execute(exec.arguments, exec)`），
+// `execute`（packages/core/tools/src/index.ts 里那句 `await tool.execute(exec.arguments, exec)`），
 // 模型给的类型错误不会在框架层报错。宽松取值（`x === true`）会让 `{rebuild:1}` 静默走增量、
 // `{hidden:"true"}` 静默失效——用户以为重建/含隐藏了，实际没有。故本文件的
 // 每个取值器都是「非法定类型即抛错」。

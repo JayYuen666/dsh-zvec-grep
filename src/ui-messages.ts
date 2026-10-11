@@ -114,7 +114,7 @@ export interface UiMessages {
 
 /**
  * 本包的文案命名空间 merge 进官方的 `LocaleNamespaceMap`（installed
- * `dsh-client-ui-slots/lib/types/index.d.ts:22-30`：「Dictionary owners extend via
+ * `dsh-client-ui-slots/lib/types/index.d.ts`：「Dictionary owners extend via
  * declaration merging (exactly like {@link SlotMap} …)；the key is the namespace string,
  * the value is the union of its dictionary keys」）。这一步是**必需**而不是美化：不 merge
  * 时官方 `LocaleRuntime.register` / `bind` 只有那条**未类型化**重载可用
@@ -150,7 +150,7 @@ export type LocaleNs = typeof LOCALE_NS_KEY;
 
 /**
  * 卡片取文案的函数形状：官方 `TranslateNS<N>`（installed `dsh-client-ui-slots/lib/types/
- * index.d.ts:67` `= Translate<LocaleKeysOf<N>>`，而 `Translate<K> = (key: K, params?) =>
+ * index.d.ts` `= Translate<LocaleKeysOf<N>>`，而 `Translate<K> = (key: K, params?) =>
  * string`）——键集就是上面 merge 的 `keyof UiMessages`（并上官方 `common` 命名空间的共享
  * 词表：`LocaleKeysOf` 就是这么定义的，官方查找链在自有命名空间 miss 后确实会去问
  * common，故这不是本包「多出来的键」），函数面完全归官方，本地不再抄签名。

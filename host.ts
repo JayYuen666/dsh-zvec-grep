@@ -18,17 +18,24 @@
 //     （query）或转义后的位置参数（index/status），绝不裸拼进命令。
 //   - zg_index 被 guard 强制要求 confirm=true，防止模型静默建/删索引。
 //   - 工具入参在 lib/cli.ts 里逐项严格取值（harness 不校验 parameters，见该文件头）。
-//   - 「工作区重建」是**动作端点**：webServer 可被配成绑 0.0.0.0，故除 sec-fetch-site
-//     同源校验外还要求每次 apply 生成的 CSRF 头，且 root 必须落在「本 daemon 实际观测到
-//     的会话工作区」白名单内——否则任意绝对路径都能被拿去 `zg index --rebuild`。
+//   - 「工作区重建」是**动作端点**：webServer 可被绑到本机网卡的具体地址（宿主只拒通配
+//     地址），故除 sec-fetch-site 同源校验外还要求每次 apply 生成的 CSRF 头，且 root 必须
+//     落在「本 daemon 实际观测到的会话工作区」白名单内——否则任意绝对路径都能被拿去
+//     `zg index --rebuild`。
 //
-// 运行方式：dsh 的 cordis Loader 直接 import 本 .ts（Node ≥22.18 类型剥离）。
-// 运行时值导入只有 schemastery，且 0.1.7 起必须是**宿主 fork** @deepseek-ai/schemastery：
-// 只有它的 resolve 会把标了 .volatile() 的字段包成 Volatile 引用（公共 schemastery@3.18.0
-// 既没有 .volatile()，解析出来的也仍是普通值，设置卡写进去的值永远读不到）。
+// 运行方式：包入口是构建产物 host.js（`npm run build` 由 host.ts + lib/*.ts 打包而来）。
+// 发布态必须走产物：Node 对躺在 node_modules 里的 .ts 直接抛
+// ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING，而本包正是躺在 profile 的 node_modules 里被
+// 载入的。构建侧的逐字节新鲜度由 test/host-freshness.ts 钉住。
+// 运行时值导入只有 @jayyuen66/dsh-plugin-shared 的 lib 子路径与 @deepseek-ai/schemastery，
+// 且后者必须是**宿主 fork**：只有它的 resolve 会把标了 .volatile() 的字段包成 Volatile 引用
+// （公共 schemastery 既没有 .volatile()，解析出来的也仍是普通值，设置卡写进去的值永远读不到）。
+// shared 自己的 dist/text.js 又值导入 @deepseek-ai/dsh-output-retention，所以那枚宿主包也在
+// 必填 peer 面上——缺席只在装出去之后才现形，判据钉在 test/publish-manifest.test.ts。
 // @deepseek-ai/cordis 一律 type-only（运行时由 ctx 注入）。@deepseek-ai/dsh-tools 同样
 // type-only，但**类型面全面绑定它**：注册与 guard 两位直接从官方服务类 `ToolRuntime` 上
-// `Pick`（installed dsh-tools/lib/types/index.d.ts:619/:638），于是注册的工具字面量由官方
+// `Pick`（installed dsh-tools/lib/types/index.d.ts 的 `ToolDefinition` 与 `ToolGuard`），于是
+// 注册的工具字面量由官方
 // `ToolDefinition` 检查、guard 谓词由官方 `ToolGuard` 检查——两者都随官方成员走，本文件不
 // 重述它们的签名；工具体收到的执行面走官方 ToolRunContext（详见下面 ToolsService / ToolExec
 // 与 lib/routing.ts 的读取面）。
@@ -100,7 +107,7 @@ import type { TimerService } from "@deepseek-ai/cordis-plugin-timer";
 // 与 session-rescue/lesson-loop/ocr-review 原来各自复制，现统一由 shared 提供。
 import { sendJson, queryParam, guardBody } from "@jayyuen66/dsh-plugin-shared/lib/http";
 // 信任闸门：三条路由 handler 的第一条语句。
-import { guardTrust } from "@jayyuen66/dsh-plugin-shared/lib/trust";
+import { guardTrust, isNonLoopbackBindHost } from "@jayyuen66/dsh-plugin-shared/lib/trust";
 import { DEFAULT_EMBEDDING, isLocalEmbedding } from "./lib/embedding-catalog.ts";
 import {
   assertAbsoluteRoot,
@@ -164,7 +171,7 @@ import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 // 抄的是宿主 bash 工具的 processOutcome，见该文件头）。
 import { jobOutcomeOf } from "@jayyuen66/dsh-plugin-shared/lib/job-outcome";
 
-// 官方给生产者的 kind 扩展点（installed dsh-jobs/lib/types/view.d.ts:26 的 JobKindMap，
+// 官方给生产者的 kind 扩展点（installed dsh-jobs/lib/types/view.d.ts 的 JobKindMap，
 // dsh-tool-pwsh / dsh-tool-workflow 同款写法）：kind 既是 id 命名空间也是 id 前缀。
 // 位置在 import 块之后：declare module 是一条语句，夹在 import 中间会让后面每条 import
 // 都违反 import/first（ESM 下 import 本就被提升，先于模块体执行，挪动不改运行时行为）。
@@ -306,11 +313,12 @@ export interface Config {
 type ShellService = Pick<ShellExecutor, "resolve" | "execute">;
 
 /**
- * 官方 ToolRuntime（installed `@deepseek-ai/dsh-tools/lib/types/index.d.ts:512`，cordis
+ * 官方 ToolRuntime（installed `@deepseek-ai/dsh-tools/lib/types/index.d.ts` 里的
+ * `declare class ToolRuntime extends Service`，cordis
  * Service 类 + 一整套 private 字段 → TS 名义比较，结构替身与本包测试桩都无法满足它）的
  * **方法面投影**：只 `Pick` 本包调的两位，签名一个字都不再重述——原文在 installed 同文件
- * `:619` `register(definition: ToolDefinition): () => void` 与 `:638`
- * `guard(guard: ToolGuard): () => void`（`Context.tools: ToolRuntime` 的增强在 `:34`）。
+ * 的 `register(definition: ToolDefinition): () => void` 与
+ * `guard(guard: ToolGuard): () => void` 两位上（`Context.tools: ToolRuntime` 的增强也写在那份文件里）。
  * 于是注册字面量由官方 `ToolDefinition` 检查、guard 谓词由官方 `ToolGuard` 检查，且这两位
  * 从此跟着官方成员走：官方添一枚必填参数或换掉载荷类型，本文件当场是编译错误，而不是镜像
  * 继续编译通过、调用点静默拿到错形状（同 ocr-review 的 `ToolsService` 口径）。
@@ -368,7 +376,7 @@ type JobsService = Pick<
 >;
 
 /**
- * 官方 `SettingsForms`（installed `@deepseek-ai/dsh-settings/lib/types/index.d.ts:62`，
+ * 官方 `SettingsForms`（installed `@deepseek-ai/dsh-settings/lib/types/index.d.ts`，
  * `Service` 子类 + private `ownerContext/revisions/closed/scheduled/presentations` → 名义
  * 比较）的方法面投影：本包只用 `configure`（经注入子上下文挂页面策略）与 `describe`
  * （跨命名空间读官方 locale 偏好）。此前这里写的是**整个类**，那是一条对本包需求的过度
@@ -415,11 +423,11 @@ interface HostCtx {
   /** 本插件 fiber：`configure` 的 owner 必须显式传它（缺省是 settings 服务自己的 fiber）；
    *  类型就是官方 `SettingsForms.configure(presentation, owner?: Fiber)` 的那位 `Fiber`。 */
   fiber: Fiber;
-  /** 服务读取面取官方 `Context["get"]`（installed `@deepseek-ai/cordis/lib/types/reflect.d.ts:14`
+  /** 服务读取面取官方 `Context["get"]`（installed `@deepseek-ai/cordis/lib/types/reflect.d.ts`
    *  `get<K extends string & keyof this>(name: K, strict?: boolean): undefined | this[K]`），
    *  本地不再重述一枚 `get`。本包只读 `webServer`，而它**是**官方声明进 `Context` 的成员
-   *  （installed `@deepseek-ai/dsh-host-webserver/lib/types/index.d.ts:15-18`），故走泛型臂拿到
-   *  `undefined | WebServer`，不走那条 `get(name: string): any` 兜底（reflect.d.ts:17）。
+   *  （installed `@deepseek-ai/dsh-host-webserver/lib/types/index.d.ts`），故走泛型臂拿到
+   *  `undefined | WebServer`，不走那条 `get(name: string): any` 兜底（reflect.d.ts）。
    *  旧镜像多出的 `(name: string): unknown` 是「还会读别的名字」的占位，实际没有；删它不减防御。
    *  `undefined` 是官方语义（"or `undefined` when not (yet) provided"）：非 web profile 的宿主确实
    *  交不出服务，`registerRebuildEndpoints` 里那道 `!webServer` 闸照旧。返回整类而非本包投影不是
@@ -1294,7 +1302,8 @@ function define(host: HostCtx, spec: ToolSpec): void {
  *  0.1.7 迁移要点（两处都是静默失效，写错不报错）：
  *   - `.volatile()` 决定字段是否进设置表单。宿主 `describe()` 只投影 volatile 字段
  *     （packages/settings/settings/src/schema.ts 的 volatileForm），全漏标则整条被跳过
- *     （settings/src/index.ts:308-309）、写入抛 `has no volatile fields`（:386）。
+ *     （settings/src/index.ts 里 `volatileForm(schema)` 空判即 `return []` 的那一处）、写入抛
+ *     `has no volatile fields`（同文件的那句 throw）。
  *   - `settings.register(ns, schema, { base })` 的「底座」层已被宿主移除：内置默认逐字段
  *     落成下面的 `.default()`（原 BUILTIN_BASE 原样搬来，单一来源），cordis 装载期按同一
  *     份 schema 校验行 config 并填默认，再把 volatile 字段包成引用交给 apply。
@@ -1436,7 +1445,7 @@ interface RebuildState {
  * 拖垮泵"的兜。选 pull 而不是生产者 push（`JobHandle.append`）是复核
  * 后按实测定下的：
  *  - `proc.observed[*].readFrom` 是**非消费**的独立观察者面（installed dsh-shell
- *    types.d.ts:199-203："without stealing bytes from `readOutput`"），与本包前台用的
+ *    types.d.ts："without stealing bytes from `readOutput`"），与本包前台用的
  *    消费式游标互不干扰——此前本仓写的"官方泵会与 readOutput 争同一份游标"是错的；
  *  - 泵按注册表自己的节拍跑（实测默认 150ms，落定前再排最后一次）⇒ **卡片关着环也前进**，
  *    模型侧 job_output 随时看得见进度；push 形态把可见性绑在了轮询上。
@@ -1547,7 +1556,7 @@ function capacityLimitOf(error: unknown): string | undefined {
  * 「工作区重建」动作端点的四道前置校验：绝对路径 + 归一化、本 daemon 观测过的白名单、
  * 目录此刻仍存在。不过就把错误就地答完并返回 undefined（错误文本全走双语字典）。
  *
- * 这四道是**动作**端点的闸门：webServer 可被配成绑 0.0.0.0，没有白名单的话任何能连上
+ * 这四道是**动作**端点的闸门：webServer 可被绑到本机网卡的具体地址，没有白名单的话任何能连上
  * 服务面的一方都能拿任意绝对路径去 `zg index --rebuild`——读遍那棵树、写 `.zvec-grep/`，
  * 还可能把其中的非隐藏敏感文件灌进向量库并回显到上下文。
  * @param req 请求对象
@@ -1681,7 +1690,7 @@ function procSandboxNote(proc: ShellExecution, messages: ZvecGrepMessages): stri
 /**
  * 工作区白名单：重建端点只接受**本 daemon 真实观测到过的会话工作区**
  * （guard 每次工具调用、execute 每次 root 解析都会登记）。
- * webServer 可被配成 0.0.0.0，端点又是一个会读遍整棵树、写 .zvec-grep/ 的
+ * webServer 可被绑到本机网卡的具体地址，端点又是一个会读遍整棵树、写 .zvec-grep/ 的
  * 动作，绝不能接受任意绝对路径；键经 assertAbsoluteRoot 归一，
  * `/repo/../repo` 与 `/repo/` 这类同物异写不再能绕过比较。
  */
@@ -2328,8 +2337,10 @@ function registerRebuildEndpoints(deps: RebuildEndpointDeps): void {
     return;
   }
 
-  // 非回环服务面唯一的可读信号（installed dsh-host-webserver d.ts `:50`/`:83`）。
-  const servingNonLoopback = webServer.host === "0.0.0.0";
+  // 非回环服务面按**绑定的那枚地址本身**判，不比字面量：宿主只拒通配地址（`0.0.0.0`/`::`），
+  // 绑本机网卡的具体 IPv4/IPv6 是合法配置，而那正是需要收紧权威的一面。判据取自 shared 的
+  // `isNonLoopbackBindHost`，它同时覆盖 IPv6 回环的多种拼法（`::1`、`::0.0.0.1`、全写零形）。
+  const servingNonLoopback = isNonLoopbackBindHost(webServer.host);
   // 后台重建交给官方注册表（ctx.jobs）：环、留存、容量、生命周期，以及"模型侧
   // job_list/job_output/job_kill 看不看得见这次重建"都在它那边。
   //
@@ -2367,7 +2378,7 @@ function registerRebuildEndpoints(deps: RebuildEndpointDeps): void {
     },
   });
   // 启动端点：POST + 同源 + CSRF（guardBody 三道一次做完）+ 白名单 root + 目录存在。
-  // 旧实现只查 `startsWith("/")`：任何能连到 webServer（可配 0.0.0.0）的一方都能
+  // 旧实现只查 `startsWith("/")`：任何能连到 webServer（可绑本机网卡地址）的一方都能
   // 拿任意绝对路径触发 `zg index --rebuild`——读遍那棵树、写 .zvec-grep/、
   // 还可能把其中的非隐藏敏感文件灌进向量库并回显到上下文。
   const disposeRebuild = webServer.register({
@@ -3154,11 +3165,11 @@ function registerToolGuards(runtime: PluginRuntime): void {
  * 设置卡片的「工作区重建」端点组（引导 + 后台进程 + 轮询状态）。
  *
  * ⚠ 这三条路由的归属方必须对 webServer **建立依赖**，不能在 apply 里读一次就算完：
- * `ctx.get` 是无 inject 语义的存储读（官方 reflect.d.ts:10-14 明写 "or `undefined`
+ * `ctx.get` 是无 inject 语义的存储读（官方 reflect.d.ts 明写 "or `undefined`
  * when not (yet) provided"），而真实宿主上 webServer 比本条目晚到位——隔离 DSH_HOME
  * 实测 apply 当场读到 undefined、+1.3s 才交得出实例。旧写法的结果是三条路由在任何
  * web profile 上都不注册，卡片的「工作区重建」永远 404。子 fiber 只在依赖到位时激活、
- * 依赖换实例时先卸后装（registry.d.ts:97），故效应挂在**子上下文**上即得「后到即注册、
+ * 依赖换实例时先卸后装（registry.d.ts），故效应挂在**子上下文**上即得「后到即注册、
  * 重启即重注册」。不写进插件级 inject：那会让没有 webServer 的宿主（TUI）连三个工具
  * 一并失活。
  * @param runtime apply 的运行时依赖（host / config / 白名单 / 文案读取器）
@@ -3195,7 +3206,7 @@ function apply(ctx: Context, config: Config): void {
   configureSettingsPage(host);
   const localeMessages = createLocaleMessages(host);
 
-  // 重建端点的两道锁：每次 apply 重新生成的 CSRF token（webServer 可绑 0.0.0.0，
+  // 重建端点的两道锁：每次 apply 重新生成的 CSRF token（webServer 可绑到本机网卡的具体地址，
   // sec-fetch-site 只是浏览器侧的纵深防御，本地进程可伪造/直连）+ 工作区白名单
   // （只认本 daemon 真实观测到过的会话工作区，见 createRootLedger）。
   // token 形态与本仓其余五包统一为 `randomUUID()`（此前只有本包是 hex，

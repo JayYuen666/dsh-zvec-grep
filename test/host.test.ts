@@ -522,7 +522,8 @@ function schemaDefaults(): Record<string, unknown> {
  * 「自身标了 volatile」或「是 object 且子树里有可编辑字段」的字段才进表单。
  * @returns 顶层 object 时给表单字段名清单；叶子可编辑时给 []；
  *  null = 该子树没有任何可编辑字段 → 宿主 describe() 会整条跳过本条目
- *  （settings/src/index.ts:308-309），写入则抛 `has no volatile fields`（:386）。
+ *  （settings/src/index.ts 里 `volatileForm(schema)` 空判即 `return []` 的那一处），写入则抛
+ *  `has no volatile fields`（同文件的那句 throw）。
  *  （用 null 而不是 undefined 表"没有"：本仓 lint 的 consistent-return 配了
  *  `treatUndefinedAsUnspecified`，`return undefined` 记作无值返回、与 `return []` 冲突。）
  */
@@ -2498,7 +2499,7 @@ describe("rebuild-roots 引导端点", () => {
     const access = fetchAccess(ctx);
     assert.equal(typeof access.csrf, "string");
     // 加严：原来只验 `length >= 16`，那连形态都不钉（hex 与 uuid 都过）⇒ 现与
-    // lesson-loop/test/host.test.ts:848、ocr-review/test/host.test.ts:1330 的针同形。
+    // 判据与 lesson-loop、ocr-review 两份 host 测试里的那条针同形。
     assert.match(
       access.csrf,
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
@@ -4306,7 +4307,8 @@ describe("0.1.7 隐式注册验收", () => {
   });
 });
 
-/** 本机网卡上的非回环 IPv4：`shared/lib/trust.ts:120-129` 只认"确属本机网卡"的那批地址。
+/** 本机网卡上的非回环 IPv4：`@jayyuen66/dsh-plugin-shared/lib/trust` 的 `interfaceAddresses`
+ *  只认"确属本机网卡"的那批地址。
  *  取不到就响亮失败而不是跳过——这条用例是本包唯一把 `servingNonLoopback` 拨到 **true** 的
  *  接线（替身没有 `host` 成员时，那道锁在真实接线上永为合着）。 */
 function lanIpv4(): string {
@@ -4352,33 +4354,43 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
     assert.doesNotMatch(res.body, /csrf/u, "被拒的响应体里泄露 token 等于闸门白装");
   });
 
-  it("servingNonLoopback 是**接**出来的：只有 webServer.host 声明 0.0.0.0 才放本机网卡权威", () => {
-    // 钉的是 host.ts 那一行的接线（`webServer.host === "0.0.0.0"` ⇒ 喂给 guardTrust），不是
-    // trust 的纯函数判据（那份在 shared/test/trust.test.ts 里已经钉过，包括读真网卡的缺省臂）。
-    // 把 `===` 改成 `!==`、或整条删掉写死 false，下面两个断言会一起反掉 ⇒ 变异跑不掉。
-    const lan = `${lanIpv4()}:8787`;
-    const headers = { host: lan, origin: `http://${lan}`, "sec-fetch-site": "same-origin" };
-    // 替身没声明服务面 ⇒ 非回环权威一律拒（"宿主只绑回环"的常态）。
-    const loopbackOnly = makeCtx();
-    applyTo(loopbackOnly);
-    const refused = makeRes();
-    void routeOf(loopbackOnly, REBUILD_ROOTS_PATH).handler(
-      makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers }),
-      refused,
-    );
-    assert.equal(refused.statusCode, 403);
-    assert.match(refused.body, /untrusted host/u);
-    // 声明绑了 0.0.0.0 ⇒ 同一个请求过闸门，token 照旧交给卡片。
-    const bound = makeCtx();
-    bound.webServerHost = "0.0.0.0";
-    applyTo(bound);
-    const allowed = makeRes();
-    void routeOf(bound, REBUILD_ROOTS_PATH).handler(
-      makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers }),
-      allowed,
-    );
-    assert.equal(allowed.statusCode, 200);
-    assert.match(allowed.body, /csrf/u, "过闸的应答该照旧把 token 交给卡片");
+  it("servingNonLoopback 由 webServer.host 那枚绑定地址算出，不比字面量", () => {
+    // 钉的是 host.ts 那一行的接线（`isNonLoopbackBindHost(webServer.host)` ⇒ 喂给 guardTrust），
+    // 不是 trust 的纯函数判据（那份在 shared 的 trust 测试里已经钉过，包括读真网卡的缺省臂）。
+    // 宿主只拒**通配**地址，绑本机网卡的具体 IPv4 是合法配置，而旧写法 `=== "0.0.0.0"` 会把
+    // 这一面读成回环服务，于是同网段一方拿着网卡权威就能过动作端点的闸门。写死 false 由第三、
+    // 四档抓，写死 true 由第一、二档抓。
+    const bindCase = lanIpv4();
+    const headers = {
+      host: `${bindCase}:8787`,
+      origin: `http://${bindCase}:8787`,
+      "sec-fetch-site": "same-origin",
+    };
+    const cases: readonly { bind?: string; status: number }[] = [
+      { status: 403 },
+      { bind: "127.0.0.1", status: 403 },
+      { bind: "0.0.0.0", status: 200 },
+      { bind: bindCase, status: 200 },
+    ];
+    for (const entry of cases) {
+      const ctx = makeCtx();
+      // 缺省那一档靠「不写这一位」表达：`exactOptionalPropertyTypes` 下 `= undefined` 不合法。
+      if (entry.bind !== undefined) {
+        ctx.webServerHost = entry.bind;
+      }
+      applyTo(ctx);
+      const res = makeRes();
+      void routeOf(ctx, REBUILD_ROOTS_PATH).handler(
+        makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers }),
+        res,
+      );
+      assert.equal(res.statusCode, entry.status, `绑 ${String(entry.bind)} 时该回 ${entry.status}`);
+      if (entry.status === 200) {
+        assert.match(res.body, /csrf/u, "过闸的应答该照旧把 token 交给卡片");
+      } else {
+        assert.match(res.body, /untrusted host/u);
+      }
+    }
   });
 
   it("写端点 rebuild：恶意 Host 即便带对 token 也在权威那一层被拒", async () => {

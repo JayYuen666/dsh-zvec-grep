@@ -1,0 +1,109 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+# 同一分支上后到的提交取消前一个，省 runner，也避免两个并行的 check 互相盖结果。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # action 按 tag 引用意味着上游动 tag 就等于本仓换了构建器。钉 commit SHA，
+      # tag 版本写在同行注释里，升级时照着改这一行即可。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 12
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Windows 那一档钉的是产物里 `//#region` 标记与 path.sep 的归一：本机跑不到 win32 的
+      # 分隔符形态，只有在这台 runner 上「同一份源码两种字节」这类漂移才会现形。
+      - run: pnpm run check
+
+  # 这道门验的是「装出去之后」：本包真正的故障形状是构建、类型检查与 528 条用例全绿，
+  # 而装载时 ERR_MODULE_NOT_FOUND（shared 产物值导入的宿主包缺席就是这么一个坑）。
+  # 判据只能在消费侧的安装布局上，所以这里打真包、进干净目录、真 import。
+  install-probe:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 12
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: 两个发布器各打一次包
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pkg/npm /tmp/pkg/pnpm
+          npm pack --pack-destination /tmp/pkg/npm --ignore-scripts
+          pnpm pack --pack-destination /tmp/pkg/pnpm
+      - name: 干净目录安装 npm tarball（不带任何 flag）
+        run: |
+          set -euo pipefail
+          tarball="$(ls /tmp/pkg/npm/*.tgz | head -1)"
+          mkdir -p /tmp/probe && cd /tmp/probe
+          npm init -y >/dev/null
+          # 不传 --legacy-peer-deps：那正是本包 peer 面（宿主包一律 peer + dev，不进
+          # dependencies）能不能被默认安装语义吃下去的判据。
+          npm install "$tarball" --no-audit --no-fund
+      - name: 装载 host 半（入口可解析、运行期值导入齐备）
+        run: |
+          set -euo pipefail
+          cd /tmp/probe
+          node --input-type=module -e '
+          const mod = await import("@jayyuen66/dsh-zvec-grep");
+          const plugin = mod.default;
+          if (typeof plugin?.apply !== "function") throw new Error("入口没有 cordis 插件形状：缺 apply");
+          if (plugin.Config === undefined) throw new Error("入口缺 Config：设置卡不会挂载");
+          if (!Array.isArray(plugin.inject) || plugin.inject.length === 0) {
+            throw new Error("入口缺 inject：服务依赖面没声明，条目不会激活");
+          }
+          console.log("host 半装载通过，服务依赖面:", plugin.inject.join(", "));
+          '
+      - name: pnpm 侧安装与装载
+        run: |
+          set -euo pipefail
+          tarball="$(ls /tmp/pkg/pnpm/*.tgz | head -1)"
+          mkdir -p /tmp/probe-pn && cd /tmp/probe-pn
+          npm init -y >/dev/null
+          # 这个目录之后由 pnpm 管（publish.yml 用的发布器正是 pnpm），装依赖也得用 pnpm：
+          # 实测在 pnpm 布局的项目里跑 `npm install` 会以
+          # "Cannot read properties of null (reading 'matches')" 崩掉——那是 npm 读不懂
+          # pnpm 留下的 node_modules 树，与本包无关，但足以让这一档假红。
+          pnpm add "$tarball"
+          node --input-type=module -e '
+          import { existsSync, readFileSync } from "node:fs";
+          import { createRequire } from "node:module";
+          import path from "node:path";
+          const mod = await import("@jayyuen66/dsh-zvec-grep");
+          if (typeof mod.default?.apply !== "function") throw new Error("pnpm 布局下入口装载失败");
+          // bundle 注册行按裸包名扫 dsh.client 声明，所以 patch 文件必须**随包在**且写着这一行；
+          // 取不到或行丢了，`dsh plugin add` 会静默少一个条目。
+          const require = createRequire(import.meta.url);
+          const pkgDir = path.dirname(require.resolve("@jayyuen66/dsh-zvec-grep/package.json"));
+          const patch = path.join(pkgDir, "cordis.patch.yml");
+          if (!existsSync(patch)) throw new Error("cordis.patch.yml 没随包发出：bundle 注册行会悬空");
+          if (!readFileSync(patch, "utf8").includes("- id: zvec-grep")) {
+            throw new Error("cordis.patch.yml 里缺 `- id: zvec-grep` 注册行");
+          }
+          console.log("pnpm 布局下入口与 patch 文件均就位");
+          '

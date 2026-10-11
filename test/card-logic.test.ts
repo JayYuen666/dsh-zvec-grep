@@ -48,7 +48,7 @@ const ZH_LIMIT_INVALID_HINT = "请输入 1-50 的整数";
 // 契约形状本身即断言：五成员全必选（getSnapshot / subscribe / mutate / set / unset，
 // 见 @deepseek-ai/dsh-client-ui-settings/client 的 ConfigForm），set/unset 回
 // `Promise<boolean>`（受理位），**没有** dispose——`configForms.get(entryId)` 交回的是
-// provider 持有的共享表单（同包 config-form.d.ts:138-142），卡片自 dispose 会连坐同
+// provider 持有的共享表单（同包 config-form.d.ts），卡片自 dispose 会连坐同
 // provider 的其它消费者。
 
 /** 官方 `ConfigFormSnapshot` 的合法形状（7 位全必选）；首个快照受理前 value/revision
@@ -450,7 +450,7 @@ describe("保存动作走 set/unset 两条路（草稿模型）", () => {
   it("官方面第五位 mutate 在位（批量原子写）：本卡不走它，但契约要求它存在", async () => {
     const scope = fakeScope(snap({ value: {} }));
     // 判别位是官方 `SettingsPathOpView` 的 `op`（'set' | 'unset'，installed
-    // dsh-settings/lib/types/types.d.ts:47-54），不是 `kind`——旧夹具写 `kind` 一直没红，
+    // dsh-settings/lib/types/types.d.ts），不是 `kind`——旧夹具写 `kind` 一直没红，
     // 是因为 `dsh-api-remotes/client` 不在类型图里、那个类型解析成 error 被 skipLibCheck
     // 吞掉了。现在补上依赖，官方面当场把这一位挑了出来。
     const ops: Parameters<SettingScope["mutate"]>[0] = [
