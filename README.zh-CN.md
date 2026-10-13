@@ -154,6 +154,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ### 开发
 
+- 测试分三层。`test/*.test.ts`（单测 + mock 宿主上下文）钉本包自己的纯逻辑；`test/integration/*` 起**真**宿主服务（`dsh-tools` 的 ToolRuntime、`dsh-subprocess-local` + `dsh-bash-local`、`dsh-jobs-local`、真 HTTP 的 `dsh-host-webserver`、timer 与 approval），把插件挂进官方调用管线（`ctx.tools.execute()` / 真 `fetch`）驱动；`test/e2e/zg-cli.test.ts` 既没有插件也没有替身，只把 `lib/cli.ts` 造出的命令行喂给**真 zg CLI**，钉它的输出形状、错误码与旗标面。宿主契约的缺陷都出在中间那层：mock 上下文只会同意本包已经相信的事（例如 `ctx.get("jobs") === ctx.get("jobs")` 在替身里恒真，而真实 cordis 每次读服务都新建一枚 traceable 代理，该等式恒假）。
 - `npm run check` 是发布前的一条门：typecheck（两侧 tsconfig）+ `oxlint` + 重建两个 bundle + `vitest run --coverage` + `oxfmt --check`。
 - 覆盖率按**全局 100% 阈值**跑（stmts/branches/funcs/lines）：任何一行或分支没被用例钉住，套件当场红——这是本仓的既定质量门，不是巧合。
 - `npm run build` / `npm run build:client` 产出 `host.js` / `client.js`，两者**都不入库**：`prepare` 与 `prepack` 现产，而 `test/build-host.test.ts` / `test/build-client.test.ts` 拿磁盘产物与内存构建逐字节比，产物过期即变红。发布物不手改——发布入口本就是构建产物，因为 Node 对躺在 `node_modules` 里的 `.ts` 直接拒绝类型剥离。

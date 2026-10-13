@@ -52,7 +52,7 @@
 // 校验已在 define() 内以零依赖方式等效实现。
 
 import Schema from "@deepseek-ai/schemastery";
-import { existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -124,6 +124,9 @@ import {
   REFRESH_NAMES,
   SYMBOL_TYPE_NAMES,
 } from "./lib/cli.ts";
+// ignoreFiles 的存在性预检要与命令构造期用**同一个**取值器（单值/数组都收）：两处各读一遍
+// 就会出现"预检放过、构造期才拒"的缝隙。
+import { singleOrList } from "./lib/argv-guard.ts";
 import type { ClientMode, SearchArgs, IndexArgs } from "./lib/cli.ts";
 import {
   ROUTING_NAME,
@@ -1394,20 +1397,57 @@ interface RebuildRecord {
 }
 
 /**
+ * 一条作业的身份证：官方 `JobView` 上三段**值稳定**的事实（kind / label / startedAt）。
+ *
+ * 为什么不存「注册表实例引用」：`ctx.get("jobs")` 每读一次都会新建一枚 traceable 代理
+ * （installed `@deepseek-ai/cordis/lib/index.js` 的 `getTraceable` → `createTraceable`，
+ * 对带 tracker 的服务值恒返回新 Proxy），于是**同一枚服务**的两次读也不 `===`（实测：
+ * 真实宿主里 `ctx.get("jobs") === ctx.get("jobs")` 为 false）。拿实例引用做身份比较在真实
+ * 宿主上恒为假：轮询端点会对每条活着的重建回 404，卸载效应也只会 kill 进程而不 remove
+ * 作业、把环留在宿主内存里。故身份必须由投影**值**推导——换一枚实例时它从 1 重签发 id，
+ * 而 startedAt 与 label 同时撞上意味着"同毫秒又发出一条一模一样的命令"，与"用户在服务
+ * 重载后一毫秒内又起一次重建"同阶，那时卡片 404 重来即可。
+ */
+interface JobIdentity {
+  readonly kind: JobView["kind"];
+  readonly label: JobView["label"];
+  readonly startedAt: JobView["startedAt"];
+}
+
+/** 从名册投影推导身份证（官方 `JobView` 的三段稳定事实）。 */
+function identityOf(view: JobView): JobIdentity {
+  return { kind: view.kind, label: view.label, startedAt: view.startedAt };
+}
+
+/** 两段身份证是否同一回事（三段全同才算）。 */
+function sameIdentity(left: JobIdentity, right: JobIdentity): boolean {
+  return (
+    left.kind === right.kind && left.label === right.label && left.startedAt === right.startedAt
+  );
+}
+
+/**
+ * 身份证尚未盖章时的占位出生时刻。
+ *
+ * `startedAt` 由官方签发（`Date.now()`，永不为 0），而 kind/label 在 `start` 之前就已
+ * 已知——那正是本包递给官方的那份规格。于是"start 的同步块里就跑到了 `run()`"那一档读取
+ * （官方 `start` 会同步跑第一拍）比对时必然落到"对不上"：那一刻还没有可比的出生时刻，
+ *  不该把同 id 的另一条作业当成自己的收走。
+ */
+const UNSIGNED_STARTED_AT = 0;
+
+/**
  * 名册里那条 id 是不是**我们**的那条作业。
  *
  * 只比 id 不够：计数器是注册表的实例字段（实测两枚实例对同一 kind 都从 1 开始），换一枚
- * 实例就重名。出生时刻由官方签（`Date.now()`），跨实例撞上同一毫秒的机会与"用户在服务重载后
- * 一毫秒内又起一次重建"同阶，而那已经是另一次用户意图，卡片 404 重来即可。
+ * 实例就重名；那时同 id 指向的是另一条作业（另一棵树/另一条命令），旧卡片跟上去就是串台。
  * @param state 这条记录的状态盒
  * @param view 名册里同 id 的那条投影
  * @returns 同一条作业
  */
-function sameJob(state: RebuildState, view: JobView, live: JobsService): boolean {
-  // 身份证是两半：签发注册表的**实例身份**（"jobs 那一行被换成另一枚实例"的直接证据）
-  // + 出生时刻。只比时间戳在同毫秒重签时会撞车（两枚实例各取 Date.now() 同值），
-  // 实例引用不会——这正是"换过服务"这条语义本身。
-  return state.owner === live && state.bornAt === view.startedAt;
+function sameJob(state: RebuildState, view: JobView): boolean {
+  // 身份证是投影值三段（kind/label/startedAt），不是服务实例引用——理由见 JobIdentity。
+  return sameIdentity(state.identity, identityOf(view));
 }
 
 /** 终止重建进程：kill 异常忽略（进程可能已自然退出/已被回收）。 */
@@ -1429,11 +1469,9 @@ function killProc(proc: ShellExecution): void {
  * "看不见了"说成"没跑出来"。
  */
 interface RebuildState {
-  /** 出生时刻（官方 `JobView.startedAt`）＝身份证的另一半；0 = 还没盖（start 返回前的同步块内）。 */
-  bornAt: number;
-  /** 签发这条作业的注册表实例＝身份证的主体；null = 还没盖。换过实例即可判非同一条，
-   *  不依赖时间戳（同毫秒重签会撞值）。 */
-  owner: JobsService | null;
+  /** 这条作业的身份证（kind/label/startedAt 三段）。`start` 交回投影前
+   *  `startedAt` 是未盖章占位值（见 UNSIGNED_STARTED_AT）。 */
+  identity: JobIdentity;
   /** 执行器的读者报 lossy 或抛错 ⇒ 真少了字节（与"环按留存窗裁过头部"分开标）。 */
   lost: boolean;
   /** 超时说明。不进环（环的写权归注册表的泵），由投影端点合成。 */
@@ -1618,7 +1656,7 @@ function followRunningRebuild(
       return false;
     }
     const view = jobView(jobs, record.id);
-    return view !== null && sameJob(record.state, view, jobs) && isLiveStatus(view.status);
+    return view !== null && sameJob(record.state, view) && isLiveStatus(view.status);
   });
   if (following === undefined) {
     return false;
@@ -1948,7 +1986,7 @@ function rebuildJobSpec(
           return null;
         }
         const view = jobView(live, handle.id);
-        if (view === null || !sameJob(state, view, live)) {
+        if (view === null || !sameJob(state, view)) {
           return null;
         }
         return { jobs: live, status: view.status };
@@ -2008,6 +2046,54 @@ function rebuildJobSpec(
 }
 
 /**
+ * `ignoreFiles` 的可用性预检：模型给的第 N 条忽略文件必须是**当前进程读得了的普通文件**。
+ *
+ * 为什么必须预检（全部实测，见 test/e2e/zg-cli.test.ts）：真 zg 遇到读不成的 ignore 文件
+ * **不是**按"没有这条规则"继续，而是整次索引失败（`ZVEC_GREP.ENGINE.INDEXING.WORKSPACE_FAILED`，
+ * 原因是 ENOENT / EACCES / EISDIR），并且那个坏路径会**写进工作区索引的状态**——此后这条树上的
+ * `zg index` 与 `zg status` 都报同一个错，`--reset-paths` 清不掉，只有 `zg_index drop`（整棵
+ * 索引删掉重来）能救。一个拼错的文件名、一个存在但读不了的文件（mode 000 / 他人属主，用绝对路径
+ * 还够得着系统文件）、或一个目录，就把用户的工作区索引弄坏，属于必须在起进程之前拦下的那一类。
+ *
+ * 判据「读得了 + 是文件」合成**一次** try（accessSync 在前）：`statSync().isFile()` 对 mode 000
+ * 的文件照样返回 true（stat 只要父目录可搜索、不要文件本身可读），故先 `accessSync(R_OK)` 补上
+ * "当前进程真能 open 来读"这半段——它与 zg 的读权限同 uid 同源（root 下两者都放行、非 root 下
+ * 两者都拒）；再用 `isFile()` 挡掉目录。**不拆成「不存在」与「读不了」两条独立分支**：可读性那
+ * 一档在 windows（chmod 只翻只读位，属主仍读得了）与 root（绕过 DAC）下根本造不出来，拆成独立
+ * 分支会让 CI 的 windows 那格在 100% 覆盖率门禁下无从而钉（本仓不用 coverage-ignore 逃生口）。
+ * 合成一句「不是存在且可读的文件」文案，三种成因都准确覆盖，且 catch 由「不存在」这一档跨平台钉住。
+ *
+ * drop 那一臂整段跳过：`--drop` 的命令只有 `zg index <root> --drop --yes`，ignoreFiles 被
+ * buildIndexCommand 静默丢掉、根本不进 zg（见 lib/cli.ts 的 drop 分支），预检它没有意义，还会
+ * 拿"给一个真实存在的忽略文件"这句误导文案把一次合法的删索引拦下。判 drop 用与构造器**同一个**
+ * `boolOf`，两处口径不会漂。
+ * @param args 索引入参（`ignoreFiles` 单值或数组；`drop` 为真时整段跳过）
+ * @param root 已归一的工作区根（相对路径按它解析）
+ * @param messages 文案表
+ * @returns {void}
+ * @throws Error 指向第一个不可用的条目（不静默丢弃用户给的那一项）
+ */
+function assertIgnoreFilesExist(args: IndexArgs, root: string, messages: ZvecGrepMessages): void {
+  if (boolOf(args.drop, "drop", messages)) {
+    return;
+  }
+  for (const entry of singleOrList(args.ignoreFiles, "ignoreFiles", messages)) {
+    const target = entry.startsWith("/") ? entry : `${root}/${entry}`;
+    let usable = false;
+    try {
+      // 先判可读（不存在 / 无权限 / 父目录不可搜索都在这里抛），再判是普通文件（挡掉目录）。
+      accessSync(target, constants.R_OK);
+      usable = statSync(target).isFile();
+    } catch {
+      // 读不到就不是可用文件：保留初始的 false，统一走下面那句文案。
+    }
+    if (!usable) {
+      throw new Error(fill(messages.ignoreFileMissing, { path: entry, root }));
+    }
+  }
+}
+
+/**
  * 起一条 `zg index`：命令构造 + resolve + execute 三步。
  *
  * 设置卡重建端点与模型侧后台索引**共用**这一个函数（不是复制品），所以两条入口起的作业
@@ -2037,6 +2123,8 @@ async function spawnIndexWrite(
     // 版本门槛先于命令构造：太老的 zg 会在这一行就拿到可照做的指引，而不是起一条
     // 命令形态对不上的 zg 再让人对着结果猜。
     await routes.versionGate.ensure(started);
+    // 与前台索引同一道预检（见 assertIgnoreFilesExist）：后台这条路的入参同样来自模型。
+    assertIgnoreFilesExist(indexArgs, assertAbsoluteRoot(indexArgs.root, started), started);
     const built = buildIndexCommand(
       indexArgs,
       embedding,
@@ -2096,7 +2184,12 @@ function attachIndexWrite(
   }
   pruneRebuildHistory(starting, records);
   // 丢失记账先于 start：源的 read 可能在 start 里同步跑第一拍。
-  const state: RebuildState = { bornAt: 0, owner: null, lost: false, timeoutNote: null };
+  const state: RebuildState = {
+    // kind/label 与下面那份规格同源（就是命令本身）；startedAt 等官方签。
+    identity: { kind: REBUILD_JOB_KIND, label: command, startedAt: UNSIGNED_STARTED_AT },
+    lost: false,
+    timeoutNote: null,
+  };
   let jobId: JobId;
   try {
     jobId = startUnderController(starting, rebuildJobSpec(routes, proc, state, command, root));
@@ -2104,16 +2197,13 @@ function attachIndexWrite(
     // 已拆就是这一档）都会被官方件按"不注册、序号作废"处理，那时侧表里不该留着这条。
     // 身份证与登记同一步完成：`run()` 若抛错，官方件按"不注册、序号作废"处理（实测），
     // 那时侧表里不该留着这条记录。
-    state.bornAt = starting.get(jobId).startedAt;
-    state.owner = starting;
+    state.identity = identityOf(starting.get(jobId));
     const clashed = records.get(jobId);
-    // 同一实例的 id 计数器单调，不重签 ⇒ owner 异即"换过服务"，bornAt 无需再比
-    // （比了也是永远为假第二次操作数，白亏分支覆盖）。
-    if (clashed !== undefined && clashed.state.owner !== starting) {
-      // 同名不同命：`jobs` 那一行被换成另一枚实例，它的计数器又从这个 id 开始分配。
-      // 顶掉旧记录会让那张旧面板从此跟着**另一棵树**的重建走（root 当场换人），而旧的
-      // zg 也没人再管——两边都是坏结果。所以这里反过来：把刚起的这条收掉、拒绝登记，
-      // 并响亮地告诉调用方换过服务了要重载插件。旧那条的记录与超时臂都原样留着。
+    // 换过注册表 ⇒ 同 id 是另一条作业（新实例的计数器又从 1 开始）。顶掉旧记录会让那张旧
+    // 面板从此跟着**另一棵树**的重建走（root 当场换人），而旧的 zg 也没人再管——两边都是坏
+    // 结果。所以这里反过来：把刚起的这条收掉、拒绝登记，并响亮地告诉调用方换过服务了要重载
+    // 插件。旧那条的记录与超时臂都原样留着。
+    if (clashed !== undefined && !sameIdentity(clashed.state.identity, state.identity)) {
       killProc(proc);
       return { error: started.endpointRegistryReplaced, status: 503 };
     }
@@ -2240,7 +2330,7 @@ function handleRebuildStatus(
     });
     return;
   }
-  if (!sameJob(record.state, output.view, jobs)) {
+  if (!sameJob(record.state, output.view)) {
     // 同名不同命：`jobs` 那一行被重载后新实例重新签发了这个 id。旧卡片读不到新作业，
     // 新作业也不许被旧卡片的轮询/超时/卸载臂碰到。
     sendJson(res, 404, {
@@ -2310,7 +2400,7 @@ function releaseRebuildRecords(routes: RebuildRoutes): void {
   } else {
     for (const record of records.values()) {
       const view = jobView(jobs, record.id);
-      if (view === null || !sameJob(record.state, view, jobs)) {
+      if (view === null || !sameJob(record.state, view)) {
         // 名册里没有这条（已被别人收走），或者同名不同命（`jobs` 换过一枚实例）：
         // 两种都只剩我们手里的进程可收，绝不去 kill/remove 别人那条健康作业。
         killProc(record.proc);
@@ -2875,6 +2965,9 @@ async function runIndexTool(
     // 参数。放在 try 之外时，那次抛出会绕过 finally，占位永不交还——这棵树被永久标成
     // 「重建中」，之后每次检索都等一条已经死掉的重建，每次重建都只得到「已有一条重建在
     // 进行中」，门禁的重建期放行还会持续放行 grep/rg。
+    // 存在性预检先于命令构造：ignoreFiles 指向不存在的文件会把整棵工作区索引弄坏，
+    // 而模型够得着这个参数（见 assertIgnoreFilesExist 的实测说明）。
+    assertIgnoreFilesExist(indexArgs, root, messages);
     const { command, workdir } = buildIndexCommand(
       indexArgs,
       readDefaultEmbedding(config),

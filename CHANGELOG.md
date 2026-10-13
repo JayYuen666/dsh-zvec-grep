@@ -2,6 +2,31 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.3
+
+修复一处**跟着真实宿主语义失效的作业身份判据**（它让重建轮询恒 404、卸载只杀进程不摘作业 ⇒ 官方环缓冲留在宿主内存），并给 `ignoreFiles` 补上起进程之前的**存在性 + 可读性**预检（一条读不成的忽略文件会永久弄坏整棵工作区索引）。测试面从「单测 + mock 宿主」扩到三层：新增真宿主半栈的集成层与直怼真 zg CLI 的点对点层。
+
+### Fixed
+
+- **作业身份改用投影值，不再比注册表实例引用**。旧 `sameJob` 的一半判据是 `state.owner === ctx.get("jobs")`，而真实 cordis 每读一次服务都新建一枚 traceable 代理 ⇒ 同一枚注册表的两次读也不 `===`，该判据在真实宿主上**恒为假**（mock 上下文里恒真，故单测全绿、线上全崩）。后果有三：轮询端点对每条活着的重建恒回 404；卸载 / 超时臂只 `killProc` 而从不 `jobs.remove` ⇒ 官方环缓冲留在宿主内存里（内存泄露）；「同根第二条启动复用在跑那条」的 follow 恒不生效。现改用官方 `JobView` 上三段**值稳定**的投影（`kind` / `label` / `startedAt`）做身份——`JobView` 虽每次新建对象，这三个原始值却跨读恒定。`startedAt` 未盖章时用占位 `0`（官方签的是 `Date.now()`，永不为 0），保证 `start` 同步跑第一拍时不会把同 id 的另一条作业误认成自己的。
+- **`ignoreFiles` 预检补上「可读性」这半段，并与「是否存在」合成一次判定**。原判据只查 `statSync().isFile()`，而它对 mode 000 / 他人属主的文件照样返回 `true`（stat 只要父目录可搜索、不要文件本身可读）；真 zg 去 open 它会 `EACCES` ⇒ 整次索引失败并把这条坏路径**写进工作区索引状态**，此后这棵树上的 `zg index` / `zg status` 都报同一个错，`--reset-paths` 清不掉，只有 `zg_index drop` 能救——与「文件不存在」是同一种永久损坏，却漏过了预检。现以 `accessSync(R_OK)` 在前、`isFile()` 在后合成一次 try：`accessSync` 与 zg 的读权限同 uid 同源（root 下两者都放行、非 root 下两者都拒），只查权限位、不读内容，没有 `readFileSync` 那种把大文件整段读进内存的代价。**刻意不拆成「不存在」与「读不了」两条独立分支 / 两句文案**：可读性那一档在 windows（chmod 只翻只读位、属主仍读得了）与 root（绕过 DAC）下造不出文件来触发，拆成独立分支会让 CI 的 windows 那格在 100% 覆盖率门禁下无从而钉（本仓不用 coverage-ignore 逃生口）；合成一条 catch 后由跨平台的「不存在」这一档钉住，三种成因（ENOENT / EISDIR / EACCES）共用一句「不是一份存在且当前进程可读的文件」文案。
+- **`drop` 那一臂不再被 `ignoreFiles` 预检误拒**。`--drop` 的命令只有 `zg index <root> --drop --yes`，`ignoreFiles` 被 `buildIndexCommand` 静默丢掉、根本不进 zg（也就无从损坏索引）；而预检原先无条件先跑，于是 `drop:true` + 一条坏 `ignoreFiles` 会被「请给一个真实存在的忽略文件」这句误导文案拦下一次合法的删索引。现 `drop` 为真时整段跳过预检，判 `drop` 用与构造器**同一个** `boolOf`，两处口径不漂。
+
+### Added
+
+- **`ignoreFiles` 可用性预检（`assertIgnoreFilesExist`）**：模型够得着 `ignoreFiles` 这个参数，而一条读不成的忽略文件会永久弄坏工作区索引，属于必须在起进程之前拦下的那一类。前台索引、模型侧后台索引、设置卡重建这三条起 `zg index` 的路径共用同一道预检（卡片那条不带 `ignoreFiles`，天然空转）；`drop` 为真时整段跳过（见上）。三种不可用成因合成一句「不是存在且可读的文件」文案，双语，并写明代价与出路。
+- **测试分三层**。原来只有 `test/*.test.ts`（单测 + 一枚 mock 宿主上下文）。新增：
+  - `test/integration/*`：真宿主半栈——官方 cordis `Context` + `dsh-tools` 的 `ToolRuntime`（含 pre-execute 瀑布与官方 JSON Schema 子集校验）+ `dsh-subprocess-local` / `dsh-bash-local` 的本地 bash 执行器（真 spawn / 真 deadline / 真 stdout 上限与 spill / 真凭据擦除）+ `dsh-jobs-local` 的 `LocalJobRegistry`（真环 / 真泵 / 真容量）+ 真 `node:http` 监听的 `dsh-host-webserver` + timer + approval，把插件挂进官方调用管线（`ctx.tools.execute()` / 真 `fetch`）驱动。宿主契约的缺陷都出在这一层：mock 上下文只会同意本包已经相信的事（`ctx.get("jobs") === ctx.get("jobs")` 在替身里恒真、真实 cordis 恒假，正是上面那条 Fixed 的成因）。
+  - `test/e2e/zg-cli.test.ts`：既无插件也无替身，只把 `lib/cli.ts` 造出的命令行喂给**真 zg CLI**，钉它的旗标面、输出形状、错误码，以及「坏 `ignoreFiles` 会弄坏整棵树」这类上游事实（含 ENOENT 与 EACCES 两档）。
+  - **两层按环境 gate，而非无条件跑**：真-zg 的 integration + e2e 整体 `describe.skipIf(!zgAvailable())`——CI 的干净 runner 没装真 zg，硬跑会以「command not found」变红而不是跳过；本机装了 zg 才跑。本包自己的判据另由 `test/host.test.ts` 的 mock 宿主独立钉到 100%（`assertIgnoreFilesExist`：drop 跳过 / 不存在 / 读不了 / 放行，绝对与相对两种写法都覆盖），所以这两层在 CI 跳过后覆盖率不塌；「读不了」那档再按 `canMakeUnreadableFile()`（root 或 windows 造不出属主读不了的文件）单独跳过，也不依赖它保覆盖率。
+- 两份 README 各补一段「测试分三层」的说明。
+
+### Changed
+
+- `devDependencies` 补 `@deepseek-ai/dsh-bash-local` / `dsh-http-proxy` / `dsh-subprocess-local` / `dsh-timeout`（真宿主台架的传递依赖，均**不进** `dependencies`）。
+- `pnpm-workspace.yaml` 的 `allowBuilds` 把 `@deepseek-ai/dsh-subprocess-local` / `koffi` / `node-pty` 显式记为 `false`。这三枚是集测台架经 `dsh-subprocess-local` 传递引入的原生模块（各带安装脚本），而 pnpm 12 默认拦截未声明的构建脚本 ⇒ CI 那步 `pnpm install --frozen-lockfile` 以 `ERR_PNPM_IGNORED_BUILDS` 退出 1（本机因 `.modules.yaml` 早记下 ignoredBuilds 决定反而不报）。但本包根本用不到它们的构建产物：`dsh-subprocess-local` 经 `dsh-lazy-require` 惰性加载 `node-pty` / `koffi`，集成用例走的是 bash 执行路径、从不 require（本机 `.modules.yaml` 记的正是 ignoredBuilds，600 用例照绿）。显式 `false` 让 pnpm 跳过构建且不计入 ignoredBuilds（源码实测：唯有 `allowBuild()` 返回 `undefined` 的未声明档才报错），CI 也因此不必为用不到的原生模块在 windows 那一格背上 node-gyp 编译。`esbuild: true` 那条不动（vite 传递引入，确实要它落平台二进制）。
+- `oxlint.config.ts` 的 `syncWrites` 声明 `chmodSync`（用例造 mode 000 的不可读忽略文件）与 `accessSync`（只读权限探针；共享基线的只读豁免表恰好没收录它，故经本包这唯一的 sync 例外口子声明）。
+
 ## 0.1.2
 
 宿主生态跟到 `0.2.1-alpha.2`，并把一处**跟着宿主变更而失效的安全判据**改回可用。这一版还补上了发布面与装载面的门禁，以及中英两份 README。

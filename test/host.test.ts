@@ -10,7 +10,15 @@
 // Promise.withResolvers（运行时 Node≥22 可用；lib=ES2024 无该静态成员故类型借道 cast）。
 import { describe, it, beforeAll, afterAll, vi } from "vitest";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { networkInterfaces, tmpdir } from "node:os";
 import path from "node:path";
 import vm from "node:vm";
@@ -2235,6 +2243,87 @@ describe("zg_index / zg_status 执行", () => {
       () => toolOf(ctx, "zg_index").execute({ root, confirm: true, drop: "true" }, execOf(root)),
       /drop 必须是布尔值/u,
     );
+  });
+
+  describe("ignoreFiles 预检（存在 + 可读；drop 那一臂跳过）", () => {
+    // 这一层用 mock 宿主钉**本包自己的判据**（起命令之前的那段）：CI 没有真 zg 时它照跑，
+    // 覆盖率不因真-zg 的集成/端到端两层按 zgAvailable 跳过而塌。上游「读不成的忽略文件会把
+    // 整棵工作区索引写坏」这一事实另由 test/e2e/zg-cli.test.ts（ENOENT / EACCES 两档）与
+    // test/integration/tools-real.test.ts 用真 zg 钉住。
+    // 「读不了」这一档要靠 mode 000 造，而 root（绕过 DAC）与 windows（chmod 只翻只读位、属主
+    // 仍可读）都造不出来 ⇒ 那两种环境跳过它。覆盖率不受影响：host.ts 那句合并判据的 catch 由
+    // 下面「不存在」这一档跨平台钉住，可读性只是把同一条 catch 再走一遍。
+    const canMakeUnreadable =
+      process.platform !== "win32" &&
+      !(typeof process.getuid === "function" && process.getuid() === 0);
+
+    it("相对与绝对两种写法都放行，并原样递进 --ignore-file", async () => {
+      const ctx = makeCtx();
+      applyTo(ctx);
+      writeFileSync(path.join(root, "rel.ignore"), "*.log\n");
+      const abs = path.join(root, "abs.ignore");
+      writeFileSync(abs, "*.tmp\n");
+      ctx.shell.runResults.push(okRun("INDEXED"));
+      await toolOf(ctx, "zg_index").execute(
+        { root, confirm: true, ignoreFiles: ["rel.ignore", abs] },
+        execOf(root),
+      );
+      const command = String(ctx.shell.resolveCalls[0]?.command);
+      assert.match(command, /--ignore-file 'rel\.ignore'/u);
+      // 绝对路径按原样递过去：预检既不把它改成相对 root，也不改动命令构造。
+      assert.ok(command.includes(`--ignore-file '${abs}'`), command);
+    });
+
+    it("指向不存在的忽略文件：起命令之前就被拒，一条 zg 都不发", async () => {
+      const ctx = makeCtx();
+      applyTo(ctx);
+      await assert.rejects(
+        () =>
+          toolOf(ctx, "zg_index").execute(
+            { root, confirm: true, ignoreFiles: ["nope.ignore"] },
+            execOf(root),
+          ),
+        /存在且当前进程可读/u,
+      );
+      assert.equal(ctx.shell.resolveCalls.length, 0, "预检没过就不该构造/发出任何命令");
+    });
+
+    it.skipIf(!canMakeUnreadable)(
+      "存在但读不了（mode 000）：走同一条 catch，也被拒在起命令之前",
+      async () => {
+        const ctx = makeCtx();
+        applyTo(ctx);
+        const locked = path.join(root, "locked.ignore");
+        writeFileSync(locked, "*.log\n");
+        chmodSync(locked, 0o000);
+        try {
+          await assert.rejects(
+            () =>
+              toolOf(ctx, "zg_index").execute(
+                { root, confirm: true, ignoreFiles: ["locked.ignore"] },
+                execOf(root),
+              ),
+            /存在且当前进程可读/u,
+          );
+          assert.equal(ctx.shell.resolveCalls.length, 0);
+        } finally {
+          chmodSync(locked, 0o644);
+        }
+      },
+    );
+
+    it("drop 那一臂跳过预检：drop + 坏 ignoreFiles 不被误拒，命令里也没有 --ignore-file", async () => {
+      const ctx = makeCtx();
+      applyTo(ctx);
+      ctx.shell.runResults.push(okRun("DROPPED"));
+      await toolOf(ctx, "zg_index").execute(
+        { root, confirm: true, drop: true, ignoreFiles: ["nope.ignore"] },
+        execOf(root),
+      );
+      const command = String(ctx.shell.resolveCalls[0]?.command);
+      assert.match(command, /--drop/u);
+      assert.ok(!command.includes("--ignore-file"), command);
+    });
   });
 
   it("hfEndpoint 传给三个工具与 rebuild", async () => {

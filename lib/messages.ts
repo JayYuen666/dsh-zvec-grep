@@ -249,6 +249,9 @@ export interface ZvecGrepMessages {
   readonly embeddingNotAllowed: string;
   /** drop 与 resetPaths 互斥。 */
   readonly dropWithResetPaths: string;
+  /** ignoreFiles 里的路径不是「存在且当前进程可读的文件」（不存在 / 是目录 / 读不了都算；真 zg
+   *  遇到读不成的忽略文件会整次索引失败并把坏路径写进索引状态，之后这条树再也起不来）。 */
+  readonly ignoreFileMissing: string;
   /** 无索引时自动改走穷举检索的前置说明。 */
   readonly exhaustiveFallbackNote: string;
   /** 穷举检索不发放 grep/rg 配额。 */
@@ -486,6 +489,8 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "embedding 引用 {reference} 不在本地候选清单内，而本部署未开放远程 embedding。远程 embedding 会把工作区内容送到外部端点，必须由用户在部署配置里显式开放（allowRemoteEmbedding），本插件不接受模型侧开启。可选本地模型：{choices}。若用户确已自行配好远程凭据（zg config provider set / zg auth grant <root> --capability embedding --scope workspace），请在插件部署配置里打开对应开关后重试。",
     dropWithResetPaths:
       "drop 与 resetPaths 互斥：--drop 整条命令只有删除索引一件事，resetPaths 无处安放（上游 zg 也拒这一对）。要清继承的文件选择设置，请不要传 drop。",
+    ignoreFileMissing:
+      "ignoreFiles 里的 {path} 在 {root} 下不是一份「存在且当前进程可读的文件」（不存在、是目录、或有文件但读不了都算）。上游 zg 遇到读不成的忽略文件不会按「没有这条规则」继续，而是整次索引失败（ENOENT / EISDIR / EACCES），并把这条坏路径写进工作区索引状态——此后这条树上的 zg index / zg status 都会报同一个错，--reset-paths 也清不掉，只有 zg_index drop 能救。请给一个真实存在、当前用户可读的忽略文件路径。",
     exhaustiveFallbackNote:
       "[zvec-grep] 该工作区（含向上各级）尚无 zg 索引，已自动改用穷举词法检索（rg 模式）。结果是逐行字面匹配，不是语义相关度排序；需要语义检索请先 zg_index 建索引。",
     rgDescription:
@@ -795,6 +800,13 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "drop conflicts with resetPaths: --drop does nothing but delete the index, so resetPaths has " +
       "nowhere to go (upstream zg rejects the pair too). To clear inherited file-selection settings, " +
       "do not pass drop.",
+    ignoreFileMissing:
+      "{path} under {root} is not an existing file the current process can read (missing, a " +
+      "directory, or present-but-unreadable all count). Upstream zg does not treat a failed " +
+      'ignore-file read as "no such rule": the whole indexing run fails (ENOENT / EISDIR / EACCES) ' +
+      "and the bad path is written into the workspace index state, after which every zg index / " +
+      "zg status on that tree reports the same error — even --reset-paths cannot clear it, only " +
+      "zg_index drop can. Give a path that really exists and that the current user can read.",
     exhaustiveFallbackNote:
       "[zvec-grep] This workspace (and every directory above it) has no zg index, so the search fell " +
       "back to exhaustive lexical matching (rg mode). Results are literal line matches, not ranked by " +

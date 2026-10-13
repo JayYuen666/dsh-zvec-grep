@@ -108,6 +108,15 @@ overrides:
   "@deepseek-ai/schemastery": 3.18.5-alpha.1
   "@deepseek-ai/dsh-client-shortcuts": 0.2.1-alpha.2
 # esbuild 由 vite 传递引入，其安装脚本负责落下当前平台的二进制；本仓没有包直接依赖它。
+# dsh-subprocess-local / koffi / node-pty 是集成台架（真宿主半栈）经 dsh-subprocess-local 传递
+# 引入的：后两者是原生模块，但 dsh-subprocess-local 用 dsh-lazy-require 惰性加载它们，本包测试
+# 走的那条 bash 执行路径根本不 require（本机 .modules.yaml 记的正是 ignoredBuilds，600 条用例照绿）。
+# 故显式声明 false =「决定不建」：pnpm 12 只对**未声明**（allowBuild() 返回 undefined）的构建脚本
+# 报 ERR_PNPM_IGNORED_BUILDS，显式 false 会跳过且不进 ignoredBuilds。CI 因此不必为用不到的原生
+# 模块背上 node-gyp 跨平台编译（windows 那一格尤其脆）。
 allowBuilds:
   esbuild: true
+  "@deepseek-ai/dsh-subprocess-local": false
+  koffi: false
+  node-pty: false
 minimumReleaseAge: 0
