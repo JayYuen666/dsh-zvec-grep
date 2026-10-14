@@ -887,6 +887,24 @@ function liveConfigRefs(ctx: MockCtx): Record<string, unknown> {
   );
 }
 
+/**
+ * 需要「盘上真工作区」的测试组按平台跳过（判据只有这一处，各 `describe.skipIf` 引用它）。
+ *
+ * 成因不是测试写错，而是插件的范围：root 判据（`lib/cli.ts` 的 `assertAbsoluteRoot`）只认以
+ * `/` 开头的绝对路径，命令形态也是 POSIX 的（`shq()` 单引号 + 整串交给 `bash -c`）。Windows 上
+ * `os.tmpdir()` 交回的是盘符形态（CI 实测 `C:\Users\RUNNER~1\AppData\Local\Temp\zvec-…`），
+ * 每一次 `rootOf` 都拒在那一步，被测行为根本走不到 ⇒ 这批用例在 win32 上不成立，跳过而不是
+ * 改成假通过。dsh 的 Windows 宿主因此不在本包支持面内（README「支持面」一节）。
+ *
+ * windows 那格 CI 仍跑它真正要钉的东西：同一份源码在两种字节形态下的产物 / 换行 / path.sep
+ * 漂移，加上不需要 root 的判据用例；覆盖率门禁归 ubuntu 格（跳过这批用例后 `host.ts` 在
+ * win32 不可能到 100%，见 ci.yml 的那段注释）。
+ *
+ * 写成 `describe.skipIf(realRootUnavailable)` 而不是包一层别名：oxlint 的 vitest 规则按 `describe`
+ * 字面量识别 suite，别名会让整个文件被当成一个作用域（实测 221 条 consistent-test-it 噪声）。
+ */
+const realRootUnavailable = process.platform === "win32";
+
 // ── 真实临时工作区（root 存在性预检）──────────────────────────────────────
 
 const createdDirs: string[] = [];
@@ -1201,7 +1219,7 @@ function okRun(stdoutText = "OK"): ShellRunResult {
 
 // ── 注册面 ────────────────────────────────────────────────────────────────
 
-describe("zg 版本门槛", () => {
+describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
   it("版本够新：放行，且探测不吃命令结果队列", async () => {
     const root = ws();
     const ctx = makeCtx();
@@ -1440,7 +1458,7 @@ describe("zg 版本门槛", () => {
   });
 });
 
-describe("官方用户确认（tools/pre-execute → ctx.approval）", () => {
+describe.skipIf(realRootUnavailable)("官方用户确认（tools/pre-execute → ctx.approval）", () => {
   it("默认关：该被问的显式 root 也直接放行（不打扰用户，也不改变既有行为）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -1586,7 +1604,7 @@ describe("官方用户确认（tools/pre-execute → ctx.approval）", () => {
   });
 });
 
-describe("host.apply 注册面", () => {
+describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
   it("隐式注册：Config schema 逐字段默认 = 0.1.6 交给 register 的内置底座", () => {
     // 0.1.7 删了 settings.register(ns, schema, { base })：命名空间 = profile 条目 id，
     // 默认值改由 schema 自己带（cordis 装载期用同一份 schema 填默认后交引用进 apply）。
@@ -1764,7 +1782,7 @@ const GROUP_HEADER_1 = "query groups (2):";
 const GROUP_LINE_1 = "Q1 [supplemental]: parseConfig";
 const GROUP_LINE_2 = "Q2 [supplemental]: parse a config file";
 
-describe("zg_search 执行", () => {
+describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
   let ctx: MockCtx;
   let root: string;
   beforeAll(() => {
@@ -2331,7 +2349,7 @@ describe("zg_search 执行", () => {
   });
 });
 
-describe("zg_index / zg_status 执行", () => {
+describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
   let root: string;
   beforeAll(() => {
     root = ws("index");
@@ -2627,7 +2645,7 @@ describe("zg_index / zg_status 执行", () => {
 // 真实 zg 的契约是「preserves the normal output and exits non-zero unless the Workspace
 // index is ready」：就绪报告打在 stdout，退出码只表达就绪与否。走普通失败路径会把报告丢掉、
 // 只留一句 stderr，恰好扔掉用户最需要的输出。
-describe("zg_status 就绪判定", () => {
+describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
   it("checkReady=true 透传 --check-ready", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -2724,7 +2742,7 @@ describe("zg_status 就绪判定", () => {
 
 // ── 重建端点 ──────────────────────────────────────────────────────────────
 
-describe("rebuild-roots 引导端点", () => {
+describe.skipIf(realRootUnavailable)("rebuild-roots 引导端点", () => {
   it("GET 回 CSRF token 与已观测工作区列表", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -2766,7 +2784,7 @@ describe("rebuild-roots 引导端点", () => {
   });
 });
 
-describe("rebuild 启动端点", () => {
+describe.skipIf(realRootUnavailable)("rebuild 启动端点", () => {
   it("POST 有效 root 返回 jobId 并启动带超时的后台进程", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -2959,7 +2977,7 @@ describe("rebuild 启动端点", () => {
   });
 });
 
-describe("rebuild 后台进程状态", () => {
+describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
   it("完成：status/exitCode 原样回给卡片（completed+exit≠0 不得显示成功）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3178,7 +3196,7 @@ describe("rebuild 后台进程状态", () => {
   });
 });
 
-describe("rebuild-status 端点", () => {
+describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
   it("跨源 → 403", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3703,7 +3721,7 @@ describe("rebuild-status 端点", () => {
 
 // ── 行级 config + required 校验 ───────────────────────────────────────────
 
-describe("zvec-grep 行级 config 与 required 校验", () => {
+describe.skipIf(realRootUnavailable)("zvec-grep 行级 config 与 required 校验", () => {
   it("行 config 覆盖 schema 默认，未提供字段保持 schema 默认", async () => {
     // 旧断言盯的是「行 config 合进 BUILTIN_BASE 后交给 settings.register 的 base」。
     // 0.1.7 把这两件事都收走了（底座 = schema 的 .default()，合并 = cordis 装载期），
@@ -3752,7 +3770,7 @@ describe("zvec-grep 行级 config 与 required 校验", () => {
 // 的常量，现在进 Config schema（非 volatile：不占设置卡，行 config 是唯一改值入口）。
 // 这里钉两条链：前台三工具的 resolve 请求（timeoutMs/stdoutMaxBytes）与后台重建
 // （stdoutMaxBytes + kill 定时器时长），默认与行 config 覆盖两个方向都要走到。
-describe("部署值：超时与 stdout 上限走 Config", () => {
+describe.skipIf(realRootUnavailable)("部署值：超时与 stdout 上限走 Config", () => {
   it("三工具前台 resolve 带各自的默认超时与 stdout 上限（默认 = 原常量同值）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -4125,7 +4143,7 @@ describe("工具 render 全性", () => {
 // 工作区已建 zg 索引时，bash/pwsh 的 grep/rg 与原生 grep 工具在成功 zg_search
 // 一次之前会被拒绝。索引目录用真实 fs 临时目录（existsSync 真实路径）。
 
-describe("search-first 门禁", () => {
+describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
   let ctx: MockCtx;
   let tmp: string;
 
@@ -4437,7 +4455,7 @@ describe("search-first 门禁", () => {
 // 错误全自带字典（lib/messages.ts），语言只读官方 locale 命名空间的 preference。
 // 见 lib/locale.ts 的契约：读不到（没装 locale 插件）即中文默认。
 
-describe("host 侧文案双语", () => {
+describe.skipIf(realRootUnavailable)("host 侧文案双语", () => {
   it("locale 命名空间未注册 → 中文默认，且不抛", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -4802,7 +4820,7 @@ function grepVerdict(
 //
 // 一次 zg_index(background=true) 应当把「起进程 + 登记作业 + 挂超时回收」全做完，把可轮询的
 // 作业号交回后立刻返回；起的作业与设置卡那条重建在名册上同形，所以卡片也能看见。
-describe("模型侧后台索引", () => {
+describe.skipIf(realRootUnavailable)("模型侧后台索引", () => {
   it("返回可轮询的作业号，且本次调用不挂着", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -4941,7 +4959,7 @@ describe("模型侧后台索引", () => {
   });
 });
 
-describe("宿主没有会话存储时的降级", () => {
+describe.skipIf(realRootUnavailable)("宿主没有会话存储时的降级", () => {
   it("上溯停在已知的最后一跳，功能不中断（仍不阻断任何调用）", async () => {
     const ctx = makeCtx();
     ctx.noSessions = true;
@@ -5038,7 +5056,7 @@ describe("工作区白名单的有效期与最近使用", () => {
   });
 });
 
-describe("解锁表的最近使用淘汰", () => {
+describe.skipIf(realRootUnavailable)("解锁表的最近使用淘汰", () => {
   it("重新检索即刷新时效：额度在窗内一直可用", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5094,7 +5112,7 @@ async function searchWithStderr(stderr: string): Promise<string> {
 // zg 在成功时也往 stderr 写索引进度（非 TTY 下逐行落盘）。这些行每次建索引都在，写进回执
 // 只是噪声；真正要交回的是降级提示、锁冲突与任何**不认识**的新告警——所以判据是「只丢
 // 认得的进度行」，而不是「只留认得的告警」。
-describe("成功执行的 stderr 分类", () => {
+describe.skipIf(realRootUnavailable)("成功执行的 stderr 分类", () => {
   const runWithStderr = searchWithStderr;
 
   it("整段都是索引进度 → 一句注脚都不加", async () => {
@@ -5149,7 +5167,7 @@ describe("成功执行的 stderr 分类", () => {
 //
 // 只判「文件在不在」会把两种实况误判成有索引：文件在但不是一份清单，以及清单在但根路径
 // 不覆盖这个目录（此时在该目录检索必然失败，而门禁却按「已建索引」拦着 grep/rg）。
-describe("索引探测的清单校验", () => {
+describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
   const withManifest = withWorkspaceManifest;
   const makeApplied = appliedCtx;
 
@@ -5263,7 +5281,7 @@ describe("索引探测的清单校验", () => {
   });
 });
 
-describe("子代理共享检索解锁", () => {
+describe.skipIf(realRootUnavailable)("子代理共享检索解锁", () => {
   it("主代理搜过之后，它的子代理立刻能用那份额度（不必自己再搜一次）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5315,7 +5333,7 @@ describe("子代理共享检索解锁", () => {
   });
 });
 
-describe("穷举词法检索通道", () => {
+describe.skipIf(realRootUnavailable)("穷举词法检索通道", () => {
   it("无索引：自动改走 --rg，并在结果前显式声明这次是字面匹配", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5439,7 +5457,7 @@ async function searchIn(ctx: MockCtx, root: string, cwd?: string): Promise<unkno
   return toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(cwd));
 }
 
-describe("root 授权", () => {
+describe.skipIf(realRootUnavailable)("root 授权", () => {
   it("缺省 root（会话工作区本身）：放行", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5556,7 +5574,7 @@ describe("root 授权", () => {
 
 // ── 重建期检索通道 ──────────────────────────────────────────────────────────
 
-describe("重建期检索通道", () => {
+describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
   it("等待期间被取消：按中止收口而不是继续挂着", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5827,7 +5845,7 @@ describe("重建期检索通道", () => {
   });
 });
 
-describe("守护进程（zg server）就绪门槛", () => {
+describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", () => {
   it("守护进程缺席：background 在构造期即拒，那条会静默关掉刷新的命令不发出去", async () => {
     const ctx = makeCtx();
     applyTo(ctx);

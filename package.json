@@ -1,6 +1,6 @@
 {
   "name": "@jayyuen66/dsh-zvec-grep",
-  "version": "0.1.4",
+  "version": "0.1.5-rc",
   "description": "dsh 工作区语义检索插件（zg）：zg_search / zg_index / zg_status + 本地 embedding 设置卡片 + systemPrompt 路由规则 + guard 安全兜底。",
   "keywords": [
     "cordis",
@@ -50,7 +50,9 @@
     "lint": "oxlint .",
     "test": "vitest run --coverage",
     "test:watch": "vitest",
+    "test:platform": "vitest run --coverage.enabled=false",
     "check": "npm run --loglevel=warn typecheck && npm run --loglevel=warn lint && npm run --loglevel=warn build:client && npm run --loglevel=warn build && npm run --loglevel=warn test && npm run --loglevel=warn fmt:check",
+    "check:platform": "npm run --loglevel=warn typecheck && npm run --loglevel=warn lint && npm run --loglevel=warn build:client && npm run --loglevel=warn build && npm run --loglevel=warn test:platform && npm run --loglevel=warn fmt:check",
     "prepack": "npm run --loglevel=warn build:client && npm run --loglevel=warn build",
     "fmt": "oxfmt .",
     "fmt:check": "oxfmt --check .",

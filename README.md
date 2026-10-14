@@ -32,6 +32,13 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - The three `/_dsh/zvec-grep/*` routes hang off an `inject(["webServer"])` child fiber: with no webServer (a TUI host) the child never activates, so those routes simply do not exist while the tools keep working.
   - On the real host webServer arrives about a second after this entry, which is why it must be a dependency and not a one-off `ctx.get`.
 
+### Support surface
+
+- **POSIX hosts (Linux / macOS).** The root predicate accepts only absolute paths starting with `/` (`assertAbsoluteRoot` in `lib/cli.ts`), the command line is POSIX-shaped (`shq()` single-quote escaping plus the whole string handed to `bash -c`), and index probing plus the `rootPaths` comparison inside the manifest split on `/` as well.
+- **Windows hosts are out of scope**, and the failure mode is **fail-fast, not drift**: when the session workspace looks like `C:\Users\…`, all three zg tools refuse right in `rootOf` and say why ("root must be an absolute path starting with /"). The plugin never builds a `zg` command from a mismatched path and never hands a wrong-path result back to the model as if it were a real search. The card's "rebuild workspace" runs into the same root gate.
+- Real Windows support would mean changing the predicate itself rather than translating paths in front of it: root normalization (drive letters and UNC), a second command form (pwsh/cmd quoting is not `bash -c`), the `/`-based grep tokenizer and path-shape rules in the gate, and the `rootPaths` coverage check against `<root>/.zvec-grep/manifest.json`. That is a design change; this package does not do it and does not pretend to.
+- The CI matrix therefore splits in two: **the ubuntu job is the full gate** (including the four 100% coverage thresholds); **other platforms run only the parts that do not need a workspace on disk** — the "same source, two byte shapes" product / line-ending / `path.sep` drift — and **do not judge coverage**, because suites needing a real root skip wholesale on win32 (`realRootUnavailable` in `test/host.test.ts`) and `host.ts` could not reach 100% afterwards. The reasoning is written into `.github/workflows/ci.yml`.
+
 ### Tools exposed to the model
 
 - zg_search: at least one of query / queries / fts / vector (32 routes max, 4000 chars per query).

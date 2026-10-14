@@ -30,9 +30,24 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # Windows 那一档钉的是产物里 `//#region` 标记与 path.sep 的归一：本机跑不到 win32 的
+      # Windows 那一格钉的是产物里 `//#region` 标记与 path.sep 的归一：本机跑不到 win32 的
       # 分隔符形态，只有在这台 runner 上「同一份源码两种字节」这类漂移才会现形。
-      - run: pnpm run check
+      #
+      # 两格的命令不同，因为**覆盖率只能在 ubuntu 格判**：本包的 root 判据只认以 `/` 开头的
+      # 绝对路径（lib/cli.ts 的 assertAbsoluteRoot），而 win32 上 os.tmpdir() 交回的是盘符形态
+      # （实测 C:\Users\RUNNER~1\AppData\Local\Temp\…），凡是要在盘上造真实工作区的用例都会在
+      # rootOf 先拒掉、根本走不到被测行为 ⇒ 这些 suite 按平台跳过（test/host.test.ts 的
+      # realRootUnavailable）。跳过了 184 条用例，host.ts 在 win32 不可能到四项 100%，
+      # 所以 windows 格跑 check:platform（同一套 typecheck/lint/两个 bundle/全量用例/格式，
+      # 只是不判覆盖率），而不是把覆盖率阈值调低——阈值 100% 是 ubuntu 格的真约束，不是装饰。
+      # dsh 的 Windows 宿主因此明确不在支持面内（README「支持面」一节）；要支持 Windows 得动
+      # root 判据与命令形态本身，那是设计变更而不是给 CI 打个洞。
+      - name: gate（ubuntu：全部门禁，覆盖率归这一格）
+        if: matrix.os == 'ubuntu-latest'
+        run: pnpm run check
+      - name: gate（其余平台：产物/换行/path.sep 与不依赖真根的用例，不判覆盖率）
+        if: matrix.os != 'ubuntu-latest'
+        run: pnpm run check:platform
 
   # 这道门验的是「装出去之后」：本包真正的故障形状是构建、类型检查与 528 条用例全绿，
   # 而装载时 ERR_MODULE_NOT_FOUND（shared 产物值导入的宿主包缺席就是这么一个坑）。

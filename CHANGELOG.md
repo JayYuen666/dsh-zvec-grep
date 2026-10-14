@@ -2,6 +2,20 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.5-rc
+
+把 **Windows 的支持范围说清楚，并让 CI 按这个范围分工**。直接起因是 `b121e91`（0.1.4）推上去之后 `gate (windows-latest, 22)` 交了 184 条失败：唯一成因是 root 判据只认以 `/` 开头的绝对路径，而 win32 上 `os.tmpdir()` 交回盘符形态（`C:\Users\RUNNER~1\AppData\Local\Temp\…`），凡是要在盘上造真实工作区的用例都在 `rootOf` 先被拒、根本走不到被测行为。**这不是 0.1.4 改出来的**（184 条里 173 条的用例在 0.1.3 就存在，两版对 win32 也只保护了「造不出属主不可读文件」那一档），而是这一格的结果第一次被端上来。
+
+### Changed
+
+- **CI 两格分工**：ubuntu 格跑 `pnpm run check`（全部门禁，含四项 100% 覆盖率）；其余平台跑新增的 `pnpm run check:platform`——同一套 typecheck / lint / 两个 bundle / 全量用例 / `oxfmt`，只是不判覆盖率。理由写在 `ci.yml` 的注释里：需要盘上真根的用例在 win32 整块跳过之后，`host.ts` 的覆盖率本就到不了 100%，把阈值调低等于把 ubuntu 格的真约束改成装饰。
+- **`test/host.test.ts` 按平台跳过 24 个 suite**（谓词收成一处 `realRootUnavailable = process.platform === "win32"`，各 suite 写 `describe.skipIf(realRootUnavailable)(…)`）。写成字面上的 `describe.skipIf` 而不是包一层别名：oxlint 的 vitest 规则按 `describe` 识别 suite，别名会让整文件被当成一个作用域，实测冒出 221 条 `consistent-test-it` 噪声。**没有**跳过在 win32 上原样通过的那 6 个 suite（信任闸门、白名单有效期、hitSummary、探测缓存、render 全性、隐式注册验收）——跳掉一条本来会绿的用例就是抹掉真实信号。
+- 两份 README 新增「支持面 / Support surface」一节：本包是 POSIX-only，Windows 宿主下三个 zg 工具在 `rootOf` 当场拒并说明原因（fail-fast，不会拿错位路径去拼命令、也不会把错路结果当正常检索交回模型）；真要支持 Windows 得动 root 归一、第二套命令形态（pwsh/cmd 的引号与 `bash -c` 不同义）、门禁的 `/` 切词与 `manifest.json` 的 `rootPaths` 比对，属设计变更。
+
+### Fixed
+
+- 新增 `test:platform` / `check:platform` 两个脚本，让「不判覆盖率的那套门禁」在 package.json 里单源，CI 只挑命令——避免 workflow 里内联一串命令、日后与本地脚本各走各的。
+
 ## 0.1.4
 
 把 **zg 守护进程（server 模式）这一档能力差从「使用限制」变成显式判据**：`--mode auto` 在 daemon 缺席时由上游静默落回 direct（模型逐次冷加载、增量刷新与 `refresh=background` 都不存在），而本包过去既没有一处说明，也没有拦住那个不可能兑现的参数。顺带修掉两处评审确认的缺陷：`requireApprovalForExplicitRoot` 会为**注定被拒**的 root 弹一次换不来放行的确认；两份 README 与 `host.ts` 头注释的配置面数字早已和 schema 脱节（14 vs 16、四个 vs 十枚）。

@@ -29,6 +29,13 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 - apply 需要 settings/shell/tools/systemPrompt/timer 五个服务面：它们都在 `inject` 里，缺任一 cordis 就不激活本条目（宿主启动诊断点名 `pending (waiting for service: …)`）；apply 里的守卫再兜一层，ctx 形状不对时抛 `required services … missing`。
   - 三条 `/_dsh/zvec-grep/*` 端点挂在 `inject(["webServer"])` 的子 fiber 上：宿主没有 webServer（如 TUI）时子 fiber 不激活，端点不存在而工具照常。真实宿主上 webServer 比本条目晚到位约 1 秒，所以这里必须是依赖、不能只在 apply 里 `ctx.get` 读一次。
 
+### 支持面
+
+- **POSIX 宿主（Linux / macOS）**。root 判据只认以 `/` 开头的绝对路径（`lib/cli.ts` 的 `assertAbsoluteRoot`），命令行也是 POSIX 形态（`shq()` 单引号转义 + 整串交给 `bash -c`），索引探测与清单里的 `rootPaths` 比对同样按 `/` 分隔。
+- **Windows 宿主不在支持面内**，而且是 **fail-fast，不是静默走偏**：会话工作区长成 `C:\Users\…` 时，三个 zg 工具都在 `rootOf` 当场拒掉并说清原因（「root 必须是绝对路径（以 / 开头）」），不会拿一个错位的路径去拼 `zg` 命令、也不会把结果当成一次正常检索交回模型；设置卡的「工作区重建」同样过不去 root 那关。
+- 真要在 Windows 上支持，要动的是判据本身而不是加一层路径转换：root 归一（盘符与 UNC）、第二套命令形态（pwsh/cmd 的引号规则与 `bash -c` 不同义）、门禁里那套按 `/` 的 grep 切词与路径形状判据、以及 `<root>/.zvec-grep/manifest.json` 的 `rootPaths` 覆盖判据。这属设计变更，本包没做，也不假装能做。
+- CI 矩阵因此分两手：**ubuntu 格是全部门禁**（含四项 100% 覆盖率）；**windows 格只跑不依赖真工作区的部分**与「同一份源码两种字节」的产物 / 换行 / `path.sep` 漂移，**不判覆盖率**——需要盘上真根的用例在 win32 整块跳过（`test/host.test.ts` 的 `realRootUnavailable`），跳过之后 `host.ts` 本就无从到 100%。判据与理由写在 `.github/workflows/ci.yml`。
+
 ### 提供给模型的工具
 
 - zg_search：query / queries / fts / vector 至少其一（合计 <= 32 组，单条 <= 4000 字符）。
