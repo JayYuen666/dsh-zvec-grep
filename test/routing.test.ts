@@ -155,8 +155,17 @@ describe("isGrepRgCommand", () => {
     assert.equal(isGrepRgCommand("GREP foo"), true);
   });
 
-  it("管道与绝对路径调用命中", () => {
-    assert.equal(isGrepRgCommand("cat a.txt | grep foo"), true);
+  it("绝对路径 / git / xargs 命中；管道下游且无路径操作数不算", () => {
+    // 管道下游的 grep 只在过滤上游输出（ps/env/dscacheutil…），不检索文件系统 ⇒
+    // 不算检索。实测回归：`dscacheutil -q host | grep ip_address` 曾被误拦。
+    assert.equal(isGrepRgCommand("cat a.txt | grep foo"), false);
+    assert.equal(isGrepRgCommand("ps aux | grep node"), false);
+    assert.equal(isGrepRgCommand("dscacheutil -q host | grep ip_address"), false);
+    assert.equal(isGrepRgCommand("env | grep -i KEY"), false);
+    // 操作数扫描遇到下一段命令即停：仍然没有路径操作数 ⇒ 还是流过滤。
+    assert.equal(isGrepRgCommand("cat a | grep foo | wc -l"), false);
+    // 管道下游但带路径操作数 ⇒ 仍算检索。
+    assert.equal(isGrepRgCommand("cat a.txt | grep foo src/"), true);
     assert.equal(isGrepRgCommand("/opt/homebrew/bin/rg foo src"), true);
     assert.equal(isGrepRgCommand("git grep foo"), true);
     assert.equal(isGrepRgCommand('find . -name "*.ts" | xargs grep TODO'), true);
@@ -186,7 +195,8 @@ describe("isGrepRgCommand", () => {
 
   it("转义/选项形态按命令位判定", () => {
     // \grep 是绕 alias 的常见写法，仍是命令位上的 grep
-    assert.equal(isGrepRgCommand(String.raw`cat a | \grep foo`), true);
+    // 不带管道才走这一条：管道形态见上一组用例（下游过滤不算检索）
+    assert.equal(isGrepRgCommand(String.raw`\grep foo src`), true);
     assert.equal(isGrepRgCommand(String.raw`gr\ep foo`), true);
     // 选项形状（-*/--*）不是命令名
     assert.equal(isGrepRgCommand("--grep foo"), false);

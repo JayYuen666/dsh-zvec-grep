@@ -88,6 +88,8 @@ interface RootsBody {
   ok: boolean;
   csrf: string;
   roots: string[];
+  /** 守护进程就绪态（卡片那一行的唯一来源）。 */
+  serverReady: boolean;
 }
 
 /** 引导端点：拿 CSRF 与候选工作区。 */
@@ -177,6 +179,9 @@ describe.skipIf(!zgAvailable())("真实宿主：重建路由的 HTTP 面", () =>
       expect(body.roots.some((root) => root.endsWith(ws.slice(1)) || root === ws)).toBe(true);
       // 候选只来自本插件自己的数据（不是文件系统扫描）。
       expect(body.roots.length).toBeLessThan(64);
+      // 卡片那一行守护进程就绪态走的是真 HTTP：应答里必须有这一位、且是布尔。
+      // 具体值由这台机器上 `zg server` 的真实状态决定（断言它可机判，不钉死某一臂）。
+      expect(body.serverReady).toBeTypeOf("boolean");
     } finally {
       await host.dispose();
     }

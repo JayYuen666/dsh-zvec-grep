@@ -67,6 +67,10 @@ export interface UiMessages {
 
   /** 「工作区重建」行标题。 */
   readonly rebuildLabel: string;
+  /** 守护进程就绪那一行（无占位符）。 */
+  readonly daemonReadyNote: string;
+  /** 守护进程未就绪那一行（无占位符）。 */
+  readonly daemonOfflineNote: string;
   /** 重建行说明（整行模板）：`{embedding}`、`{roots}`。 */
   readonly rebuildHint: string;
   /** 有候选工作区时的尾注。 */
@@ -188,6 +192,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     windowHint: "超过该时长未再次 zg_search，配额整体过期；清空恢复默认 10",
     windowInvalid: "解锁时效必须是 {min}-{max} 的整数",
     rebuildLabel: "工作区重建（切换 embedding 并保存后执行）",
+    daemonReadyNote:
+      "守护进程：就绪 —— 检索可走 server 模式，索引有增量刷新与后台刷新，embedding 模型池常驻。",
+    daemonOfflineNote:
+      "守护进程：未就绪 —— 检索按直连模式逐次冷加载 embedding 模型（大工作区更慢），refresh=background 与索引增量刷新不可用；需要时在终端执行 `zg server on`。",
     rebuildHint: "以当前默认模型重建：{embedding}；等价于 zg index --rebuild。{roots}",
     rootsNoteWith: "候选工作区来自本 daemon 已打开过的会话（服务端白名单）。",
     rootsNoteEmpty: "尚无可选工作区：先在该工作区里开一个会话（任一次工具调用即登记）。",
@@ -245,6 +253,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "Without another zg_search inside this window the whole quota expires; clear to restore the default 10",
     windowInvalid: "the unlock window must be an integer between {min} and {max}",
     rebuildLabel: "Workspace rebuild (run after switching embedding and saving)",
+    daemonReadyNote:
+      "Daemon: ready — searches can use server mode, with incremental and background index refreshing and a resident embedding model pool.",
+    daemonOfflineNote:
+      "Daemon: not ready — searches run in direct mode and cold-load the embedding model every call (slower on large workspaces); refresh=background and incremental index refresh are unavailable. Run `zg server on` in a terminal when you want it.",
     rebuildHint:
       "Rebuild with the current default model: {embedding}; same as zg index --rebuild. {roots}",
     rootsNoteWith:

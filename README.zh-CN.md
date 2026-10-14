@@ -4,9 +4,9 @@
 
 ### 它做什么
 
-- 给 dsh 会话接上工作区语义检索：注册 zg_search / zg_index / zg_status 三个模型工具，底层经宿主 shell 以 `--mode direct` 调 zg CLI（BM25 + 向量 + RRF 混合检索）。
+- 给 dsh 会话接上工作区语义检索：注册 zg_search / zg_index / zg_status 三个模型工具，底层经宿主 shell 调 zg CLI（BM25 + 向量 + RRF 混合检索）。传输模式缺省 `--mode auto`：守护进程就绪就走 server，缺席时 zg **静默落回 direct**（上游只做就绪探测、不代为拉起，本包也不起，见「守护进程」一节）。
 - 注入一段 systemPrompt 硬规则（`zvec-grep-routing`，order 1550）+ 两道 tools.guard：zg_* 安全兜底与 search-first 门禁（已建索引的工作区里，grep/rg 前必须先有一次成功的 zg_search）。
-- 附带 web 端设置卡：默认 embedding、limit、search-first 配额/时效，以及「工作区重建」按钮。
+- 附带 web 端设置卡：默认 embedding、limit、search-first 配额/时效，守护进程就绪态一行，以及「工作区重建」按钮。
 
 ### 安装
 
@@ -36,7 +36,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - `globs` / `insensitiveGlobs` / `fileTypes` / `excludedFileTypes` 既收**单个字符串**也收字符串数组（与上游 zg 对这几项的对外契约一致，最多 128 项、单项 <= 1024 字符）。
   - `symbolTypes` 绑定 zg 的真实闭集，取值**只认小写**：`module` / `class` / `interface` / `function` / `value` / `alias`。zg 侧 `--symbol-type Class` 会以非零码退出（`Unsupported symbol type: Class`），插件在构造命令前就拦下并列出合法取值；不做大小写折叠——悄悄改成小写等于替模型改了它没写的约束。
   - `preview` 三档：`none` 只给锚点行 / `short` 锚点加一段有界上下文 / `full` 整段源码，**默认 short**，每条命中自带有界源码片段。
-  - `refresh` 三档：`wait` 等索引刷到最新（**默认**）/ `off` 不刷新 / `background` 交给守护进程后台刷新。`background` 只在守护进程模式下成立：直连模式下 zg 不报错，而是降级成 `off` 并往 stderr 打一行 `warning: --refresh background requires Server mode; Direct mode uses --refresh off`——本包把 stderr 原样回显，那一行会自己到模型眼前。
+  - `refresh` 三档：`wait` 等索引刷到最新（**默认**）/ `off` 不刷新 / `background` 交给守护进程后台刷新。`background` 要有**就绪的守护进程**才给：不可用时在**构造命令前**就拒并点名出路，而不是让 zg 把刷新整个关掉、只在 stderr 留一行 `warning: --refresh background requires Server mode; Direct mode uses --refresh off`——那条路退出码照旧 0、命中照旧出，唯独「后台在刷新」是假的。两种不可用各有各的文案：守护进程缺席时出路是 `zg server on`；部署把 `clientMode` 钉死 `direct` 时那么说就是指错方向，出路是回行 config 把模式改回 auto/server。
   - 输出尾部附一行**命中摘要**，两栏口径分开给：`分组计数合计`（各查询组 `hits:` 之和）与`去重后 N 个不同位置`（按「相对路径 + 行号范围」去重）。分栏是因为同一处代码会被多组各命中一次（名次与匹配来源逐组变化），直接求和会把同一处位置重复计入、冒充命中总数。
   - 某组命中数正好等于 `--limit` 时只作**观察陈述**并显式说明「zg 不提供截断信号，此处不作断言」——zg 的输出没有任何截断标记，不能把"可能还有未显示的命中"说成事实。输出被宿主按 stdout 上限截尾时另附「只含保留部分」。
 - zg_index：confirm 必填且必须为 true（required 校验 + guard 双层拒绝）。
@@ -65,16 +65,16 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ### 设置项与检索根
 
-- 命名空间 `zvec-grep` 由宿主**隐式**注册（0.1.7 起 = profile 条目 id，插件侧不再有 `settings.register`）；schema 共十四个字段，其中卡上那六枚标 `.volatile()`，内置默认逐字段写在 `.default()` 上。
+- 命名空间 `zvec-grep` 由宿主**隐式**注册（0.1.7 起 = profile 条目 id，插件侧不再有 `settings.register`）；schema 共 16 个字段，其中卡上那 6 枚标 `.volatile()`，内置默认逐字段写在 `.default()` 上。
   - defaultEmbedding=local/qwen3-embedding-0.6b、defaultLimit=10（1-50）、hfEndpoint=国内可达的 HF 兼容镜像基址（可改成别的镜像或留空走官方 HF）。
   - enforceSearchFirst=true、grepBudgetPerSearch=3（1-20）、unlockWindowMin=10（1-240）。
-- 另有**非 volatile 部署值**（不进设置卡，只在 cordis.yml 的行 config 里改值；上面工具一节的「5 分钟 / 10 分钟 / 60 秒 / 400000 字节」就是它们的默认）：searchTimeoutMs=300000、statusTimeoutMs=60000、indexTimeoutMs=600000（也是后台重建 kill 定时器的时长）、stdoutMaxBytes=400000、clientMode=auto、rebuildWaitMs=120000，超时/缓冲几项均最小 1。
+- 另有**非 volatile 部署值**，共 10 枚（不进设置卡，只在 cordis.yml 的行 config 里改值；上面工具一节的「5 分钟 / 10 分钟 / 60 秒 / 400000 字节」就是它们的默认）：searchTimeoutMs=300000、statusTimeoutMs=60000、indexTimeoutMs=600000（也是后台重建 kill 定时器的时长）、stdoutMaxBytes=400000、clientMode=auto、rebuildWaitMs=120000，超时/缓冲几项均最小 1；再加远程 embedding 三件套与 requireApprovalForExplicitRoot（各见下面两小节）。
   - 远程 embedding 三件套，默认**全关**：`allowRemoteEmbedding=false`、`remoteEmbeddingEndpoint=""`、`remoteEmbeddingApiKeyFrom=""`。
     - 关着的时候，显式 embedding 引用在**命令构造期**就必须落在本地候选清单里。
     - 打开后端点与凭据**只经环境变量**下发给 zg 子进程（`ZVEC_GREP_ENDPOINT` / `ZVEC_GREP_API_KEY`），**绝不进 argv**——本包把整条命令当作业 label 回显给卡片，argv 里的密钥会进界面、进日志、进 `ps` 的进程表。
     - 凭据那项填的是**宿主进程里那个装凭据的环境变量名**（如 `ZVEC_GREP_API_KEY`），不是密钥本身：宿主 subprocess 层会把名字含 KEY/SECRET/TOKEN 的继承变量剔掉，必须由本插件显式转发才到得了 zg；只记名字也让密钥不必落进插件配置文件。
     - 本插件**不自动传 `--allow-remote`**：zg 还要用户自己跑一次 `zg auth grant <root> --capability embedding --scope workspace` 才肯发请求，那道按 root 的授权本插件不代劳。
-  - `requireApprovalForExplicitRoot=false`：打开后，三个 zg 工具里**显式给了 root**、且那个 root 既不是本会话工作区、也不在本会话已登记范围内时，会经官方 `tools/pre-execute → {kind:'ask'} → ctx.approval` 弹一次用户确认。默认关，且有三个已知边界：`danger-full-access` 预设把 `approval/policy` 写成 `never`（ask 会被确定性拒绝）、委派子代理被钉死 `approvalPolicy: 'never'`（**该开关对子代理无效**）、宿主没装 approval 服务时 fail-closed 成拒绝。这道确认**只加不减**：`rootOf` 的授权判据一字未改，越界的 root 即便「用户已批准」照旧被拒。
+  - `requireApprovalForExplicitRoot=false`：打开后，三个 zg 工具里**显式给了 root**、且这次调用要靠 `rootOf` 的「与会话工作区互为祖先/后代」那一条才放行时，会经官方 `tools/pre-execute → {kind:'ask'} → ctx.approval` 弹一次用户确认。发问判据与 `rootOf` **同源**（同一个 `judgeRoot`），所以两类调用不再被打扰：注定被拒的（越界 / 目录不存在 / 解析不了 / 没有会话工作区可作参照）——那一次确认换个不来放行；本就无需授权的（root 就是会话工作区本身、或这台 daemon 已观测过）。默认关，且有三个已知边界：`danger-full-access` 预设把 `approval/policy` 写成 `never`（ask 会被确定性拒绝）、委派子代理被钉死 `approvalPolicy: 'never'`（**该开关对子代理无效**）、宿主没装 approval 服务时 fail-closed 成拒绝。这道确认**只加不减**：`rootOf` 的授权判据一字未改，越界的 root 即便「用户已批准」照旧被拒。
 - 优先级：设置里的运行时值 > 组合包层/用户层行的 config > schema 的 `.default()`；行 config 中显式缺省的字段不覆盖默认。读侧是 `config.<field>.get()`（volatile 引用，卡上改完下一个事件即生效）；非 volatile 部署值是普通值形态，不经 `.get()`。
 - root 校验：必须是以 `/` 开头的绝对路径，词典归一折叠空段与 `.`。
   - 拒绝空串、非字符串、含 NUL、相对路径、越出文件系统根的 `..`，归一后为 `/` 也拒。
@@ -98,12 +98,21 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - `--help`/`--version`/`-V`、`echo "grep x"`、`git commit -m "use rg"` 不算。
 - 有沙箱执行器时会区分 runner 失败、策略拒绝与 zg 自身失败，并在结果里显式打「可能不完整」标记。
 
+### 守护进程（server 模式）
+
+- 这一档不是「快一点」的区别。`--mode auto` 的两侧是两种能力面：direct 每发 `zg query` 都要新建再关闭一次引擎、**embedding 模型逐次冷加载**；而索引的增量刷新（watcher）、`refresh=background` 与常驻模型池**只在 server 模式下存在**。上游对 `auto` 只做就绪探测、不会替用户拉起 daemon。
+- 本包**不代为起一个长驻进程**：`zg server on` 会在用户机器上落下 detached 进程与 token 文件，那是该由用户点头的动作，不是插件替部署做的决定。本包做的是把这一档**显式化**，不再让它藏在「检索超时给 5 分钟」和「改动搜不到」这类使用限制背后：
+  - 按 TTL（60 秒）缓存 `zg server status --check-ready` 的**退出码**（就绪 0、未就绪非零；读 stdout 文本不行，那是给人看的状态表、不在本包的依赖契约里）。探测失败一律按未就绪收口，**绝不外抛**基础设施故障。
+  - 据此收口 `refresh=background`（见工具一节），并在 `zg_status` 的输出尾部与设置卡各回显一行就绪态。被信任闸门拒掉的请求不起探测；重建期那条「合成投影」也不起（它本来的契约就是不启子进程）。
+  - 设置卡的 `serverReady` 只可能是 `true` / `false`；旧版 host 的应答里根本没有这一位，卡片对「未知」的那一臂**不显示**，而不是把它说成「未就绪」。
+- 想把红利拿到手：在持有终端时执行 `zg server on`（起停与状态另有 `zg server off` / `zg server status`）。本包只读它的就绪态，不拥有它的生命周期。
+
 ### 对外接口
 
 - 三条路由的 handler 第一句都是 `guardTrust(req, res, { servingNonLoopback })`（`shared/lib/trust`），任一判据不过即 `403` + `{ ok:false, error: ... }`。
   - 判据次序：Host 权威 → `sec-fetch-site` 白名单 → `origin` 与 Host 逐字比对；两句错误文本是 `"untrusted host authority"` 与 `"cross-origin request rejected"`。
   - `servingNonLoopback` 由 `isNonLoopbackBindHost(webServer.host)` 按**绑定地址本身**算出（宿主只拒通配地址，绑本机网卡的具体 IPv4/IPv6 是合法配置，比字面量会漏判这一面）；非本方法的 `405` 带 `Allow` 与 `{ ok:false, error:"GET only" | "POST only" }`，不再是空回显。
-- `GET /_dsh/zvec-grep/rebuild-roots`：只回本包自己的数据（每次 apply 重新生成的 CSRF token + 已观测工作区列表），允许 GET/HEAD，过不了上面那道闸门即 403。
+- `GET /_dsh/zvec-grep/rebuild-roots`：只回本包自己的数据（每次 apply 重新生成的 CSRF token + 已观测工作区列表 + 卡片要显示的那行守护进程就绪态），允许 GET/HEAD，过不了上面那道闸门即 403。就绪探测排在**两道闸门之后**，被拒的请求不起子进程。
 - `POST /_dsh/zvec-grep/rebuild?root=...`：闸门 + 头 `x-zvec-grep-csrf` + body <= 4096 字节 + root 命中白名单 + 目录存在，成功回 `{ ok, jobId }`；否则 405/403/400/500。
 - `/_dsh/zvec-grep/rebuild-status?jobId=...`：闸门后轮询（卡片每 2 秒一次），回 status/exitCode/root/output（有沙箱时带 sandbox），未知 jobId 回 404 并说明多半是出了本包那条 10 条落定窗口。
 - 另有 systemPrompt 段 `zvec-grep-routing`（order 1550）与 settings 命名空间 `zvec-grep`。
@@ -146,11 +155,12 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 ### 常见问题
 
 - grep/rg 被拒且提示「尚未执行过 zg_search」：这是 search-first 门禁，先 zg_search；配额用尽或过期同理，换个更准的 query/fts 重搜即可续上，不必关插件。
-- 检索超时：默认 `--refresh wait` 会同步刷新既有索引，大工作区请用 globs/fileTypes 缩小范围或调小 limit，也可先手写字面检索。
+- 检索超时：默认 `--refresh wait` 会同步刷新既有索引，大工作区请用 globs/fileTypes 缩小范围或调小 limit，也可先手写字面检索；想让超时这件事本身变小，就起守护进程（见「守护进程」一节）——直连模式每次都要冷加载 embedding 模型，那才是超时预算被抬到 5 分钟的原因。
 - 重建按钮回 403「root 不在本 daemon 观测到的工作区白名单内」：该目录从未在本 daemon 开过会话；先在该目录起会话，或让模型带 confirm=true 调 zg_index。
 - 卡片显示重建失败而 zg 看着像跑完了：成功判据是 completed 且 exit 0——exit 127（zg 没装）也落在 completed，看输出尾部原因。
 - 从未建索引的 root：zg_search 明确报错而不是静默建索引；建索引只在用户明确要求时由 zg_index 做。
 - 换了 embedding 却搜不到语义结果：切换 embedding 必须 rebuild=true 重建后才生效。
+- zg 失败只回显一句没有 `Code:` 的文案：上游在不带 `--debug` 时会把两类失败（权重下载失败、索引文件失败）塌成一句话，本包那套按码归因正好在这条链上失效。所以这种失败的回显尾部会补一句「可加 `--debug` 复跑」的指引——本包**不默认带** `--debug`：它会明显拉长输出，而这三条工具的回显有界（stdout 400000 字节）是给模型读的。已有 `Code:` 行的失败不补这一句。
 
 ### 开发
 

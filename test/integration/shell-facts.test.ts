@@ -5,6 +5,8 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
@@ -16,6 +18,21 @@ const cleanups: (() => void)[] = [];
 const ENV_KEY_NAME = "ZG_TEST_EMBED_KEY";
 /** 密钥值（两条用例共用同一个，断言里也只引用它一次）。 */
 const FORWARDED_KEY = "sk-forwarded";
+
+/**
+ * 这台机器上 zg 守护进程的真实就绪态。判据与 host.ts 同源：`--check-ready` 只用**退出码**
+ * 表达就绪与否（非零即未就绪，那条错误没有 `Code:` 行）。用例跟着它给期望值，而不是替
+ * 这台机器编一个答案——否则没起 daemon 的开发机上这条必红，起了 daemon 的机器上又恒绿。
+ * 不用同步 API：本包的 node/no-sync 只开写盘那一组。
+ */
+async function daemonReady(): Promise<boolean> {
+  const child = spawn("zg", ["server", "status", "--check-ready"]);
+  // 就绪报告是给人看的状态表，本用例只取退出码；不排空两路流，子进程会挂着不退出。
+  child.stdout.resume();
+  child.stderr.resume();
+  const signals: unknown[] = await once(child, "close");
+  return signals[0] === 0;
+}
 
 /** 本地 embedding 权重是否已缓存（否则 zg index 要联网下载）。 */
 function indexable(): boolean {
@@ -198,9 +215,10 @@ describe.skipIf(!zgAvailable() || !indexable())(
       }
     }, 600_000);
 
-    it("直连模式下 --refresh background 的降级警告原样到模型眼前", async () => {
-      // 真 zg 实测原文：`warning: --refresh background requires Server mode; Direct mode uses
-      // --refresh off`。它只在 stderr，而成功路径的 stderr 去噪只丢认得的进度行——这条必须留下。
+    it("clientMode 钉死 direct 时 refresh=background 构造期即拒，命令根本没发出去", async () => {
+      // 旧行为是让命令照发、由 zg 静默把刷新关掉、只在 stderr 留一行
+      // `warning: --refresh background requires Server mode; Direct mode uses --refresh off`。
+      // 退出码照旧 0、命中照旧出——唯独「后台在刷新」是假的，而那是本包该拒的那一类。
       const ws = await indexedWorkspace({});
       const host = await startHost({
         config: { clientMode: "direct", defaultEmbedding: TEST_EMBEDDING },
@@ -211,11 +229,59 @@ describe.skipIf(!zgAvailable() || !indexable())(
           { query: "authService", refresh: "background" },
           host.agentOf(ws),
         );
-        assert.ok(!outcome.isError, host.textOf(outcome));
+        assert.ok(outcome.isError, "钉死 direct 时这一档必须在发命令之前停住");
         const text = host.textOf(outcome);
-        expect(text).toContain("requires Server mode");
-        // 以本包的 stderr 注形态出现（不是裸贴一行，也不被去噪吃掉）。
-        assert.match(text, /zg stderr/iu);
+        expect(text).toContain("clientMode");
+        // 那句指错方向的出路不该出现：这一档不是「去起个守护进程」能解决的。
+        expect(text).not.toContain("zg server on");
+        // 而 zg 自己的降级警告本就不该出现——命令压根没被 dispatch。
+        expect(text).not.toContain("requires Server mode");
+        expect(host.shellCalls.some((row) => row.request.command.startsWith("zg query"))).toBe(
+          false,
+        );
+      } finally {
+        await host.dispose();
+      }
+    }, 600_000);
+
+    it("clientMode=auto 时按守护进程的真实就绪态收口：缺席拒、就绪才下发 --refresh background", async () => {
+      // 这一档的答案取决于这台机器上守护进程在不在，所以断言跟着真探测走，而不是替它编一个。
+      // 两臂都是判据：缺席时必须拒（旧行为是静默降级成 off），就绪时才允许把 background 发出去。
+      const ready = await daemonReady();
+      const ws = await indexedWorkspace({});
+      const host = await startHost({ config: { defaultEmbedding: TEST_EMBEDDING } });
+      try {
+        const outcome = await host.call(
+          "zg_search",
+          { query: "authService", refresh: "background" },
+          host.agentOf(ws),
+        );
+        const text = host.textOf(outcome);
+        const dispatched = host.shellCalls.find((row) =>
+          row.request.command.startsWith("zg query"),
+        );
+        // 断言写成**无条件**的形式，期望值本身由这台机器的真实就绪态决定：分支式 expect 会让
+        // 「这次跳过了哪一臂」不可见，而这条用例的价值恰恰在于两臂都被钉住。
+        assert.equal(outcome.isError, !ready, "缺席就必须在发命令前停住；就绪就该放行");
+        assert.equal(
+          text.includes("zg server on"),
+          !ready,
+          "只有缺席那一臂该给出 `zg server on` 这条出路",
+        );
+        expect(text).not.toContain("requires Server mode");
+        assert.equal(dispatched !== undefined, ready, "被拒的调用不该把命令发出去");
+        // 发出去时命令必须带着 background 这一档（而不是被静默换成 off）；没发出去时无所谓。
+        assert.equal(
+          (dispatched?.request.command ?? "").includes("--refresh background"),
+          ready,
+          "命令与请求的那一档必须一致",
+        );
+        // 就绪态的探测本身是纯读，且挂在系统临时目录上（不因某个会话工作区不存在而失败）。
+        const probe = host.shellCalls.find(
+          (row) => row.request.command === "zg server status --check-ready",
+        );
+        assert.ok(probe !== undefined, "这一档要读守护进程的真实就绪态");
+        expect(probe.spec.workdir).toBe(tmpdir());
       } finally {
         await host.dispose();
       }

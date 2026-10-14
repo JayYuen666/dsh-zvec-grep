@@ -2,12 +2,16 @@
 //
 // 职责：
 //   1. 带一份导出 Config schema（可编辑的 volatile 六项 defaultEmbedding / defaultLimit /
-//      hfEndpoint / enforceSearchFirst / grepBudgetPerSearch / unlockWindowMin，加四个
-//      非 volatile 部署值 searchTimeoutMs / statusTimeoutMs / indexTimeoutMs / stdoutMaxBytes）：
+//      hfEndpoint / enforceSearchFirst / grepBudgetPerSearch / unlockWindowMin，另加十枚
+//      非 volatile 部署值：三枚超时、stdoutMaxBytes、clientMode、rebuildWaitMs、
+//      远程 embedding 三件套、requireApprovalForExplicitRoot）：
 //      0.1.7 起设置命名空间
 //      是**隐式**的——宿主按 profile 条目 id（`zvec-grep`，见 cordis.patch.yml）把标了
 //      `.volatile()` 的字段投影成设置表单，插件侧不再注册。
-//   2. 注册 3 个模型工具：zg_search / zg_index / zg_status（经 ctx.shell 调 zg CLI，--mode direct）。
+//   2. 注册 3 个模型工具：zg_search / zg_index / zg_status（经 ctx.shell 调 zg CLI，--mode 取
+//      部署值 clientMode，缺省 auto：守护进程就绪走 server、缺席由 zg 静默落回 direct，故本包
+//      另按 TTL 缓存 `zg server status --check-ready` 的退出码，把这一档显式化并收口
+//      refresh=background，见 createZgServerGate 与 backgroundSupportFor）。
 //   3. 注册 systemPrompt 硬规则段（routing，order 1550）+ tools.guard 安全兜底
 //      + search-first 门禁（工作区已建索引时 grep/rg 前必须先 zg_search，
 //      每次成功 zg_search 发放配额：grepBudgetPerSearch 次 / unlockWindowMin 分钟）。
@@ -117,6 +121,7 @@ import {
   boolOf,
   resolveRoot,
   clampLimit,
+  requestsBackgroundRefresh,
   clientModeOf,
   DEFAULT_CLIENT_MODE,
   DEFAULT_LIMIT,
@@ -127,7 +132,7 @@ import {
 // ignoreFiles 的存在性预检要与命令构造期用**同一个**取值器（单值/数组都收）：两处各读一遍
 // 就会出现"预检放过、构造期才拒"的缝隙。
 import { singleOrList } from "./lib/argv-guard.ts";
-import type { ClientMode, SearchArgs, IndexArgs } from "./lib/cli.ts";
+import type { BackgroundSupport, ClientMode, SearchArgs, IndexArgs } from "./lib/cli.ts";
 import {
   ROUTING_NAME,
   ROUTING_ORDER,
@@ -583,6 +588,24 @@ function withDetail(detail: string, prefix: string): string {
   return detail.length > 0 ? fill(prefix, { detail }) : "";
 }
 
+/**
+ * zg 的结构化失败在 stderr 上以一行 `Code: <CODE>` 交出错误码（上游 `src/cli/errors.ts`），
+ * 本包所有按码归因的判据都读那一行。**缺了这一行**就意味着这次失败没有可机读的码，而上游
+ * 恰好有两类塌法会长这样：不带 `--debug` 时 `MODEL2VEC_DOWNLOAD_FAILED` 与
+ * `INDEXING.FILES_FAILED` 被折成一句无码文案（首次下载 embedding 权重正落在这一档）。
+ * 这里据此补一条可行动的出路，而不是让模型对着「exit=1 + 一句话」猜。
+ *
+ * 空 detail 不补：什么都没打出来时谈不上「上游把原因塌成了一句」，那条指引只会占住回显预算。
+ * 已有 `Code:` 行时也不补：那时归因本就够了。
+ */
+const STRUCTURED_ERROR_CODE = /^\s*Code:/imu;
+
+function noCodeHint(detail: string, messages: ZvecGrepMessages): string {
+  return detail.length === 0 || STRUCTURED_ERROR_CODE.test(detail)
+    ? ""
+    : `\n${messages.noErrorCodeHint}`;
+}
+
 function shellFailure(result: ShellRunResult, messages: ZvecGrepMessages): string | null {
   const runnerFailure = sandboxFailure(result, messages);
   if (runnerFailure !== null) {
@@ -615,10 +638,12 @@ function shellFailure(result: ShellRunResult, messages: ZvecGrepMessages): strin
       detail: withDetail(detail, messages.detailPrefix),
     });
   }
-  return fill(messages.genericFailure, {
+  // 无码失败补一条可行动的出路（见 noCodeHint）：这一支是唯一「zg 自己失败了、而本包读不到
+  // 错误码」的位置——127 与沙箱那两支各有各的归因，不该被这条指引淹掉。
+  return `${fill(messages.genericFailure, {
     exit: result.exitCode,
     detail: withDetail(detail, messages.detailColon),
-  });
+  })}${noCodeHint(detail, messages)}`;
 }
 
 /**
@@ -850,6 +875,80 @@ function createZgVersionGate(host: HostCtx, config: Config): ZgVersionGate {
       if (probe !== undefined) {
         throw tooOldZgError(probe, messages);
       }
+    },
+  };
+}
+
+// ── 守护进程（zg server）就绪门槛 ───────────────────────────────────────────
+//
+// 为什么要有它：本包发的 `--mode` 缺省是 `auto`，而上游对 `auto` 的解析是「守护进程就绪就
+// 走 server、否则**静默**落回 direct」，它不会替用户把 daemon 拉起来（上游
+// `src/client/mode-router.ts` 的 routeByMode，实测无 auto-spawn）。direct 与 server 的差别
+// 不是快慢一点半点：direct 每一发 `zg query` 都要新建并关闭一次引擎，embedding 模型**逐次
+// 冷加载**；而索引的增量刷新、后台刷新（`refresh=background`）与常驻模型池**只在 server 模式
+// 存在**。旧版本把这一整档能力差摊成了「检索超时给 5 分钟」和「改动搜不到」两条使用限制，
+// 却没有任何一处告诉使用者症结在哪。
+//
+// 就绪判据取上游自己的退出码：`zg server status --check-ready` 就绪时正常退出、未就绪时
+// 以「zvec-grep server is not ready」非零退出（上游 `src/cli/commands.ts` 的 runServer）。
+// 读 stdout 文本不行——那里是给人看的状态表，格式不在本包的依赖契约里。
+//
+// **探测失败一律按未就绪**，且绝不影响别的通道：daemon 起不来时 `wait`/`off` 与穷举检索照旧
+// 能用，本包只是不再接受 `background` 这一档，并把这件事说清楚。
+
+/** 就绪态缓存时长：daemon 可被随时 `zg server on/off` 起停，比版本探测勤得多。 */
+const SERVER_READY_TTL_MS = 60_000;
+/** 探测自身超时：`zg server status` 是纯读，不该借检索超时。 */
+const SERVER_READY_PROBE_TIMEOUT_MS = 10_000;
+/** 就绪探测命令行：`--check-ready` 把「就绪与否」 expressed 成退出码。 */
+const SERVER_READY_COMMAND = "zg server status --check-ready";
+
+/** 守护进程就绪门槛的执行面。 */
+interface ZgServerGate {
+  /** 就绪返回 true；未就绪、探测不出来、zg 没装都返回 false。**从不抛错**。 */
+  ready: () => Promise<boolean>;
+}
+
+/** 探一次守护进程就绪态：退出码 0 = 就绪。任何异常与非零退出都算未就绪。 */
+async function probeServerReady(host: HostCtx, config: Config): Promise<boolean> {
+  try {
+    const env = zgEnv(config);
+    // workdir 取系统临时目录：与工作区无关的纯读探测，不该因为某个会话的目录不存在而失败。
+    const spec = host.shell.resolve({
+      command: SERVER_READY_COMMAND,
+      workdir: tmpdir(),
+      timeoutMs: SERVER_READY_PROBE_TIMEOUT_MS,
+      stdoutMaxBytes: config.stdoutMaxBytes,
+      ...(env ? { env } : {}),
+    });
+    const execution = await host.shell.execute(spec);
+    const result = await execution.result();
+    return result.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 建这道门槛。缓存挂闭包（随 apply 生死），TTL 到期后重探。
+ *
+ * **并发不合并**：两条检索同时撞上 TTL 边界会各探一次，多起一发纯读进程而已——
+ * 换来的是没有「在途 Promise 该不该共享」这层状态可测（与版本门槛同一口径）。
+ */
+function createZgServerGate(host: HostCtx, config: Config): ZgServerGate {
+  let cachedAt = 0;
+  let cachedReady = false;
+  let probed = false;
+  return {
+    async ready(): Promise<boolean> {
+      const now = Date.now();
+      if (probed && now - cachedAt < SERVER_READY_TTL_MS) {
+        return cachedReady;
+      }
+      cachedReady = await probeServerReady(host, config);
+      cachedAt = now;
+      probed = true;
+      return cachedReady;
     },
   };
 }
@@ -1207,27 +1306,75 @@ function indexProbeOf(dir: string): boolean {
 
 // ── 工具注册辅助 ───────────────────────────────────────────────────────────
 
-/** 工具入参的 root：显式值 > 会话工作区，再过存在性预检（一处三工具共用）。 */
+/** 该问一句时递给文案的两条路径（会话工作区在这里必然存在，故不留 `undefined` 分支）。 */
+interface RootQuestion {
+  readonly root: string;
+  readonly cwd: string;
+}
+
+/**
+ * root 判据的两种结局。**三位工具与 pre-execute 的确认闸共用这一条判据**，
+ * 于是「guard/execute 说两遍」与「问了一次注定被拒的调用」都没有立足处。
+ *  - `allowed: false`：一律拒（没有会话工作区可作参照、解析不了、目录不存在、
+ *    既未登记又与会话工作区无关）。
+ *  - `allowed: true` + `question`：放行。`question` 只在**靠「与会话工作区互为祖先/后代」
+ *    这一条才放行**时非空——那才是唯一该问用户的一类：root 就是会话工作区本身、或这台
+ *    daemon 已观测过，都不该打扰用户；而被拒的那一路问了也白问（`rootOf` 的授权判据一字
+ *    未改，批准照样拒）。旧写法把「既不是工作区、也不在 ledger」一律当成要问，于是对
+ *    `/etc` 这类注定被拒的根也弹一次用户无法兑现的确认，这次修掉。
+ */
+type RootDecision =
+  | { readonly allowed: false; readonly reason: string }
+  | { readonly allowed: true; readonly root: string; readonly question: RootQuestion | undefined };
+
+/** root 判据的单一来源：显式值 > 会话工作区 → 存在性 → 授权（已观测 / 同一棵树）。 */
+function judgeRoot(
+  rawRoot: unknown,
+  cwd: string | undefined,
+  messages: ZvecGrepMessages,
+  ledger: RootLedger,
+): RootDecision {
+  let resolved: string;
+  try {
+    resolved = assertRootExists(resolveRoot(rawRoot, cwd, messages), messages);
+  } catch (error) {
+    return { allowed: false, reason: errorText(error) };
+  }
+  // 会话工作区本身（含尾部斜杠这种写法）、或这台 daemon 已观测过的根：放行，不必问。
+  if (
+    (cwd !== undefined && normalizeRoot(resolved) === normalizeRoot(cwd)) ||
+    ledger.has(resolved)
+  ) {
+    return { allowed: true, root: resolved, question: undefined };
+  }
+  // 与会话工作区在同一棵树上（互为祖先/后代）：放行，但这一类该问用户一句。
+  if (cwd !== undefined && pathsRelated(resolved, cwd, messages)) {
+    return { allowed: true, root: resolved, question: { root: resolved, cwd } };
+  }
+  return {
+    allowed: false,
+    reason: fill(messages.rootNotAuthorized, {
+      root: resolved,
+      cwd: cwd ?? messages.rootNoSession,
+    }),
+  };
+}
+
+/** 工具入参的 root：过 root 判据，放行后登记进白名单（一处三工具共用）。 */
 function rootOf(
   args: Record<string, unknown>,
   exec: ToolExec,
   messages: ZvecGrepMessages,
   ledger: RootLedger,
 ): string {
-  const cwd = sessionHeaderCwd(exec);
-  const root = assertRootExists(resolveRoot(args["root"], cwd, messages), messages);
-  // 授权：根必须落在本会话可操作范围内。两种放行——
-  //   1) 它已经被观测过（会话工作区本身，或这台 daemon 见过的另一个会话的工作区）；
-  //   2) 它与会话工作区在同一棵树上（互为祖先/后代），例如会话开在子包而要检索仓库根。
-  // 除此之外的显式根一律拒：光是「一个合法的绝对路径」不构成授权，模型可以凭空写出
-  // 任意路径，而检索与建索引都会把那棵树读进上下文。
-  if (!ledger.has(root) && (cwd === undefined || !pathsRelated(root, cwd, messages))) {
-    throw new Error(fill(messages.rootNotAuthorized, { root, cwd: cwd ?? messages.rootNoSession }));
+  const decision = judgeRoot(args["root"], sessionHeaderCwd(exec), messages, ledger);
+  if (!decision.allowed) {
+    throw new Error(decision.reason);
   }
   // 登记必须在校验与授权都成功**之后**：否则一次被拒的调用会把自己写进白名单，
   // 下一轮就变成「已观测」，越权一步到位。
-  ledger.add(root);
-  return root;
+  ledger.add(decision.root);
+  return decision.root;
 }
 
 /** 三工具共用的注册规格（对象化：文案要在每次 execute 现取，位置参数已近上限）。
@@ -1911,38 +2058,54 @@ interface RebuildEndpointDeps {
   records: Map<string, RebuildRecord>;
   /** zg 版本门槛（与工具面共用同一份缓存，探测结果不该因入口不同而分叉）。 */
   versionGate: ZgVersionGate;
+  /** 守护进程就绪门槛（卡片要显示这一档，与三条工具共用同一份缓存）。 */
+  serverGate: ZgServerGate;
 }
 
 /**
- * 三条重建路由共享的运行时依赖：每次 `registerRebuildEndpoints` 一份，闭包量对象化
- * 是为了让拆出来的 handler 函数不越 over `max-params`（同一份状态，不是新的持有者）。
+ * 起一条 `zg index` 写操作所需的那部分依赖。
+ *
+ * 单独成一层是因为它有**两类调用方**：三条 HTTP 路由，以及模型侧的 `zg_index
+ * background=true`。后者不是 HTTP 请求，过去要凑出 `RebuildRoutes` 就得给 `csrf` 塞一个
+ * 空串、给 `servingNonLoopback` 塞一个 `false`——两个哑值，它们的「没被用到」只靠当前
+ * 这两个函数恰好不读它们来保证。收窄成这一层之后，哑值在类型上不再可能构造。
  */
-interface RebuildRoutes {
+interface IndexWriteRoutes {
   host: HostCtx;
-  /** apply 收到的那份 volatile 引用配置（端点每次现读，改完不必重载插件）。 */
+  /** apply 收到的那份 volatile 引用配置（每次现读，改完不必重载插件）。 */
   config: Config;
-  csrf: string;
-  ledger: RootLedger;
   /** 现取一份文案（语言随官方 locale 偏好，改语言不必重载插件）。 */
   messages: () => ZvecGrepMessages;
   /** 官方注册表每次用时现读（理由见 registerRebuildEndpoints）。 */
   jobsOf: () => JobsService | undefined;
-  /** 本包侧表（引用共享：三条路由与卸载效应都读写同一张表）。 */
+  /** 本包侧表（引用共享：三条路由、模型侧后台索引与卸载效应读写同一张表）。 */
   records: Map<string, RebuildRecord>;
   /** 活跃重建状态源：端点与模型侧索引工具共用，占位互斥跨入口成立。 */
   rebuilds: RebuildRegistry;
   /** zg 版本门槛：起 zg 之前先过一道（与三条工具共用同一份缓存）。 */
   versionGate: ZgVersionGate;
-  servingNonLoopback: boolean;
 }
 
-/** 引导端点：交回本次 apply 生成的 CSRF token 与白名单里观测到的工作区。 */
-function handleRebuildRoots(
+/**
+ * 三条重建路由共享的运行时依赖：每次 `registerRebuildEndpoints` 一份，闭包量对象化
+ * 是为了让拆出来的 handler 函数不越 over `max-params`（同一份状态，不是新的持有者）。
+ * 比 {@link IndexWriteRoutes} 多的四位全属 HTTP 面：CSRF token、白名单、绑定地址，
+ * 以及卡片要显示的守护进程就绪态（与三条工具共用同一份门槛缓存，两个入口不该各探各的）。
+ */
+interface RebuildRoutes extends IndexWriteRoutes {
+  csrf: string;
+  ledger: RootLedger;
+  servingNonLoopback: boolean;
+  serverGate: ZgServerGate;
+}
+
+/** 引导端点：交回本次 apply 生成的 CSRF token、白名单里观测到的工作区，以及守护进程就绪态。 */
+async function handleRebuildRoots(
   routes: RebuildRoutes,
   req: IncomingMessage,
   res: ServerResponse,
-): void {
-  const { csrf, ledger, servingNonLoopback } = routes;
+): Promise<void> {
+  const { csrf, ledger, servingNonLoopback, serverGate } = routes;
   // 信任闸门（shared/lib/trust）：必须是 handler 体的第一条语句——先验权威再谈方法/参数。
   if (!guardTrust(req, res, { servingNonLoopback })) {
     return;
@@ -1954,7 +2117,10 @@ function handleRebuildRoots(
   }
   // 自家 isCrossOrigin 支在信任闸门之后不可达：trust 的 sec-fetch-site 白名单更严、错误文本同一句
   // （既有的「跨源 403」用例仍然绿，拒它的是闸门）。
-  sendJson(res, 200, { ok: true, csrf, roots: ledger.list() });
+  // 守护进程就绪态排在两道闸门**之后**才探：不该让一个被拒的请求起一发子进程。
+  // 这条探测走 TTL 缓存（与三条工具同一份），卡片每开一次不至于多起一次 zg。
+  const serverReady = await serverGate.ready();
+  sendJson(res, 200, { ok: true, csrf, roots: ledger.list(), serverReady });
 }
 
 /**
@@ -1967,7 +2133,7 @@ function handleRebuildRoots(
  * @returns 官方 JobSpec：kind / label / output / run
  */
 function rebuildJobSpec(
-  routes: RebuildRoutes,
+  routes: IndexWriteRoutes,
   proc: ShellExecution,
   state: RebuildState,
   command: string,
@@ -2112,7 +2278,7 @@ function assertIgnoreFilesExist(args: IndexArgs, root: string, messages: ZvecGre
  * @returns 起来的进程与它跑的命令；失败为 `{ error, status }`
  */
 async function spawnIndexWrite(
-  routes: RebuildRoutes,
+  routes: IndexWriteRoutes,
   started: ZvecGrepMessages,
   indexArgs: IndexArgs,
   embedding: string,
@@ -2166,7 +2332,7 @@ async function spawnIndexWrite(
  * @returns 宿主签发的 `{ jobId }`；失败为 `{ error, status }`
  */
 function attachIndexWrite(
-  routes: RebuildRoutes,
+  routes: IndexWriteRoutes,
   root: string,
   started: ZvecGrepMessages,
   spawned: { proc: ShellExecution; command: string },
@@ -2419,7 +2585,7 @@ function releaseRebuildRecords(routes: RebuildRoutes): void {
 
 /** 设置卡片的「工作区重建」端点组（引导 / 启动 / 轮询）。按语义拆离 apply 主体。 */
 function registerRebuildEndpoints(deps: RebuildEndpointDeps): void {
-  const { ctx, host, config, csrf, ledger, messages, rebuilds, versionGate } = deps;
+  const { ctx, host, config, csrf, ledger, messages, rebuilds, versionGate, serverGate } = deps;
   // 官方 `Context["get"]` 交出的是整个 `WebServer` 类；这里显式收回本包的方法面投影，
   // 于是「只用 register」仍是编译期约束（误用别的成员即报错），不必再镜像一次签名。
   const webServer: WebServerService | undefined = host.get("webServer");
@@ -2455,16 +2621,17 @@ function registerRebuildEndpoints(deps: RebuildEndpointDeps): void {
     records,
     rebuilds,
     versionGate,
+    serverGate,
     servingNonLoopback,
   };
 
-  // 引导端点：卡片先拿 CSRF token 与可选工作区列表（都是本插件自己的数据）。
+  // 引导端点：卡片先拿 CSRF token、可选工作区列表与守护进程就绪态（都是本插件自己的数据）。
   // 也带同源校验——token 泄露给跨源页面等于白名单 + CSRF 两道锁一起白给。
   const disposeRoots = webServer.register({
     kind: "exact",
     path: REBUILD_ROOTS_PATH,
-    handler: (req: IncomingMessage, res: ServerResponse) => {
-      handleRebuildRoots(routes, req, res);
+    handler: async (req: IncomingMessage, res: ServerResponse) => {
+      await handleRebuildRoots(routes, req, res);
     },
   });
   // 启动端点：POST + 同源 + CSRF（guardBody 三道一次做完）+ 白名单 root + 目录存在。
@@ -2637,6 +2804,12 @@ interface PluginRuntime {
    */
   versionGate: ZgVersionGate;
   /**
+   * 守护进程（`zg server`）就绪门槛：三条工具与卡片引导端点共用的同一份带 TTL 缓存。
+   * `--mode auto` 在 daemon 缺席时静默落回 direct，而 `refresh=background`、索引增量刷新
+   * 与常驻模型池只在 daemon 上存在——这档能力差不该由使用方自己从超时里猜，见 createZgServerGate。
+   */
+  serverGate: ZgServerGate;
+  /**
    * 会话沿父链上溯时用的会话查询面（官方 `ctx.sessions` 的 `get`）。宿主没装会话存储时
    * 为 undefined，`rootSessionKeyOf` 随之退化成「有父用父、无父用自己」——不抛错、不阻断。
    *
@@ -2748,6 +2921,31 @@ function pickExhaustive(value: unknown, hasIndex: boolean): boolean {
 }
 
 /**
+ * 这次检索能不能用 `refresh=background`（取值语义见 lib/cli.ts 的 BackgroundSupport）。
+ *
+ * 要同时看两件事：**传输模式有没有被部署钉死在 direct**，以及**守护进程是否就绪**。
+ * 钉死 direct 时后者根本无从生效，此时还叫用户去 `zg server on` 是指错方向；而守护进程
+ * 缺席时叫他去起一个是有效的。两档各有各的文案，但判据只有这一处。
+ *
+ * 没人要这一档时交回 `daemon-down`——构造器只在 `refresh` 真的是 background 时才读它，
+ * 于是「不为没人要的档位起一发探测」与「拿不到判据时保守拒绝」两头同时成立，不必再引入
+ * 第三种「不适用」状态。探测结果与 zg_status 的回显、设置卡的引导端点共用同一份 TTL 缓存。
+ */
+async function backgroundSupportFor(
+  runtime: PluginRuntime,
+  rawRefresh: unknown,
+  mode: ClientMode,
+  exhaustive: boolean,
+): Promise<BackgroundSupport> {
+  if (exhaustive || !requestsBackgroundRefresh(rawRefresh)) {
+    return "daemon-down";
+  }
+  if (mode === "direct") {
+    return "mode-direct";
+  }
+  return (await runtime.serverGate.ready()) ? "available" : "daemon-down";
+}
+/**
  * zg_search 的执行体：登记工作区 → 选通道 → 构造命令 → 前台执行 → 索引通道成功才发配额。
  * @param runtime apply 的运行时依赖（config 现读、解锁表与探测缓存共用）
  * @param args 官方 deep-frozen 后的工具入参
@@ -2788,11 +2986,13 @@ async function runSearchTool(
   };
   // 版本门槛先于命令构造（见 lib/zg-version.ts）：确知装的是更老的 zg 就停在这里。
   await runtime.versionGate.ensure(messages);
+  const mode = readClientMode(config, messages);
   const { command, workdir } = buildSearchCommand(
     searchArgs,
     messages,
-    readClientMode(config, messages),
+    mode,
     exhaustive,
+    await backgroundSupportFor(runtime, args["refresh"], mode, exhaustive),
   );
   // 超时/stdout 上限是部署值：现读 Config（非 volatile 普通值，行 config 可改）。
   const raw = await runForeground(host, command, workdir, config.searchTimeoutMs, {
@@ -2890,17 +3090,14 @@ async function startBackgroundIndex(
   indexArgs: IndexArgs,
   messages: ZvecGrepMessages,
 ): Promise<{ text: string }> {
-  const routes: RebuildRoutes = {
+  const routes: IndexWriteRoutes = {
     host: runtime.host,
     config: runtime.config,
-    csrf: "",
-    ledger: runtime.ledger,
     messages: runtime.messages,
     jobsOf: runtime.jobsOf,
     records: runtime.records,
     rebuilds: runtime.rebuilds,
     versionGate: runtime.versionGate,
-    servingNonLoopback: false,
   };
   // 与设置卡那条启动端点同一道预检：官方注册表不在时**根本不起进程**。起一条没有环、没有
   // 容量、也没人能收的 zg 比不起更糟——它会一直占着同根的写锁，把这棵树的后续索引全堵死。
@@ -2990,23 +3187,6 @@ async function runIndexTool(
   }
 }
 
-/**
- * 模型侧的后台建/重建：一次调用把「起进程 + 登记作业 + 挂超时回收」全做完，把可轮询的
- * 作业号交回模型，然后立刻返回。
- *
- * 为什么不要求模型自己去起作业：宿主作业工具在 web 平面已停用，模型侧那条路根本不可走；
- * 插件自己复用与设置卡**完全相同**的 spawn/登记/占位三步（`spawnIndexWrite` 与
- * `attachIndexWrite` 是同两个函数，不是复制品），所以两条入口起的作业在名册、状态投影、
- * 轮询端点上完全同形——卡片能看见模型起的重建，反之亦然。
- *
- * 占位在 `runIndexTool` 里、且落在第一个 await 之前就抢好了；本函数只管把已占的位接上作业号。
- * 三条失败出口（注册表缺席 / spawn 失败 / attach 失败）都**交还占位**再抛或答复。
- * @param runtime apply 的运行时依赖
- * @param root 已过授权与存在性预检的工作区
- * @param indexArgs 已归一 root 的索引入参
- * @param messages 本次 execute 现取的文案表
- * @returns 交给官方 output schema 的 `{ text }`
- */
 /** 注册 zg_index：建/重建/删索引。 */
 function registerIndexTool(runtime: PluginRuntime, registered: ZvecGrepMessages): void {
   define(runtime.host, {
@@ -3080,10 +3260,16 @@ async function runStatusTool(
         }
       : {}),
   });
-  return { text };
+  // 守护进程就绪态跟着状态报告一起交回：这一档决定检索是逐次冷加载 embedding 模型、还是走
+  // 常驻模型池与增量刷新，而读状态报告正是用户/模型最该知道它的时刻。走 TTL 缓存，与
+  // zg_search 的门槛和设置卡引导端点共用同一份探测结果。
+  // 只在这条「真读了状态」的出口上补：上面那条「正在重建中」的合成投影刻意不起任何进程，
+  // 在那里插一发探测会破掉它自己的契约。
+  const daemonNote = (await runtime.serverGate.ready())
+    ? messages.serverReadyNote
+    : messages.serverUnavailableNote;
+  return { text: `${text}\n${daemonNote}` };
 }
-
-/** 注册 zg_status：索引状态。 */
 function registerStatusTool(runtime: PluginRuntime, registered: ZvecGrepMessages): void {
   define(runtime.host, {
     name: "zg_status",
@@ -3128,23 +3314,6 @@ function registerRoutingSection(host: HostCtx, registered: ZvecGrepMessages): vo
  * 是本包加宽后的读取投影（lib/routing.ts），加宽即容错，收窄校验留在谓词内部。
  */
 
-/** 显式 root 归一后是否就是本会话工作区；解析不了（畸形参数）一律交回 false。 */
-function sameAsSessionRoot(
-  raw: string,
-  cwd: string | undefined,
-  messages: ZvecGrepMessages,
-): boolean {
-  if (cwd === undefined) {
-    return false;
-  }
-  try {
-    return normalizeRoot(resolveRoot(raw, cwd, messages)) === normalizeRoot(cwd);
-  } catch {
-    // 解析不了（畸形参数）就当「要问」：真正的越界判定在 rootOf，它照旧拒。
-    return false;
-  }
-}
-
 /** 该不该为这次调用问一句；不该问就交回 undefined（调用方转交 next()）。 */
 function explicitRootAsk(
   execution: GuardExecution,
@@ -3155,37 +3324,34 @@ function explicitRootAsk(
   // 再读字面量键（绕开 dot-notation 与索引签名点访问的互斥）。
   const args = isRecord(execution.arguments) ? execution.arguments : undefined;
   const raw: unknown = args?.["root"];
-  const cwd = sessionHeaderCwd(execution);
-  // 三个「不必问」的口径收成一条判据（任一成立就交回 undefined，调用方转交 next()）：
-  //   - 没有可判的显式 root（缺省 / 非字符串 / 空白）；
-  //   - 归一后就是本会话工作区。**这一条不能靠 ledger 兜**：pre-execute 跑在 guard **之前**
-  //     （官方 ToolGuard 注释："evaluated after every tools/pre-execute"），此刻
-  //     trackObservedRoot 还没把 cwd 登记进去，头一次调用就会对着自己的会话工作区发问；
-  //   - 本会话已登记过的 root（要么是工作区本身，要么是这台 daemon 见过的另一个会话的
-  //     工作区）——两者都不该反复打扰用户。
-  const needNotAsk =
-    typeof raw !== "string" ||
-    raw.trim().length === 0 ||
-    sameAsSessionRoot(raw, cwd, messages) ||
-    (cwd !== undefined && ledger.has(raw));
-  // 单一出口：把「不必问」也折成一个 PreToolDecision|undefined 的取值，
-  // 而不是让这个函数一半 return undefined、一半 return 对象（本仓 consistent-return 会拦）。
-  const ask: PreToolDecision | undefined = needNotAsk
+  let question: RootQuestion | undefined;
+  // 没有可判的显式 root（缺省 / 非字符串 / 空白）→ 不问，也不必花一次判据里的 existsSync。
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    // **pre-execute 跑在 guard 之前**（官方 ToolGuard 注释："evaluated after every
+    // tools/pre-execute"），所以此刻 ledger 里还没有本会话的工作区——判据里那一支「就是会话
+    // 工作区」不能靠 ledger 兜，由 judgeRoot 自己按 cwd 比。
+    const decision = judgeRoot(raw, sessionHeaderCwd(execution), messages, ledger);
+    question = decision.allowed ? decision.question : undefined;
+  }
+  // 单一出口（本仓 consistent-return）：被拒的那一路与「放行但无需授权」的（root 就是会话
+  // 工作区、或这台 daemon 已观测过）都折成 undefined，调用方转交 next()。被拒的那一路问了
+  // 也白问——`rootOf` 的授权判据一字未改，批准照样拒，那一句确认只是让用户为一个无法兑现的
+  // 承诺点一次按钮。
+  return question === undefined
     ? undefined
     : {
         kind: "ask",
         reason: fill(messages.rootApprovalReason, {
-          root: raw,
-          cwd: cwd ?? messages.rootNoSession,
+          root: question.root,
+          cwd: question.cwd,
         }),
         // displayReason 是 `{ en, [locale] }` 的多语言映射（官方 PreToolDecision 原文），
         // 故这里直接取两语各一份，而不是现取一份——用户看到的提示不该随插件语言偏好变。
         displayReason: {
-          en: fill(MESSAGES.en.rootApprovalPrompt, { root: raw }),
-          zh: fill(MESSAGES.zh.rootApprovalPrompt, { root: raw }),
+          en: fill(MESSAGES.en.rootApprovalPrompt, { root: question.root }),
+          zh: fill(MESSAGES.zh.rootApprovalPrompt, { root: question.root }),
         },
       };
-  return ask;
 }
 
 /**
@@ -3197,11 +3363,14 @@ function explicitRootAsk(
  * 用户点「允许一次」才放行；approval 服务缺席、或策略是 `never`（danger-full-access 预设 /
  * 委派子代理）时，宿主把 ask **确定性降级成拒绝**（core/tools 的 serviceAsk）。
  *
- * 问的是哪一类调用：三个 zg 工具里，**显式给了 root**、且那个 root 既不是本会话工作区、
- * 也不在本包已登记的根集合里。也就是 rootOf() 走「互为祖先/后代」那条放行路径时——
- * 会话开在 /repo/pkg 而模型要去检索 /repo，用户最该被问一句的就是这种。
+ * 问的是哪一类调用：三个 zg 工具里，**显式给了 root**、且这次调用要靠 rootOf() 的
+ * 「与会话工作区互为祖先/后代」那一条才放行——会话开在 /repo/pkg 而模型要去检索 /repo，
+ * 用户最该被问一句的就是这种。判据与 rootOf **同源于 judgeRoot**，因此两类调用不再被误问：
+ *   - 注定被拒的（越界、目录不存在、解析不了、没有会话工作区可作参照）：一次确认都换不来放行，
+ *     弹窗只是让用户为一个无法兑现的承诺点按钮；
+ *   - 无需授权的（root 就是会话工作区本身、或这台 daemon 已观测过）：本来就是用户自己开的路径。
  *
- * 这道闸**只加不减**：`rootOf` 的授权判据一字未改，root 不存在/越界照样被拒。
+ * 这道闸**只加不减**：`rootOf` 的授权判据一字未改，root 越界照样被拒。
  * 用户批准只对本次调用生效，不会把那个 root 写进白名单（那是 rootOf 成功后的事）。
  */
 function registerRootApproval(runtime: PluginRuntime): void {
@@ -3270,7 +3439,7 @@ function registerToolGuards(runtime: PluginRuntime): void {
  * @returns {void}
  */
 function registerRebuildRoutes(runtime: PluginRuntime, csrf: string): void {
-  const { config, host, ledger, messages, rebuilds, versionGate } = runtime;
+  const { config, host, ledger, messages, rebuilds, versionGate, serverGate } = runtime;
   host.inject(["webServer"], (child) => {
     registerRebuildEndpoints({
       ctx: child,
@@ -3283,6 +3452,7 @@ function registerRebuildRoutes(runtime: PluginRuntime, csrf: string): void {
       jobsOf: runtime.jobsOf,
       records: runtime.records,
       versionGate,
+      serverGate,
     });
   });
 }
@@ -3318,6 +3488,7 @@ function apply(ctx: Context, config: Config): void {
     indexProbe: createIndexProbeCache(indexProbeOf),
     rebuilds: createRebuildRegistry(),
     versionGate: createZgVersionGate(host, config),
+    serverGate: createZgServerGate(host, config),
     // 官方会话存储是**可选**服务：非 web/agent 宿主可能压根没装，故只按需取、不进 inject
     // 依赖表（进了就是硬性要求，宿主缺它时本包会直接 apply 失败）。取不到就退化成
     // 「有父用父、无父用自己」，见 quotaKeyOf。

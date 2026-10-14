@@ -124,11 +124,12 @@ export function previewOf(value: unknown, messages: ZvecGrepMessages): PreviewMo
 /**
  * 刷新策略。原先硬编码 `wait`：检索前把索引刷到最新，代价是慢。
  *
- * `background` 要单独说明：它**只在守护进程模式下成立**，直连模式下 zg 不报错，而是
- * 静默降级成 `off` 并往 stderr 打一行 warning（实测原文：`warning: --refresh background
- * requires Server mode; Direct mode uses --refresh off`）。本包把 stderr 原样回显，
- * 所以那一行会自己到模型眼前，不必在这里再造一条假解释；此处只把这条已知降级写进
- * 参数说明，避免模型选了 `background` 却以为索引在后台真的被刷新了。
+ * `background` 要单独说明：它**只在守护进程（server 模式）下成立**。直连模式下 zg 不报错，
+ * 而是静默降级成 `off` 并往 stderr 打一行 warning（实测原文：`warning: --refresh background
+ * requires Server mode; Direct mode uses --refresh off`）——退出码照旧 0、结果照旧出，唯独
+ * 「后台在刷新」这件事是假的。所以本包不再把它当成一条可以自己消化的降级：守护进程缺席时
+ * `refresh=background` 在**命令构造期**就拒，并给出两条出路（改用缺省的 wait，或先
+ * `zg server on`）。能不能用由宿主算成 BackgroundSupport 再传进来，见 host.ts 的那道门槛。
  */
 const REFRESH_TABLE = { background: "background", wait: "wait", off: "off" } as const;
 
@@ -158,6 +159,27 @@ export function refreshOf(value: unknown, messages: ZvecGrepMessages): RefreshPo
   }
   return value;
 }
+
+/**
+ * 这次调用**是不是显式要后台刷新**。宿主用它决定要不要探一发守护进程：缺省走 `wait`，
+ * 为一档没人要的取值多起一次进程是白给的开销。
+ *
+ * 这里只做字面量比较、不校验取值：非法的 `refresh`（如 `"Background"`）由 `refreshOf`
+ * 在构造期拒，两处判据不重复，也不会出现「先探了进程再报错」那种顺序依赖。
+ */
+export function requestsBackgroundRefresh(value: unknown): boolean {
+  return value === "background";
+}
+
+/**
+ * `refresh=background` 这一档到底能不能用。两个独立的开关，各有各的诚实文案：
+ *  - `available`：传输模式没被钉死，且守护进程就绪。
+ *  - `daemon-down`：模式可以走 server，但守护进程不在——出路是 `zg server on`。
+ *  - `mode-direct`：部署把 `clientMode` 钉死在 direct，守护进程在不在都到不了 server 模式
+ *    ——只叫用户去 `zg server on` 是一句指错方向的废话。
+ * 判据由宿主算（它才同时握着模式与探测能力），本模块只按它折成构造期拒绝。
+ */
+export type BackgroundSupport = "available" | "daemon-down" | "mode-direct";
 
 /**
  * 符号类型闭集，六个取值逐字抄自 zg 命令行 `--symbol-type` 的帮助文本
@@ -452,6 +474,7 @@ function buildIndexedCommand(
   root: string,
   messages: ZvecGrepMessages,
   mode: ClientMode,
+  backgroundSupport: BackgroundSupport,
 ): BuiltCommand {
   const parts: string[] = ["zg", "query"];
   const { routeCount, dashGuard } = pushQueryArgs(parts, args, messages);
@@ -464,13 +487,24 @@ function buildIndexedCommand(
   // --preview 语义：none = 每命中仅 1 行锚点源码；short = 锚点 + 有界上下文窗口；
   // full = 整段源码。缺省 short，与官方 zvec_grep_search（MCP）一致——给模型 short 能少读
   // 几次文件、更准判断相关性，同时避免 full 撑爆上下文；模型要整段函数体时可显式改。
+  const refresh = refreshOf(args.refresh, messages);
+  // background 要有守护进程才成立（见 REFRESH_TABLE 与 BackgroundSupport 的注释）。判据由
+  // 宿主算（它同时握着传输模式与探测能力），这里只把它折成一次构造期拒绝：命令照发的话 zg
+  // 会把刷新关掉、只留一行 stderr warning，而模型读到的是「后台刷新已启用」这个假结论。
+  // 两种不可用各有各的文案——叫用户去 `zg server on` 对「部署钉死 direct」那档是指错方向。
+  if (refresh === "background" && backgroundSupport === "daemon-down") {
+    throw new Error(fill(messages.refreshBackgroundNeedsServer, { root }));
+  }
+  if (refresh === "background" && backgroundSupport === "mode-direct") {
+    throw new Error(fill(messages.refreshBackgroundPinnedDirect, { root }));
+  }
   parts.push(
     "--limit",
     String(clampLimit(args.limit)),
     "--preview",
     previewOf(args.preview, messages),
     "--refresh",
-    refreshOf(args.refresh, messages),
+    refresh,
   );
   pushSearchGlobs(parts, args, messages);
   if (boolOf(args.preferSymbol, "preferSymbol", messages)) {
@@ -570,17 +604,22 @@ function buildExhaustiveCommand(
  * `exhaustive` 走 zg 的穷举词法通道（`--rg`）：不需要索引，是「工作区尚无索引」时的
  * 首选路径。选哪条路由由**宿主**判（它才有索引探测能力），本纯函数只按判据构造——
  * 判据见 host.ts 的 pickExhaustive。
+ *
+ * `backgroundSupport` 是宿主算得的「后台刷新能不能用」，只有索引通道用得上（穷举通道本就
+ * 不接受 refresh）。缺省按**不可用**处理：拿不到判据时把 background 拒掉是安全的一侧，而把
+ * 「没算出来」当成「可用」放行等于把一句假话发给模型。
  */
 export function buildSearchCommand(
   args: SearchArgs,
   messages: ZvecGrepMessages,
   mode: ClientMode = DEFAULT_CLIENT_MODE,
   exhaustive = false,
+  backgroundSupport: BackgroundSupport = "daemon-down",
 ): BuiltCommand {
   const root = assertAbsoluteRoot(args.root, messages);
   return exhaustive
     ? buildExhaustiveCommand(args, root, messages, mode)
-    : buildIndexedCommand(args, root, messages, mode);
+    : buildIndexedCommand(args, root, messages, mode, backgroundSupport);
 }
 
 export interface IndexArgs {

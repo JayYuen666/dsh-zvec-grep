@@ -2,6 +2,32 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.4
+
+把 **zg 守护进程（server 模式）这一档能力差从「使用限制」变成显式判据**：`--mode auto` 在 daemon 缺席时由上游静默落回 direct（模型逐次冷加载、增量刷新与 `refresh=background` 都不存在），而本包过去既没有一处说明，也没有拦住那个不可能兑现的参数。顺带修掉两处评审确认的缺陷：`requireApprovalForExplicitRoot` 会为**注定被拒**的 root 弹一次换不来放行的确认；两份 README 与 `host.ts` 头注释的配置面数字早已和 schema 脱节（14 vs 16、四个 vs 十枚）。
+
+### Added
+
+- **守护进程就绪门槛（`createZgServerGate`）**：按 TTL（60 秒）缓存 `zg server status --check-ready` 的**退出码**（上游契约：就绪 0、未就绪以「zvec-grep server is not ready」非零退出；读 stdout 那份状态表不行，它给人看、不在本包的依赖契约里）。探测失败一律折成「未就绪」，**绝不外抛**基础设施故障，也绝不影响 `wait` / `off` / 穷举检索这些照常能用的通道。本包**不代为 `zg server on`**：那会在用户机器上落下 detached 长驻进程与 token 文件，属该由用户点头的动作。
+- **`refresh=background` 收口（`BackgroundSupport` 三档）**：不可用时在**命令构造期**就拒，并区分两种成因各给一句诚实文案——守护进程缺席（出路是 `zg server on`）与部署把 `clientMode` 钉死 `direct`（此时叫用户起 daemon 是指错方向，出路是回行 config 改模式）。旧行为是让命令照发、由 zg 把刷新整个关掉、只留一行 stderr warning：退出码照旧 0、命中照旧出，唯独「后台在刷新」这件事是假的。判据只有 `backgroundSupportFor` 一处，模式与探测两步都由宿主算（纯构造器只按它折成拒绝）；没人要这一档时不起探测，穷举通道也不起（它本就不接受 `refresh`）。
+- **就绪态回显两处**：`zg_status` 的输出尾部各说一句（就绪讲能拿到什么，未就绪讲后果与出路），设置卡新增一行；重建期那条「合成投影」不补——它的契约本就是不启任何子进程。引导端点 `rebuild-roots` 的应答新增 `serverReady`，卡片判据收在可单测的 `daemonNoteKey`：应答里**没有这一位**（旧版 host）时不渲染，而不是把「不知道」显示成「未就绪」。
+- **无 `Code:` 行的失败补一句 `--debug` 指引**：上游不带 `--debug` 时会把 `MODEL2VEC_DOWNLOAD_FAILED` 与 `INDEXING.FILES_FAILED` 塌成一句无码文案（首次下载 embedding 权重正落在这一档），而本包所有按码归因都读那一行 `Code:`。现在只有「非零退出、有输出、却没有 `Code:` 行」那一支补指引；空输出不补（谈不上「塌成一句」），带码的不补（归因本就够）。本包**不默认带** `--debug`：它明显拉长输出，而这三个工具的回显预算是给模型读的。
+- **文档数字的门禁**：`test/readme-parity.test.ts` 新增一条，把中英两份声明的「字段总数 / 卡上 volatile 数 / 非 volatile 部署值数」与导出 `Config` 的实际形状逐一对齐（第三枚是可推导的：总数 - volatile）。原有的结构对等门只能抓到「一侧多了一节」，抓不到两侧一起写错——这次正是两侧一起错。
+
+### Fixed
+
+- **`requireApprovalForExplicitRoot` 不再为注定被拒的调用发问**。旧判据是「显式 root 既不是会话工作区、也不在 ledger」，于是对 `/etc`、相对路径、盘上不存在、没有会话工作区可作参照这些 `rootOf` **一律拒**的调用也弹一次确认；用户点「允许一次」之后照样被拒（那道闸刻意只加不减），确认成了让人为一个无法兑现的承诺点按钮。现在发问判据与 `rootOf` **同源**：两者共用同一个 `judgeRoot`，只有「靠与会话工作区互为祖先/后代这一条才放行」的调用才发问。同时删掉 `sameAsSessionRoot` 那第二条判据（它比 `judgeRoot` 宽，正是漏问/误问两侧漂移的来源）。
+- **search-first 门禁不再误拦「管道下游、只过滤上游输出」的 grep**。`isGrepRgCommand` 原先把命令位上的 grep/rg 一律判成检索，于是 `ps aux | grep node`、`env | grep KEY`、`dscacheutil -q host | grep ip_address`（实测被拦）这类**根本不读文件系统**的调用也被要求「先 zg_search」——门禁要建立的「已用语义检索定向」那条证据链对它无从谈起。现在 token 多带一档「是否由 `|` 喂入」（只有管道算，`;` 与 `&&` 之后的命令不算），管道下游那一支还要**后随实参里出现路径形状的操作数**（`/x`、`a/b`、`.`、`..`；旗标不算）才判为检索，带路径的管道调用照旧算。副作用方向是漏拦：`cat a.txt | grep foo` 因上游确实读了工作区文件而被放行，与 `hasExternalTarget` 的既有取舍同侧，代价由 systemPrompt 路由文本兜底。
+- **`startBackgroundIndex` 不再构造哑值依赖**。它不是 HTTP 请求，过去要凑出 `RebuildRoutes` 就得给 `csrf` 塞空串、给 `servingNonLoopback` 塞 `false`——两个「没被用到」只靠下游恰好不读它们来保证的占位值。现在把起一条 `zg index` 写操作所需的依赖收窄成 `IndexWriteRoutes`（`RebuildRoutes extends` 它），哑值在类型上不再可能被构造出来。
+- **删掉 `startBackgroundIndex` 那份重复的 JSDoc**：同一段 17 行文档在文件里出现两次，第二份悬在 `registerIndexTool` 头上，指向的却不是它下面那个函数。
+
+### Changed
+
+- 引导端点 `/_dsh/zvec-grep/rebuild-roots` 的 handler 转为 async（就绪态要在**信任闸门与方法判定之后**才取，被拒的请求不起子进程）。官方 `WebRoute.handler` 本就允许 `void | Promise<void>`，另两条路由一直是 async 形态。
+- `buildSearchCommand` 新增第五位 `backgroundSupport`（缺省 `daemon-down`：拿不到判据时保守拒绝，而不是把一句假话发给模型）；`lib/cli.ts` 导出 `requestsBackgroundRefresh` 供宿主判「要不要探」。
+- 两份 README：`--mode direct` 的过时说法改成按实现的 `auto` 口径并新增「守护进程（server 模式）」一节；配置面数字改成 16 / 6 / 10；`refresh` 与 `requireApprovalForExplicitRoot` 两节跟着上面的行为重写；`host.ts` 头注释同样对齐。
+- 集成层新增一条按环境自适应的用例：`clientMode=auto` 时断言跟着**这台机器上守护进程的真实就绪态**给期望值（无条件式断言，不分支），另有一条钉死 `clientMode=direct` 时「命令根本没发出去」。
+
 ## 0.1.3
 
 修复一处**跟着真实宿主语义失效的作业身份判据**（它让重建轮询恒 404、卸载只杀进程不摘作业 ⇒ 官方环缓冲留在宿主内存），并给 `ignoreFiles` 补上起进程之前的**存在性 + 可读性**预检（一条读不成的忽略文件会永久弄坏整棵工作区索引）。测试面从「单测 + mock 宿主」扩到三层：新增真宿主半栈的集成层与直怼真 zg CLI 的点对点层。

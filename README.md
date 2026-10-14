@@ -4,9 +4,9 @@
 
 ### What it does
 
-- Adds semantic workspace search to dsh sessions: registers three model tools, zg_search / zg_index / zg_status, which drive the zg CLI (BM25 + vector + RRF hybrid) through the host shell with `--mode direct`.
+- Adds semantic workspace search to dsh sessions: registers three model tools, zg_search / zg_index / zg_status, which drive the zg CLI (BM25 + vector + RRF hybrid) through the host shell. The transport mode defaults to `--mode auto`: server when the daemon is ready, and zg **silently falls back to direct** when it is not (upstream only probes readiness and never starts a daemon; neither does this package — see "Daemon (server mode)").
 - Injects one systemPrompt rule section (`zvec-grep-routing`, order 1550) plus two tools.guard layers: safety backstop for zg_* and the search-first gate (in an indexed workspace, grep/rg requires a prior successful zg_search).
-- Ships a web settings card: default embedding, limit, search-first quota/window, and a "rebuild workspace" button.
+- Ships a web settings card: default embedding, limit, search-first quota/window, daemon readiness, and a "rebuild workspace" button.
 
 ### Installation
 
@@ -39,7 +39,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - `globs` / `insensitiveGlobs` / `fileTypes` / `excludedFileTypes` accept a **single string** as well as an array of strings, matching zg's own contract for those fields (128 items max, 1024 chars per item).
   - `symbolTypes` is bound to zg's real closed set and accepts **lowercase only**: `module` / `class` / `interface` / `function` / `value` / `alias`. zg itself exits non-zero on `--symbol-type Class` (`Unsupported symbol type: Class`); the plugin refuses before assembling the command and lists the allowed values. It does not fold case — silently lowercasing would rewrite a constraint the model did not write.
   - `preview` has three levels: `none` anchor line only / `short` anchor plus a bounded context window / `full` the whole chunk. **Default short**, so every hit carries a bounded source snippet.
-  - `refresh` has three levels: `wait` refresh to the latest before searching (**default**) / `off` do not refresh / `background` hand it to the daemon. `background` only holds in daemon mode: in direct mode zg does not fail, it degrades to `off` and writes `warning: --refresh background requires Server mode; Direct mode uses --refresh off` to stderr — this package echoes stderr verbatim, so that line reaches the model on its own.
+  - `refresh` has three levels: `wait` refreshes to the latest before searching (**default**) / `off` does not refresh / `background` hands it to the daemon. `background` requires a **ready daemon**: when that is not the case it is refused **before the command is built**, with the way out named, instead of letting zg switch refreshing entirely off and leave only `warning: --refresh background requires Server mode; Direct mode uses --refresh off` on stderr — that path exits 0 with normal hits while the one thing it claims ("refreshing in the background") is false. The two kinds of unavailability get separate wording: without a daemon the way out is `zg server on`; when the deployment pins `clientMode` to `direct`, saying that would point the wrong way, and the fix is setting the mode back to auto/server in the row config.
   - A **hit summary** is appended at the end of the output with two separately reported counts: `grouped` (the sum of each query group's `hits:`) and `N distinct location(s) after dedup` (keyed by relative path + line range). They are split because one location is hit by several groups at once (rank and `matchedBy` differ per group), so a plain sum counts the same location repeatedly and passes itself off as the hit total.
   - When some group's hit count equals `--limit`, that is reported as an **observation only**, with an explicit note that zg provides no truncation signal and the summary does not assert one. When the host truncates stdout at its cap, a "covers only the kept part" note is added.
 - zg_index: confirm is required and must be true (rejected twice, by the required check and by the guard).
@@ -68,17 +68,17 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ### Settings and search roots
 
-- Namespace `zvec-grep`, fourteen fields with built-in defaults, six of them volatile and on the card.
+- Namespace `zvec-grep`, 16 fields with built-in defaults, 6 of them volatile and on the card.
   - defaultEmbedding=local/qwen3-embedding-0.6b, defaultLimit=10 (1-50), hfEndpoint=a China-reachable HF-compatible mirror base (set another mirror or leave empty for the official HF).
   - enforceSearchFirst=true, grepBudgetPerSearch=3 (1-20), unlockWindowMin=10 (1-240).
-- Additional **non-volatile deployment values** are not on the settings card: change them only via the line config in cordis.yml. The "5 minutes / 10 minutes / 60 seconds / 400000 bytes" in the tools section are their defaults.
+- Additional **non-volatile deployment values**, 10 of them, are not on the settings card: change them only via the line config in cordis.yml. The "5 minutes / 10 minutes / 60 seconds / 400000 bytes" in the tools section are their defaults.
   - searchTimeoutMs=300000, statusTimeoutMs=60000, indexTimeoutMs=600000 (also the background rebuild kill-timer duration), stdoutMaxBytes=400000 (each with a minimum of 1), clientMode=auto, rebuildWaitMs=120000.
   - Remote embedding, three values, all **off by default**: `allowRemoteEmbedding=false`, `remoteEmbeddingEndpoint=""`, `remoteEmbeddingApiKeyFrom=""`.
     - While it is off, an explicit embedding reference must be in the local catalog at **command-assembly time**.
     - Once open, the endpoint and the credential reach the zg child process **only through environment variables** (`ZVEC_GREP_ENDPOINT` / `ZVEC_GREP_API_KEY`) and **never through argv** — this plugin reuses the whole command string as a background-job label that is echoed on the card, so a key in argv would land in the UI, in logs, and in the process table.
     - The credential value holds the **name** of the environment variable in the host process that holds the credential (e.g. `ZVEC_GREP_API_KEY`), not the credential itself: the host's subprocess layer scrubs inherited names matching KEY/SECRET/TOKEN, so only an explicit forward from this plugin reaches zg — and recording just the name also keeps the secret out of the plugin's own config file.
     - This plugin does **not** pass `--allow-remote` for you: zg still requires the user to run `zg auth grant <root> --capability embedding --scope workspace` once, and that per-root authorization is not something a plugin should do on the user's behalf.
-  - `requireApprovalForExplicitRoot=false`: when on, an explicit `root` on any of the three zg tools that is neither the current session workspace nor already registered in this session triggers one user confirmation through the official `tools/pre-execute → {kind:'ask'} → ctx.approval` seam. It defaults to off, and three boundaries are known in advance: the `danger-full-access` preset sets `approval/policy` to `never` (the ask is deterministically rejected), delegated subagents are pinned to `approvalPolicy: 'never'` (**the switch has no effect inside a subagent**), and with no approval service installed the ask fails closed to a denial. This confirmation **only ever adds** a step: `rootOf`'s authorization predicate is unchanged, so an out-of-scope root is still refused even after the user approves.
+  - `requireApprovalForExplicitRoot=false`: when on, an explicit `root` triggers one user confirmation through the official `tools/pre-execute → {kind:'ask'} → ctx.approval` seam **only for calls that `rootOf` would let through via its "ancestor or descendant of the session workspace" branch**. The ask and `rootOf` share one predicate (`judgeRoot`), so two kinds of calls are no longer bothered: ones that will be refused anyway (out of scope, missing directory, unparseable, no session workspace to compare against) — where an approval can never buy a pass — and ones that need no authorization at all (the session workspace itself, or a root this daemon already observed). It defaults to off, and three boundaries are known in advance: the `danger-full-access` preset sets `approval/policy` to `never` (the ask is deterministically rejected), delegated subagents are pinned to `approvalPolicy: 'never'` (**the switch has no effect inside a subagent**), and with no approval service installed the ask fails closed to a denial. This confirmation **only ever adds** a step: `rootOf`'s authorization predicate is unchanged, so an out-of-scope root is still refused even after the user approves.
 - Precedence: runtime settings values > the line config of the bundle/user layer > built-in base; explicitly absent fields in the line config do not override the base.
   - Volatile fields are read via `config.<field>.get()`; the non-volatile deployment values are plain values and skip `.get()`.
 - Root validation: must be an absolute path starting with `/`, lexically normalised (empty and `.` segments folded).
@@ -103,12 +103,21 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - `--help`/`--version`/`-V`, `echo "grep x"` and `git commit -m "use rg"` do not.
 - With a sandboxed executor, runner failure, policy denial and a genuine zg failure are told apart, and incomplete results are flagged explicitly.
 
+### Daemon (server mode)
+
+- This is not a "somewhat faster" distinction. The two sides of `--mode auto` are two capability surfaces: direct builds and closes the engine on every `zg query` and **cold-loads the embedding model each time**, while watcher-driven incremental index refresh, `refresh=background` and a resident model pool **only exist in server mode**. Upstream only probes readiness for `auto`; it never starts a daemon for you.
+- This package **does not start a long-lived process on the user's behalf**: `zg server on` leaves a detached process and a token file on the machine, which is an action the user should own, not a decision a plugin makes for a deployment. What the package does instead is make the difference **explicit**, rather than leaving it hidden behind usage limits like "the search timeout is 5 minutes" and "recent edits are not findable":
+  - It caches the **exit code** of `zg server status --check-ready` for a 60-second TTL (0 = ready, non-zero = not ready; reading the stdout table would not do — it is formatted for humans and is not part of this package's dependency contract). A failed probe is recorded as "not ready" and never surfaces as an infrastructure error.
+  - That judgment gates `refresh=background` (see the tools section) and is echoed once at the tail of `zg_status` output and once on the settings card. A request rejected by the trust gate never triggers a probe, and neither does the rebuild-time synthetic projection, whose contract is to start no subprocess at all.
+  - The card's `serverReady` is only ever `true` / `false`. An older host response simply has no such field, and the card renders **nothing** for that arm instead of claiming "not ready".
+- To actually get the benefits: run `zg server on` in a terminal (`zg server off` / `zg server status` cover stop and state). This package reads that readiness; it does not own the daemon's lifecycle.
+
 ### Public interface
 
 - Every handler opens with `guardTrust(req, res, { servingNonLoopback })` (`shared/lib/trust`); failing any leg yields `403` with `{ ok:false, error: ... }`.
   - Order of legs: Host authority -> the `sec-fetch-site` allowlist -> a verbatim `origin` vs Host compare. The two rejection sentences are `"untrusted host authority"` and `"cross-origin request rejected"`.
   - `servingNonLoopback` is computed by `isNonLoopbackBindHost(webServer.host)` from the bound address itself - the host only rejects wildcard listeners, while binding a concrete IPv4/IPv6 of a local interface is a legitimate configuration, and a literal comparison would read that surface as loopback. A wrong method yields `405` carrying `Allow` plus `{ ok:false, error:"GET only" | "POST only" }` - no longer an empty reply.
-- `GET /_dsh/zvec-grep/rebuild-roots`: returns only this plugin's own data (a CSRF token regenerated on every apply, plus the observed workspace list); GET/HEAD allowed, 403 when the gate above rejects it.
+- `GET /_dsh/zvec-grep/rebuild-roots`: returns only this plugin's own data (a CSRF token regenerated on every apply, the observed workspace list, and the daemon readiness the card shows); GET/HEAD allowed, 403 when the gate above rejects it. The readiness probe runs **after** both gates, so a rejected request never starts a subprocess.
 - `POST /_dsh/zvec-grep/rebuild?root=...`: gate + header `x-zvec-grep-csrf` + body <= 4096 bytes + root in the whitelist + directory exists; returns `{ ok, jobId }`, otherwise 405/403/400/500.
 - `/_dsh/zvec-grep/rebuild-status?jobId=...`: polled behind the gate (the card polls every 2 seconds); returns status/exitCode/root/output (plus sandbox when present); an unknown jobId gets a 404 explaining it left the 10-record settled window.
 - Also a systemPrompt section `zvec-grep-routing` (order 1550) and the settings namespace `zvec-grep`.
@@ -150,11 +159,12 @@ What is not retained, stated plainly: the output ring keeps **UTF-8 bytes** (mea
 ### FAQ
 
 - grep/rg refused with "no zg_search has run yet": that is the search-first gate; run zg_search. The same applies once the quota is spent or expired — re-search with a sharper query/fts to refresh it, no need to disable the plugin.
-- Search times out: the default `--refresh wait` refreshes the existing index synchronously; narrow the range with globs/fileTypes or lower the limit, or fall back to a hand-written literal search.
+- Search times out: the default `--refresh wait` refreshes the existing index synchronously; narrow the range with globs/fileTypes or lower the limit, or fall back to a hand-written literal search. To make the timeout itself smaller, start the daemon (see "Daemon (server mode)") — direct mode cold-loads the embedding model on every call, which is exactly why that budget sits at 5 minutes.
 - The rebuild button answers 403 "root is not in the workspace whitelist this daemon observed": that directory never had a session in this daemon; start one there first, or let the model call zg_index with confirm=true.
 - The card reports a failed rebuild although zg looks finished: success is "completed with exit 0" — exit 127 (zg not installed) also lands in completed, so read the tail of the output.
 - A root that was never indexed: zg_search fails loudly instead of silently building the index; building happens only via zg_index on an explicit user request.
 - Changed the embedding but semantic hits are missing: switching embedding only takes effect after a rebuild with rebuild=true.
+- A zg failure comes back as one line with no `Code:` field: without `--debug` upstream collapses two failure kinds (weight download, indexing files) into a bare sentence, which is exactly where this package's attribution-by-code stops working. Such replies therefore append one line pointing at `--debug`. The package does **not** pass `--debug` by default: it visibly lengthens output, and these three tools share a bounded echo (stdout 400000 bytes) meant for a model. Failures that do carry a `Code:` line get no such note.
 
 ### Development
 

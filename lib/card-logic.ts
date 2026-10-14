@@ -34,6 +34,27 @@ export type CardTextKey =
   | "contentTypeMissing";
 
 /**
+ * 引导端点交回的守护进程就绪态该显示哪一行。
+ *
+ * `undefined` 是**必要**的一臂，不是兜底：旧版 host 的应答里没有 `serverReady` 这个字段，
+ * 而「应答里没写」与「写了未就绪」是两件事——把前者显示成后者，卡片就在用户眼前谎称了一次
+ * 「没有守护进程」。判据收在可单测的这一层，client 只负责渲染它选出来的那一行。
+ */
+export function daemonNoteKey(
+  ready: boolean | undefined,
+): "daemonReadyNote" | "daemonOfflineNote" | undefined {
+  let key: "daemonReadyNote" | "daemonOfflineNote" | undefined;
+  if (ready === true) {
+    key = "daemonReadyNote";
+  } else if (ready === false) {
+    key = "daemonOfflineNote";
+  }
+  // 单一出口：`ready` 既不是 true 也不是 false（= undefined，应答里没这一位）时留空，
+  // 调用方据此**不渲染**，而不是把「不知道」显示成「未就绪」。
+  return key;
+}
+
+/**
  * 取文案函数：官方 `ctx.locale.bind(ns)` 返回的 Translate 的子集（结构声明，
  * 与 src/ui-messages.ts 同源；键更窄、参数更宽的一侧才接得进来）。params 收到
  * 的是本包自己填的标量，故比官方形状收紧一档。

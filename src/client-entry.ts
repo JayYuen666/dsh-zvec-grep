@@ -28,6 +28,7 @@ import { LOCAL_EMBEDDINGS } from "../lib/embedding-catalog.ts";
 import type { LocalEmbeddingBackend } from "../lib/embedding-catalog.ts";
 import {
   cardStore,
+  daemonNoteKey,
   draftFields,
   httpProblem,
   isOkBody,
@@ -276,6 +277,8 @@ interface CardDeps {
   writable: boolean;
   /** 重建端点白名单候选（来自 rebuild-roots 引导端点）。 */
   roots: string[];
+  /** 守护进程就绪态（同样来自引导端点；undefined = 这一档未知，不显示）。 */
+  serverReady: boolean | undefined;
   root: string;
   rebuild: RebuildState;
   dirty: boolean;
@@ -524,6 +527,24 @@ function buildRebuildRow(deps: CardDeps): ReactNode {
   );
 }
 
+/**
+ * 守护进程（`zg server`）就绪态一行，取自 rebuild-roots 引导端点。
+ *
+ * 为什么值得单独占一行：daemon 缺席时检索按直连模式逐次冷加载 embedding 模型，而
+ * `refresh=background`、索引增量刷新与常驻模型池都不存在——本包因此在命令构造期就拒
+ * background。把这一档摆在「工作区重建」旁边，用户才不至于从「检索怎么这么慢」倒推。
+ * `undefined` 那一档**不渲染**：旧版 host 的应答没有这个字段，说成「未就绪」是谎称。
+ */
+function buildDaemonNote(deps: CardDeps): ReactNode | null {
+  const { t } = deps;
+  const key = daemonNoteKey(deps.serverReady);
+  if (key === undefined) {
+    return null;
+  }
+  const note = createElement("div", { className: "zgc-hint" }, t(key));
+  return createElement("div", { className: "zgc-row" }, note);
+}
+
 /** 重建状态节点：phase 非 idle 才出现；done 且无输出时给一句「已完成」。 */
 function buildRebuildStatusRow(deps: CardDeps): ReactNode | null {
   const { rebuild, t } = deps;
@@ -576,6 +597,7 @@ function buildCardBody(deps: CardDeps): ReactNode[] {
       onSave: deps.onSave,
       onDiscard: deps.onDiscard,
     }),
+    buildDaemonNote(deps),
     buildRebuildRow(deps),
   ];
   const status = buildRebuildStatusRow(deps);
@@ -645,18 +667,25 @@ async function requestJson(
 interface RebuildAccess {
   csrf: string;
   roots: string[];
+  /**
+   * 守护进程就绪态。`undefined` = 应答里读不出这个字段（旧版 host 的响应就没有它），
+   * 那一档在卡上**不显示**，而不是说成「未就绪」——把「不知道」讲成「没有」正是本包
+   * 一直在避免的那类谎称。
+   */
+  serverReady: boolean | undefined;
 }
 
-const NO_ACCESS: RebuildAccess = { csrf: "", roots: [] };
+const NO_ACCESS: RebuildAccess = { csrf: "", roots: [], serverReady: undefined };
 
-/** 引导端点应答 → { csrf, roots }（字段缺失/类型不对一律当作没拿到）。 */
+/** 引导端点应答 → { csrf, roots, serverReady }（字段缺失/类型不对一律当作没拿到）。 */
 function readAccess(body: Record<string, unknown>): RebuildAccess {
-  const { csrf, roots } = body;
+  const { csrf, roots, serverReady } = body;
   return {
     csrf: typeof csrf === "string" ? csrf : "",
     roots: Array.isArray(roots)
       ? roots.filter((item): item is string => typeof item === "string")
       : [],
+    serverReady: typeof serverReady === "boolean" ? serverReady : undefined,
   };
 }
 
@@ -664,6 +693,8 @@ function readAccess(body: Record<string, unknown>): RebuildAccess {
 interface RebuildView {
   root: string;
   roots: string[];
+  /** 守护进程就绪态（undefined = 引导端点没交出这一档，见 RebuildAccess.serverReady）。 */
+  serverReady: boolean | undefined;
   state: RebuildState;
   setRoot: (value: string) => void;
   /** 点击「重建」：async 状态机，调用方 fire-and-forget（面板自己推进 phase）。 */
@@ -781,7 +812,14 @@ function useRebuild(t: Translate): RebuildView {
     }
   }
 
-  return { root, roots: access.roots, state: rebuild, setRoot, start };
+  return {
+    root,
+    roots: access.roots,
+    serverReady: access.serverReady,
+    state: rebuild,
+    setRoot,
+    start,
+  };
 }
 
 function ZgCard(props: CardSlotProps): ReactNode {
@@ -858,6 +896,7 @@ function ZgCard(props: CardSlotProps): ReactNode {
     fields,
     writable,
     roots: rebuildView.roots,
+    serverReady: rebuildView.serverReady,
     root: rebuildView.root,
     rebuild: rebuildView.state,
     dirty,

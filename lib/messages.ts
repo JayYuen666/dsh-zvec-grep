@@ -135,6 +135,12 @@ export interface ZvecGrepMessages {
   readonly detailPrefix: string;
   /** 详情尾巴（「：…」紧贴句式，通用失败用）：`{detail}`。 */
   readonly detailColon: string;
+  /**
+   * 无 `Code:` 行的失败补的那条 `--debug` 指引（接在通用失败之后，无占位符）。
+   * 上游不带 `--debug` 时会把两类失败塌成一句没有错误码的文案，本包的按码归因在那一刻
+   * 正好失效——所以这条只说「怎么拿到可归因的文本」，不猜原因。
+   */
+  readonly noErrorCodeHint: string;
   /** stdout 截尾：`{maxBytes}`、`{spill}` 落盘提示。 */
   readonly outputTruncated: string;
   /** 完整输出落盘位置：`{path}`。 */
@@ -215,6 +221,22 @@ export interface ZvecGrepMessages {
   readonly previewInvalid: string;
   /** 刷新策略非法：`{received}`、`{allowed}`。 */
   readonly refreshInvalid: string;
+  /**
+   * `refresh=background` 在守护进程缺席时**不再静默降级**，而是构造期即拒：
+   * 上游对 `--refresh background` 在直连模式下只往 stderr 打一行 warning 就当过了，
+   * 模型以为自己启用了后台刷新、其实索引一动不动。`{root}` 是这次检索的工作区。
+   */
+  readonly refreshBackgroundNeedsServer: string;
+  /** zg_status 末尾补的守护进程就绪态（就绪那一臂）：无占位符。 */
+  /**
+   * `refresh=background` 被**部署钉死的 `clientMode: direct`** 挡住时的那句（`{root}`）。
+   * 与守护进程缺席分开：那一档叫用户去 `zg server on` 是对的，这一档那么说就是指错方向
+   * ——模式是部署在 cordis.yml 的行 config 里定的，得回那里改。
+   */
+  readonly refreshBackgroundPinnedDirect: string;
+  readonly serverReadyNote: string;
+  /** zg_status 末尾补的守护进程就绪态（未就绪那一臂）：无占位符。 */
+  readonly serverUnavailableNote: string;
   /** 符号类型不在 zg 闭集内：`{received}`、`{allowed}`。 */
   readonly symbolTypeInvalid: string;
   /** `..` 越出文件系统根：`{path}`。 */
@@ -312,7 +334,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     previewDescription:
       "每条命中带的源码片段大小：none 只给锚点行、short 给锚点加一段有界上下文、full 给整段源码。默认 short",
     refreshDescription:
-      "检索前如何刷新索引：wait 等刷新到最新（默认）、off 不刷新、background 交给守护进程后台刷新。注意 background 只在守护进程模式下成立，直连模式下 zg 会降级成 off 并在 stderr 提示",
+      "检索前如何刷新索引：wait 等刷新到最新（默认）、off 不刷新、background 交给守护进程后台刷新。background 只在守护进程就绪时可用：没有守护进程时这一档在命令构造前就被拒绝（直连模式下 zg 只会静默关掉刷新并留一行 stderr warning，那等于把「没刷新」说成「后台在刷」），要它请先在终端执行 `zg server on`",
     globsDescription: "路径 glob（如 src/**），单个字符串或数组",
     globsIndexDescription: "路径 glob",
     insensitiveGlobsDescription: "大小写不敏感 glob",
@@ -385,7 +407,9 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "如需查看实时输出，请在设置卡的工作区重建面板里观察。此刻即使问「索引是否就绪」也是否定的答案——重建落定后再问。",
     statusNotReady:
       "[zvec-grep] {root} 的索引**未就绪**（上面是 zg 的完整就绪报告）。这不是执行失败，" +
-      "而是 checkReady=true 要的那个结论：{detail}",
+      "而是 checkReady=true 要的那个结论：{detail}" +
+      " 若刷新反复失败（报告里出现 `read only mode` 一类写入被拒的措辞），那是该索引自身的" +
+      '状态问题，重建即可恢复：zg_index(root="…", confirm=true, rebuild=true)。',
     checkReadyDescription:
       "就绪判定：就绪报告照常给出，另行判定索引是否 ready 并在结论里明说。未就绪不是执行失败，报告仍会返回",
     traceDescription:
@@ -418,6 +442,8 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     genericFailure: "zg 执行失败（exit={exit}）{detail}",
     detailPrefix: " 详情：{detail}",
     detailColon: "：{detail}",
+    noErrorCodeHint:
+      "（这条失败没有 zg 的结构化 `Code:` 行，本包无法按码归因。上游不带 `--debug` 时会把部分失败塌成一句无码文本；要拿到可归因的完整输出，请让持有终端的用户把同一条命令加上 `--debug` 复跑一次）",
     outputTruncated:
       "[zvec-grep] 注意：输出超过 {maxBytes} 字节上限，已截断，仅保留尾部{spill}。" +
       "如需完整结果请缩小检索范围（更精确的 query / 更小的 limit / 更窄的 root）。",
@@ -469,6 +495,23 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     clientModeInvalid: "zg 传输模式非法：{received}（合法取值：{allowed}）",
     previewInvalid: "预览档位非法：{received}（合法取值：{allowed}）",
     refreshInvalid: "刷新策略非法：{received}（合法取值：{allowed}）",
+    refreshBackgroundNeedsServer:
+      "{root} 没有可用的 zg 守护进程，`refresh=background` 因此被拒绝——它只在守护进程" +
+      "模式下成立。缺了守护进程时这次调用要的是 background，而上游只会往 stderr 打一行 " +
+      "warning 就把**刷新整个关掉**，所以这里不再替它把「没刷新」说成「后台在刷」。" +
+      "两条出路：按默认 refresh=wait（检索前同步刷到最新，直连模式可用），或在持有终端时" +
+      "先执行 `zg server on` 再来要后台刷新——后者还会顺带带来索引增量刷新与常驻的模型池。",
+    refreshBackgroundPinnedDirect:
+      "{root} 这次检索把 `refresh=background` 拒绝了：本 daemon 的传输模式被部署钉死在 " +
+      "direct（行 config 的 `clientMode: direct`），而后台刷新只在 server 模式下存在。这一档" +
+      "**不是**起一个守护进程能解决的——出路是把行 config 的 clientMode 改回 auto 或 server，" +
+      "或按缺省的 refresh=wait 检索。",
+    serverReadyNote:
+      "[zvec-grep] 守护进程：就绪（检索可走 server 模式：索引增量刷新、embedding 模型池常驻）",
+    serverUnavailableNote:
+      "[zvec-grep] 守护进程：未就绪。检索因此按直连模式逐次冷加载 embedding 模型（大工作区" +
+      "会更慢，且 refresh=background 不可用）；需要增量索引与常驻模型池时，请在持有终端执行" +
+      " `zg server on`",
     symbolTypeInvalid: "符号类型非法：{received}（合法取值：{allowed}，只接受小写）",
     rootEscapesFs: "root 含越界的 .. 段：{path}",
     rootMustBeString: "root 必须是字符串（收到 {received}）",
@@ -553,7 +596,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     previewDescription:
       "How much source each hit carries: none anchor line only, short anchor plus a bounded context window, full the whole chunk. Default short",
     refreshDescription:
-      "How the index is refreshed before searching: wait refresh to the latest (default), off does not refresh, background hands it to the daemon. Note that background only holds in daemon mode; in direct mode zg degrades it to off and says so on stderr",
+      'How the index is refreshed before searching: wait refreshes to the latest (default), off does not refresh, background hands it to the daemon. background needs a ready daemon: without one it is refused before the command is built (in direct mode zg silently turns refreshing off and leaves one stderr warning, which would report "refreshing in the background" when nothing refreshes) — run `zg server on` in a terminal to get it',
     globsDescription: "Path globs (e.g. src/**), a single string or an array",
     globsIndexDescription: "Path globs",
     insensitiveGlobsDescription: "Case-insensitive globs",
@@ -659,7 +702,9 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "once the rebuild settles.",
     statusNotReady:
       "[zvec-grep] the index for {root} is **not ready** (the full zg readiness report is above). " +
-      "This is not an execution failure, it is the conclusion checkReady=true asked for: {detail}",
+      "This is not an execution failure, it is the conclusion checkReady=true asked for: {detail}" +
+      " If refreshes keep failing (wording like `read only mode` means writes are refused), that is " +
+      'the index\'s own state — rebuild it to recover: zg_index(root="…", confirm=true, rebuild=true).',
     checkReadyDescription:
       "Readiness verdict: the readiness report is still returned, and the tool additionally states " +
       "whether the index is ready. Not-ready is not an execution failure — the report still comes back",
@@ -707,6 +752,10 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     genericFailure: "zg failed (exit={exit}){detail}",
     detailPrefix: " details: {detail}",
     detailColon: ": {detail}",
+    noErrorCodeHint:
+      "(this failure carries no structured `Code:` line from zg, so it cannot be attributed by " +
+      "code. Without `--debug` upstream collapses some failures into a single uncode line — have " +
+      "a user with a terminal re-run the same command with `--debug` for attributable output)",
     outputTruncated:
       "[zvec-grep] note: output exceeded the {maxBytes} byte limit and was truncated, only the " +
       "tail is kept{spill}. Narrow the search for full results (sharper query / smaller limit / " +
@@ -768,6 +817,26 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     clientModeInvalid: "invalid zg client mode: {received} (allowed: {allowed})",
     previewInvalid: "invalid preview mode: {received} (allowed: {allowed})",
     refreshInvalid: "invalid refresh policy: {received} (allowed: {allowed})",
+    refreshBackgroundNeedsServer:
+      "{root} has no available zvec-grep daemon, so `refresh=background` was refused — it only " +
+      "holds in server mode. Without a daemon the CLI prints one stderr warning and silently " +
+      'turns refreshing **off**, which this plugin will not report as "refreshing in the ' +
+      'background". Either keep the default refresh=wait (synchronous refresh before the search, ' +
+      "works in direct mode) or run `zg server on` in a terminal first — the daemon also brings " +
+      "incremental indexing and a resident embedding model pool.",
+    refreshBackgroundPinnedDirect:
+      "{root}: `refresh=background` was refused because this daemon's transport mode is pinned " +
+      "to direct by the deployment (the row config's `clientMode: direct`), while background " +
+      "refreshing only exists in server mode. Starting a daemon would not help here — either set " +
+      "clientMode back to auto/server in the row config, or search with the default refresh=wait.",
+    serverReadyNote:
+      "[zvec-grep] daemon: ready (searches can use server mode: incremental index refresh, " +
+      "resident embedding model pool)",
+    serverUnavailableNote:
+      "[zvec-grep] daemon: not ready. Searches therefore run in direct mode and cold-load the " +
+      "embedding model every call (slower on large workspaces, and refresh=background is " +
+      "unavailable); run `zg server on` in a terminal for incremental indexing and a resident " +
+      "model pool",
     symbolTypeInvalid: "invalid symbol type: {received} (allowed: {allowed}; lowercase only)",
     rootEscapesFs: "root contains a .. segment that escapes the filesystem root: {path}",
     rootMustBeString: "root must be a string (received {received})",

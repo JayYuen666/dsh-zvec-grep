@@ -76,8 +76,36 @@ const ZG_MANIFEST_FILE = "manifest.json";
 
 /** 版本门槛的探测命令（字面量与 host.ts 的 probeZgVersion 同源，改一处两边都红）。 */
 const ZG_VERSION_COMMAND = "zg --version";
+/**
+ * 守护进程就绪门槛的探测命令（字面量与 host.ts 的 probeServerReady 同源）。
+ * 上游 `--check-ready` 的契约是「就绪报告照常打在 stdout，只用退出码表达就绪与否」，
+ * 所以替身按退出码给答案，而不是伪造一份状态文本。
+ */
+const ZG_SERVER_COMMAND = "zg server status --check-ready";
+/** 执行器缺席时替身抛的那句（三处共用：后台 spawn、就绪探测、版本探测）。 */
+const NO_EXECUTOR = "no such executor";
+/** 外域 Host：DNS 重绑定那一类权威，只有信任闸门的 Host 腿拒得了。 */
+const FOREIGN_HOST = "evil.test:8787";
 /** 健康的本机 zg：恰好等于门槛值，故默认放行（实机 stdout 就是这一行 + 换行）。 */
 const ZG_VERSION_OK = `${MINIMUM_ZG_VERSION}\n`;
+
+/**
+ * 守护进程就绪探测的执行结果。形状抄上游 `runServer` 的 `--check-ready` 契约：
+ * 就绪退出码 0、未就绪以「zvec-grep server is not ready」非零退出（无 `Code:` 行）。
+ */
+function serverProbeResult(ready: boolean): ShellRunResult {
+  return ready
+    ? {
+        exitCode: 0,
+        stdout: { text: "zvec-grep server: ready\n" },
+        stderr: { text: "" },
+      }
+    : {
+        exitCode: 1,
+        stdout: { text: "zvec-grep server: stopped\n" },
+        stderr: { text: "Error: zvec-grep server is not ready\n" },
+      };
+}
 
 /** 一次健康的版本探测执行（stdout 只有版本号一行，实测形态）。 */
 function versionOkRun(): ShellRunResult {
@@ -323,6 +351,15 @@ interface ShellMock {
   zgVersionResult: ShellRunResult | undefined;
   /** 版本探测这一次执行直接抛错（模拟执行器缺席/spawn 失败）：同样必须按「读不懂」放行。 */
   versionProbeThrows: boolean;
+  /**
+   * 守护进程就绪探测的记账（与 versionProbeCalls 同一个理由：它是基础设施的一次自检，
+   * 不该占被测命令的队列，也不该混进 resolveCalls 的断言里）。
+   */
+  serverProbeCalls: ResolveRequest[];
+  /** 守护进程就绪态：缺省 false（未就绪＝直连模式），要 background 用例显式改 true。 */
+  serverReady: boolean;
+  /** 就绪探测这一次执行直接抛错（模拟执行器缺席/spawn 失败）：按未就绪处理，绝不外抛。 */
+  serverProbeThrows: boolean;
   runResults: ShellRunResult[];
   startCalls: ResolveRequest[];
   startedProcs: MockProc[];
@@ -601,6 +638,9 @@ function makeCtx(): MockCtx {
     versionProbeCalls: [],
     zgVersionResult: undefined,
     versionProbeThrows: false,
+    serverProbeCalls: [],
+    serverReady: false,
+    serverProbeThrows: false,
     runResults: [],
     startCalls: [],
     startedProcs: [],
@@ -609,6 +649,8 @@ function makeCtx(): MockCtx {
     resolve(spec) {
       if (spec.command === ZG_VERSION_COMMAND) {
         shell.versionProbeCalls.push(spec);
+      } else if (spec.command === ZG_SERVER_COMMAND) {
+        shell.serverProbeCalls.push(spec);
       } else {
         shell.resolveCalls.push(spec);
       }
@@ -621,10 +663,14 @@ function makeCtx(): MockCtx {
       // 这里只读两个字段，故先收成最小形状而不是断言成某个具体请求类型。
       const spec = rawSpec as { command: string; timeoutMs?: number };
       const isVersionProbe = spec.command === ZG_VERSION_COMMAND;
+      const isServerProbe = spec.command === ZG_SERVER_COMMAND;
+      if (isServerProbe && shell.serverProbeThrows) {
+        throw new Error(NO_EXECUTOR);
+      }
       const isBackground = spec.timeoutMs === undefined;
       if (isBackground) {
         if (shell.startThrows === "error") {
-          throw new Error("no such executor");
+          throw new Error(NO_EXECUTOR);
         }
         if (shell.startThrows === "alien") {
           // 跨 realm 抛出的 Error：本域 `instanceof Error` 为 false，走 String() 兜底
@@ -633,7 +679,7 @@ function makeCtx(): MockCtx {
         shell.startCalls.push(rawSpec as ResolveRequest);
       }
       if (isVersionProbe && shell.versionProbeThrows) {
-        throw new Error("no such executor");
+        throw new Error(NO_EXECUTOR);
       }
       const dfr = deferred();
       // 两条流各自的"已捕获全文"与故障开关：形状对齐官方 SubprocessOutputReader，
@@ -679,15 +725,23 @@ function makeCtx(): MockCtx {
         },
         killCount: 0,
         // 前台投影：队列按序消费（保持旧 run() 「发起时 shift」的取值次序）。
-        // 版本探测**不吃这条队列**：它不是被测命令的结果，是基础设施的一次自检。
-        result: async () =>
-          isVersionProbe
-            ? (shell.zgVersionResult ?? versionOkRun())
-            : (shell.runResults.shift() ?? {
-                exitCode: 0,
-                stdout: { text: "OK" },
-                stderr: { text: "" },
-              }),
+        // 版本与守护进程两发探测**都不吃这条队列**：它们不是被测命令的结果，是基础设施的
+        // 一次自检；混进队列会让每条断言命令结果的用例都被一次无关探测顶掉。
+        result: async () => {
+          if (isVersionProbe) {
+            return shell.zgVersionResult ?? versionOkRun();
+          }
+          if (isServerProbe) {
+            return serverProbeResult(shell.serverReady);
+          }
+          return (
+            shell.runResults.shift() ?? {
+              exitCode: 0,
+              stdout: { text: "OK" },
+              stderr: { text: "" },
+            }
+          );
+        },
       };
       if (isBackground) {
         shell.startedProcs.push(proc);
@@ -978,15 +1032,24 @@ function trackRoot(ctx: MockCtx, cwd: string, id = "sess-1"): void {
   guardOf(ctx)({ name: "read", arguments: {}, agent: { session: { id, header: { cwd } } } });
 }
 
-/** 引导端点 → { csrf, roots }。 */
-function fetchAccess(ctx: MockCtx): { csrf: string; roots: string[] } {
+/**
+ * 引导端点 → { csrf, roots, serverReady }。handler 是 async（守护进程就绪态要先探一发），
+ * 所以这里必须 await——同步写法拿到的是「还没写完的 res」，JSON.parse 直接空串报错。
+ */
+async function fetchAccess(
+  ctx: MockCtx,
+): Promise<{ csrf: string; roots: string[]; serverReady: boolean }> {
   const res = makeRes();
   const rootsRoute = routeOf(ctx, REBUILD_ROOTS_PATH);
-  // 引导端点是同步 handler
-  void rootsRoute.handler(makeReq({ method: "GET", url: REBUILD_ROOTS_PATH }), res);
-  const body = JSON.parse(res.body) as { ok: boolean; csrf: string; roots: string[] };
+  await rootsRoute.handler(makeReq({ method: "GET", url: REBUILD_ROOTS_PATH }), res);
+  const body = JSON.parse(res.body) as {
+    ok: boolean;
+    csrf: string;
+    roots: string[];
+    serverReady: boolean;
+  };
   assert.equal(body.ok, true);
-  return { csrf: body.csrf, roots: body.roots };
+  return { csrf: body.csrf, roots: body.roots, serverReady: body.serverReady };
 }
 
 /** 发起一次重建（默认带同源 + CSRF 两道锁）。 */
@@ -995,7 +1058,8 @@ async function postRebuild(
   root: string | null,
   opts?: { csrfToken?: string; extraHeaders?: Record<string, string>; streamError?: boolean },
 ): Promise<MockRes> {
-  const token = opts?.csrfToken ?? fetchAccess(ctx).csrf;
+  const issued = await fetchAccess(ctx);
+  const token = opts?.csrfToken ?? issued.csrf;
   const query = root === null ? "" : new URLSearchParams({ root }).toString();
   const res = makeRes();
   await routeOf(ctx, REBUILD_PATH).handler(
@@ -1103,6 +1167,33 @@ async function settleRebuilds(ctx: MockCtx, from: number): Promise<void> {
   }
   await settledTick();
 }
+
+/**
+ * 一棵真实的父子树。确认闸的判据现在与 `rootOf` 同源（都走 host.ts 的 `judgeRoot`），
+ * 而那条判据要看盘上有没有这棵树——拿 `/repo` 这类假想路径用例会误把「目录不存在」
+ * 那一臂当成「不必问」，判不到真正要钉的那条分支。
+ */
+function askTree(name = "ask"): { parent: string; child: string } {
+  const parent = bareWs(name);
+  const child = path.join(parent, "pkg");
+  mkdirSync(child, { recursive: true });
+  return { parent, child };
+}
+
+/** 一次显式要后台刷新的索引检索（守护进程收口判据的射程就在这一档）。 */
+async function backgroundSearch(ctx: MockCtx, root: string): Promise<unknown> {
+  const outcome = await toolOf(ctx, "zg_search").execute(
+    { root, query: "hi", refresh: "background" },
+    execOf(root),
+  );
+  return outcome;
+}
+
+/**
+ * 状态报告尾部那行守护进程注。替身缺省 `serverReady = false`（未就绪＝直连模式），
+ * 所以绝大多数用例期望的是 OFFLINE 那一臂。
+ */
+const DAEMON_OFFLINE_NOTE = `\n${MESSAGES.zh.serverUnavailableNote}`;
 
 function okRun(stdoutText = "OK"): ShellRunResult {
   return { exitCode: 0, stdout: { text: stdoutText, truncated: false }, stderr: { text: "" } };
@@ -1350,88 +1441,122 @@ describe("zg 版本门槛", () => {
 });
 
 describe("官方用户确认（tools/pre-execute → ctx.approval）", () => {
-  /** 本组反复出现的两个路径：一个未登记的 root、一个本会话工作区。 */
-  const CWD = "/repo";
-  const UNREGISTERED_ROOT = "/elsewhere";
-
-  it("默认关：任何显式 root 都直接放行（不打扰用户，也不改变既有行为）", async () => {
+  it("默认关：该被问的显式 root 也直接放行（不打扰用户，也不改变既有行为）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
-    const roots = [UNREGISTERED_ROOT, "/a/b/c"];
-    const verdicts = await allowVerdicts(
-      ctx,
-      roots.map((root) => ({ name: "zg_search", root, cwd: CWD })),
-    );
+    const { parent, child } = askTree();
+    // 两个方向都在「开关打开后该问」的那一类里（互为祖先/后代）。
+    const cases = [
+      { name: "zg_search", root: parent, cwd: child },
+      { name: "zg_search", root: child, cwd: parent },
+    ];
+    const verdicts = await allowVerdicts(ctx, cases);
     for (const [index, allow] of verdicts.entries()) {
-      assert.equal(allow, true, `默认部署不该发问（root=${roots[index]}）`);
+      assert.equal(allow, true, `默认部署不该发问（root=${cases[index]?.root}）`);
     }
   });
 
-  it("打开后：显式 root 既不是会话工作区、也未登记 → 返回 ask", async () => {
+  it("打开后：靠「与会话工作区互为祖先/后代」放行的显式 root → 返回 ask（双向都问）", async () => {
     const ctx = makeCtx();
     applyTo(ctx, { requireApprovalForExplicitRoot: true });
-    const { allow, decision } = await preExecuteOf(ctx, askExec("zg_search", "/repo/pkg", CWD));
-    assert.equal(allow, false, "该问的要问");
+    const { parent, child } = askTree();
+    // 会话开在子包、模型要检索仓库根：用户最该被问一句的那一类。
+    const { allow, decision } = await preExecuteOf(ctx, askExec("zg_search", parent, child));
+    assert.equal(allow, false, "祖先根该问");
     const ask = decision as {
       kind: string;
       reason?: string;
       displayReason?: { en: string; zh: string };
     };
     assert.equal(ask.kind, "ask");
-    assert.match(ask.reason ?? "", /\/repo\/pkg/u, "理由要回显那个 root");
-    assert.match(ask.displayReason?.zh ?? "", /\/repo\/pkg/u);
-    assert.match(ask.displayReason?.en ?? "", /\/repo\/pkg/u);
-    // 相对路径：归一那一步解析不了（assertAbsoluteRoot 抛错），于是按「需要问」处理——
-    // 问错一次的代价是一句提示，漏问的代价是把某个目录的内容读进上下文。
-    const relative = await preExecuteOf(ctx, askExec("zg_search", "some/relative", CWD));
-    assert.equal(relative.allow, false, "解析不了的 root 也要问，而不是当作会话工作区放行");
+    // 理由回显的是**判据归一后**的那个 root（不是模型原样写的那串）。
+    assert.ok((ask.reason ?? "").includes(parent), "理由要回显那个 root");
+    assert.ok((ask.displayReason?.zh ?? "").includes(parent));
+    assert.ok((ask.displayReason?.en ?? "").includes(parent));
+    // 反方向（会话在仓库根、要去检索子包）同样该问。
+    const down = await preExecuteOf(ctx, askExec("zg_status", child, parent));
+    assert.equal(down.allow, false, "后代根也该问");
+  });
+
+  it("注定被拒的显式 root 一律不问（旧写法在这里弹了一次换不来放行的确认）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    const { parent, child } = askTree();
+    const stranger = bareWs("stranger");
+    const doomed: { label: string; root: unknown; cwd: string | undefined }[] = [
+      // 与会话工作区毫无关系：授权那一支一律拒，批准也换不来放行。
+      { label: "越界的绝对路径", root: stranger, cwd: child },
+      // 相对路径：assertAbsoluteRoot 解析不了，拒在解析那一步。
+      { label: "相对路径", root: "some/relative", cwd: child },
+      // 同一棵树上但盘上没有：存在性预检拒。
+      { label: "不存在的目录", root: `${parent}/nope`, cwd: child },
+      // 没有会话工作区可作参照：授权判据无从谈起。
+      { label: "无会话工作区", root: parent, cwd: undefined },
+    ];
+    const verdicts = await allowVerdicts(
+      ctx,
+      doomed.map((one) => ({ name: "zg_search", root: one.root, cwd: one.cwd })),
+    );
+    for (const [index, allow] of verdicts.entries()) {
+      assert.equal(allow, true, `被拒的那一路不该问（${doomed[index]?.label}）`);
+    }
+    // 只加不减：这些 root 交给真正的执行体，照样是被拒而不是放行。
+    const ctx2 = makeCtx();
+    applyTo(ctx2, { requireApprovalForExplicitRoot: true });
+    await assert.rejects(
+      () => toolOf(ctx2, "zg_search").execute({ root: stranger, query: "hi" }, execOf(child)),
+      /未获授权|not authorized|root/u,
+    );
   });
 
   it("会话工作区本身、以及已登记的 root：不问（最不该被打扰的两类）", async () => {
     const ctx = makeCtx();
     applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    const { child } = askTree();
     // 同一个会话工作区：归一后相等（含尾部斜杠这种写法）。
-    const sameRoots = [CWD, `${CWD}/`];
+    const sameRoots = [child, `${child}/`];
     const sameVerdicts = await allowVerdicts(
       ctx,
-      sameRoots.map((root) => ({ name: "zg_search", root, cwd: CWD })),
+      sameRoots.map((root) => ({ name: "zg_search", root, cwd: child })),
     );
     for (const [index, allow] of sameVerdicts.entries()) {
       assert.equal(allow, true, `会话工作区不该被问（root=${sameRoots[index]}）`);
     }
     // 先跑一次工具把 root 登记进 ledger，再问同一个 root。
     const registered = ws("registered");
-    const child = path.join(registered, "pkg");
-    mkdirSync(child, { recursive: true });
+    const registeredChild = path.join(registered, "pkg");
+    mkdirSync(registeredChild, { recursive: true });
     ctx.shell.runResults.push(okRun("OK"));
-    await toolOf(ctx, "zg_status").execute({ root: child }, execOf(registered));
-    const after = await preExecuteOf(ctx, askExec("zg_status", child, "/somewhere-else"));
+    await toolOf(ctx, "zg_status").execute({ root: registeredChild }, execOf(registeredChild));
+    const after = await preExecuteOf(ctx, askExec("zg_status", registeredChild, "/somewhere-else"));
     assert.equal(after.allow, true, "本会话已登记过的 root 不该再问");
   });
 
   it("三个 zg 工具都问；别家工具一个字都不拦", async () => {
     const ctx = makeCtx();
     applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    const { parent, child } = askTree();
     const toolNames = ["zg_search", "zg_index", "zg_status"];
     const toolVerdicts = await allowVerdicts(
       ctx,
-      toolNames.map((tool) => ({ name: tool, root: UNREGISTERED_ROOT, cwd: CWD })),
+      toolNames.map((tool) => ({ name: tool, root: parent, cwd: child })),
     );
     for (const [index, allow] of toolVerdicts.entries()) {
       assert.equal(allow, false, `${toolNames[index]} 应当发问`);
     }
-    const foreign = await preExecuteOf(ctx, askExec("read", UNREGISTERED_ROOT, CWD));
+    const foreign = await preExecuteOf(ctx, askExec("read", parent, child));
     assert.equal(foreign.allow, true, "本插件不该对别家工具发问");
   });
 
   it("没给 root（走缺省）或给了非字符串：都不问", async () => {
     const ctx = makeCtx();
     applyTo(ctx, { requireApprovalForExplicitRoot: true });
+    const { parent, child } = askTree();
     // arguments 根本不是对象（官方面就是 unknown）：读不出 root，同样不问。
-    const oddArgs: unknown[] = [null, "not-an-object", 7, ["/elsewhere"]];
+    const oddArgs: unknown[] = [null, "not-an-object", 7, [parent]];
     const oddVerdicts = await Promise.all(
       oddArgs.map(async (raw): Promise<boolean> => {
-        const odd = await preExecuteOf(ctx, askExec("zg_search", undefined, CWD, raw));
+        const odd = await preExecuteOf(ctx, askExec("zg_search", undefined, child, raw));
         return odd.allow;
       }),
     );
@@ -1441,23 +1566,11 @@ describe("官方用户确认（tools/pre-execute → ctx.approval）", () => {
     const noRoots: unknown[] = [undefined, 42, "", "   ", null];
     const noVerdicts = await allowVerdicts(
       ctx,
-      noRoots.map((root) => ({ name: "zg_search", root, cwd: CWD })),
+      noRoots.map((root) => ({ name: "zg_search", root, cwd: child })),
     );
     for (const [index, allow] of noVerdicts.entries()) {
       assert.equal(allow, true, `没有可判的显式 root 就别问（root=${String(noRoots[index])}）`);
     }
-  });
-
-  it("无会话工作区（agent 缺席）时的显式 root：照问（此时最需要人看一眼）", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx, { requireApprovalForExplicitRoot: true });
-    const { allow, decision } = await preExecuteOf(
-      ctx,
-      askExec("zg_search", UNREGISTERED_ROOT, undefined),
-    );
-    assert.equal(allow, false);
-    const ask = decision as { reason?: string };
-    assert.match(ask.reason ?? "", /无会话工作区/u, "理由要说清没有会话工作区可作参照");
   });
 
   it("这道闸只加不减：批准之后 rootOf 的授权判据一字未改", async () => {
@@ -1985,7 +2098,8 @@ describe("zg_search 执行", () => {
           stdout: { text: "OUT-BOOM", truncated: false },
           stderr: blank.stderr,
         },
-        /^zg 执行失败（exit=4）：OUT-BOOM$/u,
+        // 尾部不锚：这条失败没有 Code: 行，后面还会补一段 --debug 指引（见下一条用例）。
+        /^zg 执行失败（exit=4）：OUT-BOOM/u,
       ],
     ];
     ctx.shell.runResults.push(...cases.map(([result]) => result));
@@ -2005,6 +2119,35 @@ describe("zg_search 执行", () => {
       ),
     );
     assert.equal(ctx.shell.resolveCalls.length, 4, "四次都真的跑了 shell");
+  });
+
+  it("无 `Code:` 行的失败补一条 --debug 指引；带码的不补", async () => {
+    ctx = makeCtx();
+    applyTo(ctx);
+    // 上游不带 --debug 时的塌法（实测 MODEL2VEC_DOWNLOAD_FAILED 会折成这一句，没有 Code 行）：
+    // 首次下载 embedding 权重就落在这一档，正是本包按码归因失效的那条链。
+    const uncodedRun: ShellRunResult = {
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: 'Failed to download model "local/qwen3-embedding-0.6b".', truncated: false },
+    };
+    // 结构化失败：带 `Code:` 行，本包据此就能归因，不必再塞一条指不到方向的 --debug 提示。
+    const codedRun: ShellRunResult = {
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: {
+        text: "Error: no workspace index\nCode: ZVEC_GREP.ENGINE.WORKSPACE_INDEX_NOT_FOUND",
+        truncated: false,
+      },
+    };
+    ctx.shell.runResults.push(uncodedRun, codedRun);
+    const search = toolOf(ctx, "zg_search");
+    const uncode = await reasonOf(search.execute({ root, query: "x" }, execOf(root)));
+    assert.match(uncode, /--debug/u, "无码失败要给出可行动的出路，而不是让模型对着 exit=1 猜");
+    assert.match(uncode, /Failed to download model/u, "原文照留，指引只是补在后面");
+    const coded = await reasonOf(search.execute({ root, query: "x" }, execOf(root)));
+    assert.ok(!coded.includes("--debug"), "带 Code: 行的失败不补无码指引");
+    assert.match(coded, /WORKSPACE_INDEX_NOT_FOUND/u);
   });
 
   it("沙箱 runner 失败：不归因给 zg 未安装，并交代 mode/enforcement", async () => {
@@ -2157,7 +2300,9 @@ describe("zg_search 执行", () => {
     const middle = fill(MESSAGES.zh.detailMiddle, { head: guardedHead, tail: guardedTail });
     const detailPart = fill(MESSAGES.zh.detailColon, { detail: middle });
     const expected = fill(MESSAGES.zh.genericFailure, { exit: 1, detail: detailPart });
-    assert.equal(rejected.message, expected);
+    // 这条失败没有 Code: 行 ⇒ 尾部还会补一段 --debug 指引（内容不在本条断言的射程内，
+    // 由「无码失败补指引」那条用例钉）；整串仍要走 isWellFormed——补的这段也进会话日志。
+    assert.equal(rejected.message, `${expected}\n${MESSAGES.zh.noErrorCodeHint}`);
     assert.equal(rejected.message.isWellFormed(), true, "进会话日志的拒绝消息含孤立代理");
   });
 
@@ -2504,7 +2649,7 @@ describe("zg_status 就绪判定", () => {
       { root, checkReady: true },
       execOf(root),
     )) as { text: string };
-    assert.equal(out.text, "READY");
+    assert.equal(out.text, `READY${DAEMON_OFFLINE_NOTE}`, "报告原样交回，尾部补一行守护进程就绪态");
   });
 
   it("未就绪：非零退出仍交回完整报告，并明说这不是执行失败", async () => {
@@ -2580,12 +2725,12 @@ describe("zg_status 就绪判定", () => {
 // ── 重建端点 ──────────────────────────────────────────────────────────────
 
 describe("rebuild-roots 引导端点", () => {
-  it("GET 回 CSRF token 与已观测工作区列表", () => {
+  it("GET 回 CSRF token 与已观测工作区列表", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("roots");
     trackRoot(ctx, root);
-    const access = fetchAccess(ctx);
+    const access = await fetchAccess(ctx);
     assert.equal(typeof access.csrf, "string");
     // 加严：原来只验 `length >= 16`，那连形态都不钉（hex 与 uuid 都过）⇒ 现与
     // 判据与 lesson-loop、ocr-review 两份 host 测试里的那条针同形。
@@ -2597,20 +2742,19 @@ describe("rebuild-roots 引导端点", () => {
     assert.deepEqual(access.roots, [root]);
   });
 
-  it("HEAD 允许、POST 405、跨源 403", () => {
+  it("HEAD 允许、POST 405、跨源 403", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const route = routeOf(ctx, REBUILD_ROOTS_PATH);
     const head = makeRes();
-    // 引导端点是同步 handler
-    void route.handler(makeReq({ method: "HEAD", url: REBUILD_ROOTS_PATH }), head);
+    await route.handler(makeReq({ method: "HEAD", url: REBUILD_ROOTS_PATH }), head);
     assert.equal(head.statusCode, 200);
     const post = makeRes();
-    void route.handler(makeReq({ method: "POST", url: REBUILD_ROOTS_PATH }), post);
+    await route.handler(makeReq({ method: "POST", url: REBUILD_ROOTS_PATH }), post);
     assert.equal(post.statusCode, 405);
     assert.equal(post.headers["Allow"], "GET");
     const cross = makeRes();
-    void route.handler(
+    await route.handler(
       makeReq({
         method: "GET",
         url: REBUILD_ROOTS_PATH,
@@ -2682,7 +2826,8 @@ describe("rebuild 启动端点", () => {
     applyTo(ctx);
     const root = ws("body");
     trackRoot(ctx, root);
-    const token = fetchAccess(ctx).csrf;
+    const access = await fetchAccess(ctx);
+    const token = access.csrf;
     const res = makeRes();
     await routeOf(ctx, REBUILD_PATH).handler(
       makeReq({
@@ -2768,7 +2913,8 @@ describe("rebuild 启动端点", () => {
     // URLSearchParams 把空格编码成 `+`：卡片提交的正是这种形式
     const encoded = new URLSearchParams({ root }).toString();
     assert.ok(encoded.includes("+"), "替身须真的走到 + 编码");
-    const token = fetchAccess(ctx).csrf;
+    const access = await fetchAccess(ctx);
+    const token = access.csrf;
     const res = makeRes();
     await routeOf(ctx, REBUILD_PATH).handler(
       makeReq({
@@ -2803,12 +2949,13 @@ describe("rebuild 启动端点", () => {
       roots.push(root);
       trackRoot(ctx, root);
     }
-    const access = fetchAccess(ctx);
+    const access = await fetchAccess(ctx);
     assert.equal(access.roots.length, 64);
     assert.ok(!access.roots.includes(roots[0] ?? ""), "最老的应被淘汰");
     assert.ok(access.roots.includes(roots[64] ?? ""));
     trackRoot(ctx, "relative/not-a-root");
-    assert.equal(fetchAccess(ctx).roots.length, 64, "非法 root 不入账");
+    const after = await fetchAccess(ctx);
+    assert.equal(after.roots.length, 64, "非法 root 不入账");
   });
 });
 
@@ -3236,7 +3383,8 @@ describe("rebuild-status 端点", () => {
     assert.match(res.body, /ctx\.jobs/u, "要把缺的那件点名，别只回「失败」");
     assert.equal(ctx.shell.startCalls.length, 0, "没有注册表就不该先把 zg 起起来");
     // 引导端点不依赖注册表：卡片仍能取 token 与候选（坏在最小的那一面）。
-    assert.ok(fetchAccess(ctx).csrf.length > 0);
+    const issued = await fetchAccess(ctx);
+    assert.ok(issued.csrf.length > 0);
     // 轮询端点在没有注册表时全 404（侧表是空的），不抛穿。
     await expectStatus(ctx, rebuildId(1), 404);
   });
@@ -4034,8 +4182,15 @@ describe("search-first 门禁", () => {
     assert.ok(reason.includes("zg_search"));
     assert.ok(reason.includes(tmp));
     assert.notEqual(
-      guard({ name: "bash", arguments: { command: "cat a | rg pattern" }, agent: agent() }),
+      guard({ name: "bash", arguments: { command: "cat a | rg pattern src/" }, agent: agent() }),
       undefined,
+      "管道下游带路径操作数仍算检索",
+    );
+    // 管道下游且无路径操作数 = 流过滤（ps aux | grep node）：不检索文件系统，放行。
+    assert.equal(
+      guard({ name: "bash", arguments: { command: "ps aux | grep node" }, agent: agent() }),
+      undefined,
+      "管道路由的 grep 不该被拦",
     );
   });
 
@@ -4425,8 +4580,8 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
 
   /** DNS 重绑定：Host 外域而 sec-fetch-site 与 Origin 自洽 ⇒ 只有 Host 腿拒得了。 */
   const REBINDING: Record<string, string> = {
-    host: "evil.test:8787",
-    origin: "http://evil.test:8787",
+    host: FOREIGN_HOST,
+    origin: `http://${FOREIGN_HOST}`,
     "sec-fetch-site": "same-origin",
   };
 
@@ -4443,7 +4598,7 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
     assert.doesNotMatch(res.body, /csrf/u, "被拒的响应体里泄露 token 等于闸门白装");
   });
 
-  it("servingNonLoopback 由 webServer.host 那枚绑定地址算出，不比字面量", () => {
+  it("servingNonLoopback 由 webServer.host 那枚绑定地址算出，不比字面量", async () => {
     // 钉的是 host.ts 那一行的接线（`isNonLoopbackBindHost(webServer.host)` ⇒ 喂给 guardTrust），
     // 不是 trust 的纯函数判据（那份在 shared 的 trust 测试里已经钉过，包括读真网卡的缺省臂）。
     // 宿主只拒**通配**地址，绑本机网卡的具体 IPv4 是合法配置，而旧写法 `=== "0.0.0.0"` 会把
@@ -4461,23 +4616,34 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
       { bind: "0.0.0.0", status: 200 },
       { bind: bindCase, status: 200 },
     ];
-    for (const entry of cases) {
-      const ctx = makeCtx();
-      // 缺省那一档靠「不写这一位」表达：`exactOptionalPropertyTypes` 下 `= undefined` 不合法。
-      if (entry.bind !== undefined) {
-        ctx.webServerHost = entry.bind;
-      }
-      applyTo(ctx);
-      const res = makeRes();
-      void routeOf(ctx, REBUILD_ROOTS_PATH).handler(
-        makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers }),
-        res,
+    const seen = await Promise.all(
+      cases.map(
+        async (entry): Promise<{ bind: string | undefined; status: number; res: MockRes }> => {
+          const ctx = makeCtx();
+          // 缺省那一档靠「不写这一位」表达：`exactOptionalPropertyTypes` 下 `= undefined` 不合法。
+          if (entry.bind !== undefined) {
+            ctx.webServerHost = entry.bind;
+          }
+          applyTo(ctx);
+          const res = makeRes();
+          await routeOf(ctx, REBUILD_ROOTS_PATH).handler(
+            makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers }),
+            res,
+          );
+          return { bind: entry.bind, status: entry.status, res };
+        },
+      ),
+    );
+    for (const entry of seen) {
+      assert.equal(
+        entry.res.statusCode,
+        entry.status,
+        `绑 ${String(entry.bind)} 时该回 ${entry.status}`,
       );
-      assert.equal(res.statusCode, entry.status, `绑 ${String(entry.bind)} 时该回 ${entry.status}`);
       if (entry.status === 200) {
-        assert.match(res.body, /csrf/u, "过闸的应答该照旧把 token 交给卡片");
+        assert.match(entry.res.body, /csrf/u, "过闸的应答该照旧把 token 交给卡片");
       } else {
-        assert.match(res.body, /untrusted host/u);
+        assert.match(entry.res.body, /untrusted host/u);
       }
     }
   });
@@ -4485,7 +4651,7 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
   it("写端点 rebuild：恶意 Host 即便带对 token 也在权威那一层被拒", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
-    const { csrf } = fetchAccess(ctx);
+    const { csrf } = await fetchAccess(ctx);
     const res = makeRes();
     await routeOf(ctx, REBUILD_PATH).handler(
       makeReq({
@@ -4508,7 +4674,7 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
       makeReq({
         method: "GET",
         url: REBUILD_ROOTS_PATH,
-        headers: { host: "evil.test:8787", "sec-fetch-site": SEC_FETCH_CROSS_SITE },
+        headers: { host: FOREIGN_HOST, "sec-fetch-site": SEC_FETCH_CROSS_SITE },
       }),
       res,
     );
@@ -4516,10 +4682,10 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
     assert.match(res.body, /untrusted host/u);
   });
 
-  it("缺 Host（本地 CLI 与全部既有手搓用例的常态）⇒ 闸门不插手，token 照常下发", () => {
+  it("缺 Host（本地 CLI 与全部既有手搓用例的常态）⇒ 闸门不插手，token 照常下发", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
-    const access = fetchAccess(ctx);
+    const access = await fetchAccess(ctx);
     assert.equal(typeof access.csrf, "string");
     assert.equal(typeof access.csrf, "string");
     assert.ok(access.csrf.length >= 36, "uuid 形态的 token（形状由上面那条针钉死）");
@@ -4533,7 +4699,7 @@ describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
       makeReq({
         method: "GET",
         url: REBUILD_ROOTS_PATH,
-        headers: { host: "127.0.0.1:8787", origin: "http://evil.test:8787" },
+        headers: { host: "127.0.0.1:8787", origin: `http://${FOREIGN_HOST}` },
       }),
       res,
     );
@@ -5362,7 +5528,7 @@ describe("root 授权", () => {
     applyTo(ctx);
     const root = ws();
     await searchIn(ctx, root, root);
-    const access = fetchAccess(ctx);
+    const access = await fetchAccess(ctx);
     assert.ok(access.roots.includes(root), "显式用过的根应出现在重建候选里");
   });
 
@@ -5372,7 +5538,7 @@ describe("root 授权", () => {
     const base = ws();
     await searchIn(ctx, `${base}/./`, base);
     await searchIn(ctx, `${base}//`, base);
-    const access = fetchAccess(ctx);
+    const access = await fetchAccess(ctx);
     assert.equal(access.roots.filter((entry) => entry === base).length, 1);
   });
 
@@ -5619,7 +5785,7 @@ describe("重建期检索通道", () => {
     // 占位已交还 ⇒ 状态查询走真读索引，而不是被「重建中」投影挡住。
     ctx.shell.runResults.push(okRun("READY"));
     const again = await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
-    assert.deepEqual(again, { text: "READY" });
+    assert.deepEqual(again, { text: `READY${DAEMON_OFFLINE_NOTE}` });
   });
 
   it("重建落定后状态查询回到真读索引", async () => {
@@ -5630,7 +5796,7 @@ describe("重建期检索通道", () => {
     await started.release();
     ctx.shell.runResults.push(okRun("READY"));
     const out = await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
-    assert.deepEqual(out, { text: "READY" });
+    assert.deepEqual(out, { text: `READY${DAEMON_OFFLINE_NOTE}` });
   });
 
   it("重建期放行根内 grep/rg：这是「检索失败 + grep 也被拦」双重死锁的出口", async () => {
@@ -5658,5 +5824,162 @@ describe("重建期检索通道", () => {
       agent: { session: { id: "sess-1", header: { cwd: other } } },
     });
     assert.notEqual(reason, undefined, "另一棵索引树没有活跃重建，仍应被拦");
+  });
+});
+
+describe("守护进程（zg server）就绪门槛", () => {
+  it("守护进程缺席：background 在构造期即拒，那条会静默关掉刷新的命令不发出去", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("bg-offline");
+    const before = ctx.shell.resolveCalls.length;
+    await assert.rejects(() => backgroundSearch(ctx, root), /zg server on/u);
+    assert.equal(ctx.shell.resolveCalls.length, before, "被拒的调用不该把命令发出去");
+    assert.equal(ctx.shell.serverProbeCalls.length, 1, "为这一档起了一发就绪探测");
+    assert.equal(
+      ctx.shell.serverProbeCalls[0]?.workdir,
+      tmpdir(),
+      "探测是纯读，不挂在被检索的工作区上（与工作区存在与否无关）",
+    );
+  });
+
+  it("守护进程就绪：background 照常下发 --refresh background", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("bg-ready");
+    ctx.shell.runResults.push(okRun("hits: 1"));
+    const out = (await backgroundSearch(ctx, root)) as { text: string };
+    assert.match(out.text, /hits/u);
+    assert.match(String(ctx.shell.resolveCalls[0]?.command), /--refresh background/u);
+  });
+
+  it("clientMode 被钉死 direct：background 拒在 mode-direct 那一档，且不起探测", async () => {
+    // 这一档叫用户去 `zg server on` 是指错方向的：模式是行 config 定的，守护进程起也到不了
+    // server 模式。既然结论与探测结果无关，就不该为它花一发子进程。
+    const ctx = makeCtx();
+    applyTo(ctx, { clientMode: "direct" });
+    const root = ws("bg-pinned");
+    await assert.rejects(() => backgroundSearch(ctx, root), /clientMode/u);
+    assert.equal(ctx.shell.serverProbeCalls.length, 0, "模式已经判死了，探测无从改变结论");
+    await assert.rejects(
+      () => backgroundSearch(ctx, root),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.ok(
+          !message.includes("zg server on"),
+          "钉死 direct 时不该给出「去起守护进程」那句出路",
+        );
+        return true;
+      },
+    );
+  });
+
+  it("缺省 refresh 不为没人要的档位起探测", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("bg-default");
+    ctx.shell.runResults.push(okRun("hits: 0"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.equal(ctx.shell.serverProbeCalls.length, 0, "wait 用不到守护进程，不必探");
+    assert.match(String(ctx.shell.resolveCalls[0]?.command), /--refresh wait/u);
+  });
+
+  it("探测结果带 TTL：同一次 apply 里两次 background 只探一发", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("bg-ttl");
+    await assert.rejects(() => backgroundSearch(ctx, root), /zg server on/u);
+    await assert.rejects(() => backgroundSearch(ctx, root), /zg server on/u);
+    assert.equal(ctx.shell.serverProbeCalls.length, 1, "第二次走的是缓存");
+  });
+
+  it("探测自身失败按未就绪收口，不外抛基础设施故障", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverProbeThrows = true;
+    const root = ws("bg-probe-throw");
+    await assert.rejects(
+      () => backgroundSearch(ctx, root),
+      /zg server on/u,
+      "模型该拿到的是收口文案，而不是 spawn 失败",
+    );
+  });
+
+  it("穷举通道不探守护进程：它本来就不接受 refresh", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = bareWs("rg-only");
+    ctx.shell.runResults.push(okRun("match"));
+    await assert.rejects(() => backgroundSearch(ctx, root), /refresh/u);
+    assert.equal(
+      ctx.shell.serverProbeCalls.length,
+      0,
+      "为一条注定被拒的命令多起一发探测是白给的开销",
+    );
+  });
+
+  it("zg_status 尾部回显就绪态：就绪与未就绪两臂各说各的", async () => {
+    const offline = makeCtx();
+    applyTo(offline);
+    const root = ws("status-daemon");
+    offline.shell.runResults.push(okRun("READY"));
+    const off = (await toolOf(offline, "zg_status").execute({ root }, execOf(root))) as {
+      text: string;
+    };
+    assert.ok(off.text.endsWith(MESSAGES.zh.serverUnavailableNote), "未就绪要说清后果与出路");
+    assert.match(off.text, /zg server on/u);
+
+    const ready = makeCtx();
+    applyTo(ready);
+    ready.shell.serverReady = true;
+    ready.shell.runResults.push(okRun("READY"));
+    const on = (await toolOf(ready, "zg_status").execute({ root }, execOf(root))) as {
+      text: string;
+    };
+    assert.ok(on.text.endsWith(MESSAGES.zh.serverReadyNote));
+    assert.ok(!on.text.includes(MESSAGES.zh.serverUnavailableNote), "就绪时不报未就绪的文案");
+  });
+
+  it("重建期合成投影那一臂不另起探测：契约本就是「不启子进程」", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("status-rebuild");
+    await rebuildInFlight(ctx, root);
+    // rebuildInFlight 里的引导端点会探一次（那是它自己的一档），这里只断言状态查询**没有**再加一发。
+    const before = ctx.shell.serverProbeCalls.length;
+    const out = (await toolOf(ctx, "zg_status").execute({ root }, execOf(root))) as {
+      text: string;
+    };
+    assert.match(out.text, /正在重建中/u);
+    assert.equal(
+      ctx.shell.serverProbeCalls.length,
+      before,
+      "这一臂连 zg status 都不起子进程，守护进程探测也不该起",
+    );
+  });
+
+  it("引导端点把就绪态交给卡片（缺席时是 false，不是把未知说成未就绪）", async () => {
+    const offline = makeCtx();
+    applyTo(offline);
+    const off = await fetchAccess(offline);
+    assert.equal(off.serverReady, false);
+    const ready = makeCtx();
+    applyTo(ready);
+    ready.shell.serverReady = true;
+    const on = await fetchAccess(ready);
+    assert.equal(on.serverReady, true);
+  });
+
+  it("被信任闸门拒掉的引导端点不起探测：拒一个请求不该先花一发子进程", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const res = makeRes();
+    await routeOf(ctx, REBUILD_ROOTS_PATH).handler(
+      makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers: { host: FOREIGN_HOST } }),
+      res,
+    );
+    assert.equal(res.statusCode, 403);
+    assert.equal(ctx.shell.serverProbeCalls.length, 0);
   });
 });

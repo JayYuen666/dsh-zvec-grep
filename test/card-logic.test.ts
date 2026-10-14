@@ -6,6 +6,7 @@ import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import {
   cardStore,
+  daemonNoteKey,
   draftFields,
   httpProblem,
   isOkBody,
@@ -505,5 +506,20 @@ describe("卡片逻辑文案双语", () => {
       httpProblem(true, 200, "text/html", tEn),
     ]);
     assert.doesNotMatch(rendered, /[\u4E00-\u9FFF]/u);
+  });
+});
+
+describe("daemonNoteKey：守护进程就绪态该显示哪一行", () => {
+  it("三档各归各处：未知不显示，而不是把未知说成未就绪", () => {
+    assert.equal(daemonNoteKey(undefined), undefined, "应答里没有这一档 ⇒ 不显示");
+    assert.equal(daemonNoteKey(false), "daemonOfflineNote");
+    assert.equal(daemonNoteKey(true), "daemonReadyNote");
+  });
+
+  it("选出来的两个键都在双语字典里（缺键会在运行时才 t() 出 undefined）", () => {
+    for (const key of ["daemonReadyNote", "daemonOfflineNote"] as const) {
+      assert.ok(UI_MESSAGES.zh[key].length > 0, `中文缺 ${key}`);
+      assert.ok(UI_MESSAGES.en[key].length > 0, `英文缺 ${key}`);
+    }
   });
 });

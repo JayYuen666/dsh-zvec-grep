@@ -42,10 +42,12 @@ const COMMAND_BREAK_CHARS = new Set(["|", ";", "&", "(", "\n", "\r", "`", "{", "
 /** 引号字符：词首开引号、词尾闭引号都只有这两个，用集合而不是逐字符比较。 */
 const QUOTE_CHARS = new Set(["'", '"']);
 
-/** 一个 shell token：文本（引号已剥除）+ 是否落在命令位。 */
+/** 一个 shell token：文本（引号已剥除）+ 是否落在命令位 + 是否由管道喂入。 */
 interface ShellToken {
   text: string;
   atCommand: boolean;
+  /** 该 token 紧跟在管道 `|` 之后：它的 stdin 是上一段命令的 stdout。 */
+  piped: boolean;
 }
 
 /**
@@ -77,14 +79,15 @@ function indexAfterComment(command: string, from: number): number {
  */
 function tokenizeShell(command: string): ShellToken[] {
   const tokens: ShellToken[] = [];
-  const state = { buffer: "", atCommand: true, quote: "" };
+  const state = { buffer: "", atCommand: true, pipedNext: false, quote: "" };
   const flush = (): void => {
     if (state.buffer.length > 0) {
-      tokens.push({ text: state.buffer, atCommand: state.atCommand });
+      tokens.push({ text: state.buffer, atCommand: state.atCommand, piped: state.pipedNext });
       state.buffer = "";
       // 只有真吐出 token 才消费掉命令位：`cat a | grep x` 里 `|` 与 `grep` 之间的
       // 那个空格也必须让位（空 flush 若清位，控制符后的第一个词就丢了命令位）。
       state.atCommand = false;
+      state.pipedNext = false;
     }
   };
   let index = 0;
@@ -110,6 +113,8 @@ function tokenizeShell(command: string): ShellToken[] {
     } else if (COMMAND_BREAK_CHARS.has(char)) {
       flush();
       state.atCommand = true;
+      // 只有管道把上一段的 stdout 接进下一段的 stdin；`;`、`&&` 之后的命令不是。
+      state.pipedNext = char === "|";
     } else if (TOKEN_BREAK_CHARS.has(char)) {
       flush();
     } else {
@@ -133,13 +138,13 @@ function baseName(text: string): string {
  * 挑出处在「被执行位置」的 token：串首 / 控制符之后 / 包装命令（git、xargs、
  * env…）之后的第一个实参。
  */
-function commandPositionTokens(tokens: ShellToken[]): ShellToken[] {
-  const out: ShellToken[] = [];
+function commandPositionIndexes(tokens: ShellToken[]): number[] {
+  const out: number[] = [];
   let afterPrefix = false;
-  for (const token of tokens) {
+  for (const [index, token] of tokens.entries()) {
     const isCommand: boolean = token.atCommand || afterPrefix;
     if (isCommand) {
-      out.push(token);
+      out.push(index);
     }
     afterPrefix = isCommand && SEARCH_PREFIX_WORDS.has(baseName(token.text));
   }
@@ -147,12 +152,46 @@ function commandPositionTokens(tokens: ShellToken[]): ShellToken[] {
 }
 
 /**
+ * 该命令位 token 之后的实参里是否出现路径形状的操作数（旗标不算）。
+ * `.` 与 `..` 都算：`grep foo .` 检索的就是当前工作区。
+ */
+function hasPathOperand(tokens: ShellToken[], from: number): boolean {
+  // 切片而不是带下标循环：切片里不可能有 undefined，省掉一个永远走不到的兜底分支
+  // （本仓覆盖率门禁是 100%，防御性分支要么有真触发路径、要么不写）。
+  for (const token of tokens.slice(from + 1)) {
+    if (token.atCommand) {
+      break;
+    }
+    const isFlag = token.text.startsWith("-");
+    if (
+      !isFlag &&
+      (token.text.startsWith("/") ||
+        token.text.includes("/") ||
+        token.text === "." ||
+        token.text === "..")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 识别 bash/pwsh 命令串里的 grep/rg 检索调用：引号/注释感知切词后，只认
  * **命令位**上的 token 名（basename）精确匹配 grep/egrep/fgrep/rg
- * （大小写不敏感）。管道 `… | grep foo`、绝对路径 `/usr/bin/rg foo`、
- * `git grep foo`、`find … | xargs grep TODO` 均算检索；`--grep=x` 选项、路径
- * 片段（grepbar）、引号内字面量与注释里的 grep 都不算。
- * 已知近似（均为漏拦方向，代价由 systemPrompt 路由文本兜底）：
+ * （大小写不敏感）。绝对路径 `/usr/bin/rg foo`、`git grep foo`、
+ * `find … | xargs grep TODO` 均算检索；`--grep=x` 选项、路径片段（grepbar）、
+ * 引号内字面量与注释里的 grep 都不算。
+ *
+ * **管道下游且不带路径操作数的那一类不算检索**（`ps aux | grep node`、
+ * `dscacheutil -q host | grep ip_address`、`env | grep KEY`）：它的输入是上一段
+ * 命令的 stdout，不检索文件系统，门禁要求的「先语义检索」对它无从谈起
+ * （实测：本机用 `dscacheutil … | grep` 查 DNS 被拦，属误拦）。
+ * 带路径操作数的管道调用照旧算检索；`cat a.txt | grep foo` 按此判据会被放行
+ * （上游确实读了工作区文件）——方向是漏拦，与 hasExternalTarget 的既有取舍同侧，
+ * 代价由 systemPrompt 路由文本兜底。
+ *
+ * 已知近似（均为漏拦方向）：
  *   - --help/--version/-V 豁免按整条命令判断（`rg a --version && grep b c`
  *     复合命令会漏拦 grep）；
  *   - shell 关键字（`for … ; do grep`、`if … ; then rg`）不是控制符，其后的
@@ -163,9 +202,13 @@ export function isGrepRgCommand(command: string): boolean {
   if (tokens.some((token) => PROBE_FLAGS.has(token.text))) {
     return false;
   }
-  return commandPositionTokens(tokens).some((token) =>
-    GREP_COMMAND_NAMES.has(baseName(token.text)),
-  );
+  return commandPositionIndexes(tokens).some((index) => {
+    const token = tokens[index];
+    if (token === undefined || !GREP_COMMAND_NAMES.has(baseName(token.text))) {
+      return false;
+    }
+    return !(token.piped && !hasPathOperand(tokens, index));
+  });
 }
 
 /** 去掉尾部斜杠的 root 归一化（'/' 自身保持 '/'）。 */

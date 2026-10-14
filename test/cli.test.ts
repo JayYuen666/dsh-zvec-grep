@@ -9,6 +9,7 @@ import {
   buildIndexCommand,
   buildStatusCommand,
   clientModeOf,
+  requestsBackgroundRefresh,
   DEFAULT_CLIENT_MODE,
   DEFAULT_PREVIEW,
   DEFAULT_REFRESH,
@@ -269,15 +270,72 @@ describe("buildSearchCommand", () => {
     assert.equal(DEFAULT_REFRESH, "wait");
   });
 
-  it("preview / refresh 显式取值原样透传（三档全收）", () => {
+  it("preview / refresh 显式取值原样透传（三档全收，background 要有守护进程）", () => {
     for (const preview of ["none", "short", "full"]) {
       for (const refresh of ["background", "wait", "off"]) {
+        // backgroundSupport="available"：这一档只钉透传形态，能不能用另两条用例钉。
         const { command } = buildSearchCommand(
           { root: "/ws", query: "x", preview, refresh },
           zhMessages,
+          undefined,
+          undefined,
+          "available",
         );
         assert.ok(command.includes(`--preview ${preview} --refresh ${refresh}`));
       }
+    }
+  });
+
+  it("refresh=background 的两种「用不了」各有各的文案，第三种才把命令拼出来", () => {
+    // 守护进程缺席：出路是起一个。
+    assert.throws(
+      () =>
+        buildSearchCommand({ root: "/ws", query: "x", refresh: "background" }, zhMessages, "auto"),
+      /zg server on/u,
+    );
+    // 部署钉死 direct：此时叫用户去起守护进程是指错方向，两句必须分得开。
+    // 这里手工取消息而不是 assert.throws + 校验函数：本仓的 promise 规则不许回调式断言。
+    let pinned = "";
+    try {
+      buildSearchCommand(
+        { root: "/ws", query: "x", refresh: "background" },
+        zhMessages,
+        "direct",
+        false,
+        "mode-direct",
+      );
+      assert.fail("钉死 direct 时 background 必须被拒");
+    } catch (error) {
+      pinned = error instanceof Error ? error.message : String(error);
+    }
+    assert.match(pinned, /clientMode/u, "钉死 direct 的那句要点名是模式问题");
+    assert.ok(!pinned.includes("zg server on"), "钉死 direct 的那句不该给出「去起守护进程」的出路");
+    // 可用时才落到命令行上。
+    const ok = buildSearchCommand(
+      { root: "/ws", query: "x", refresh: "background" },
+      zhMessages,
+      "server",
+      false,
+      "available",
+    );
+    assert.ok(ok.command.includes("--refresh background"));
+    // 缺省（不传判据）按**不可用**收：拿不到事实时保守拒绝，而不是把假话发给模型。
+    assert.throws(
+      () =>
+        buildSearchCommand({ root: "/ws", query: "x", refresh: "background" }, zhMessages, "auto"),
+      /refresh=background/u,
+    );
+    // wait / off 与守护进程无关，任何判据下都照常构造。
+    for (const refresh of ["wait", "off"]) {
+      const plain = buildSearchCommand({ root: "/ws", query: "x", refresh }, zhMessages);
+      assert.ok(plain.command.includes(`--refresh ${refresh}`));
+    }
+  });
+
+  it("requestsBackgroundRefresh 只认字面量 background，不替调用方校验取值", () => {
+    assert.equal(requestsBackgroundRefresh("background"), true);
+    for (const value of [undefined, null, "wait", "off", "Background", 1, ["background"]]) {
+      assert.equal(requestsBackgroundRefresh(value), false, `${String(value)} 不该触发探测`);
     }
   });
 
