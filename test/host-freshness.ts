@@ -4,7 +4,7 @@
 // vitest 的结构类规则（require-hook / consistent-test-it / valid-title）全部落到夹具上。
 //
 // 背景：host.ts / lib/*.ts 改后忘跑 node build-host.mjs，dsh 载入的仍是旧 host.js。client 侧
-// 早就有这道门（test/client-freshness.ts），host 侧此前一份门禁都没有，于是真实漏过一次：
+// 早就有这道门（test/client-freshness.ts），host 侧缺这道门时真实漏过一次：
 // danger-guard/host.js 的生成时间早于 host.ts 的下一次改动——产物已过期，而没有任何门会报出来。
 // settings.js 由同一份 builder 的另一条导出产出，同样没人看管，所以它进的是同一道门。
 // mtime 断言在 git clone / touch 下不稳定，故用**内容指纹**：内存构建（build-host.mjs 的纯函数

@@ -1,14 +1,13 @@
-// host.ts 集成测试：注册面（0.1.7 隐式设置投影 + 页面策略 / 3 工具 / 规则段 / guard /
-// webServer 端点）
+// host.ts 集成测试：注册面（0.1.7 隐式设置投影 + 页面策略 / 3 工具 / 规则段 / guard）
 // 与工具执行路径（经 mock shell 断言命令构造、文本透传、错误映射、沙箱事实、
-// stderr 降级提示），重建端点的两道锁（同源 + CSRF + 工作区白名单 + 目录存在），
+// stderr 降级提示），重建读面的两道锁（工作区白名单 + 目录存在），
 // 以及 search-first 门禁（真实 fs 临时索引目录 + 会话状态解锁）。
 //
 // 同步 fs（mkdtemp/mkdir/rm/exists）为门禁测试在真实临时目录建/清索引所必需
 // （root 现在要过 existsSync 预检，桩路径 /ws 会被判「目录不存在」），
 // 对应同步方法名已列入 oxlint.config.ts 的 node/no-sync ignores。可控延迟用
 // Promise.withResolvers（运行时 Node≥22 可用；lib=ES2024 无该静态成员故类型借道 cast）。
-import { describe, it, beforeAll, afterAll, vi } from "vitest";
+import { describe, it, beforeAll, vi } from "vitest";
 import assert from "node:assert/strict";
 import {
   existsSync,
@@ -19,7 +18,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { networkInterfaces, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -38,15 +37,19 @@ import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import { MESSAGES, fill } from "../lib/messages.ts";
 import { MINIMUM_ZG_VERSION } from "../lib/zg-version.ts";
 import { SECRET_EXCLUDE_GLOBS } from "../lib/argv-guard.ts";
+import type {
+  RebuildRoots,
+  RebuildSnapshot,
+  RebuildStartRequest,
+  RebuildStartResult,
+  RebuildStatusRequest,
+  RebuildStatusResult,
+} from "../lib/rebuild-shape.ts";
 
 // 默认密钥排除的命令行形态（由 lib/argv-guard.ts 单一来源派生，避免两处硬编码漂移）。
 // 旗标是 --iglob 而非 --glob：大小写不敏感、且排在用户 iglob 之后，理由见 lib/cli.ts 的 pushIndexGlobs。
 const SECRET_ARGS = SECRET_EXCLUDE_GLOBS.map((globStr) => `--iglob '${globStr}'`).join(" ");
 
-const REBUILD_PATH = "/_dsh/zvec-grep/rebuild";
-const REBUILD_STATUS_PATH = "/_dsh/zvec-grep/rebuild-status";
-const REBUILD_ROOTS_PATH = "/_dsh/zvec-grep/rebuild-roots";
-const CSRF_HEADER = "x-zvec-grep-csrf";
 /** host.ts 的 REBUILD_JOB_KIND（未导出，同值抄一份：改了名下面所有 id 字面量一起失效）。 */
 const JOB_KIND = "zvec-grep-rebuild";
 /**
@@ -55,8 +58,6 @@ const JOB_KIND = "zvec-grep-rebuild";
  * 引用常量会跟着一起漂移成自证，抄一份才让下面每条断言先红。
  */
 const MODELSCOPE_MIRROR = "https://modelscope.cn/models";
-/** Sec-Fetch-Site 的跨站取值：CSRF / DNS 重绑定用例里「外站来的」那一条腿。 */
-const SEC_FETCH_CROSS_SITE = "cross-site";
 /** 沙箱模式：工作区可写（denied / runnerFailed 两类降级事实都挂在这一档上）。 */
 const SANDBOX_WORKSPACE_WRITE = "workspace-write";
 /** zg 未安装时 shell 的报错原文：那是**数据**，本包只透传/归类，不改写也不翻译它。 */
@@ -84,8 +85,6 @@ const ZG_VERSION_COMMAND = "zg --version";
 const ZG_SERVER_COMMAND = "zg server status --check-ready";
 /** 执行器缺席时替身抛的那句（三处共用：后台 spawn、就绪探测、版本探测）。 */
 const NO_EXECUTOR = "no such executor";
-/** 外域 Host：DNS 重绑定那一类权威，只有信任闸门的 Host 腿拒得了。 */
-const FOREIGN_HOST = "evil.test:8787";
 /** 健康的本机 zg：恰好等于门槛值，故默认放行（实机 stdout 就是这一行 + 换行）。 */
 const ZG_VERSION_OK = `${MINIMUM_ZG_VERSION}\n`;
 
@@ -156,7 +155,8 @@ function makeIndexed(root: string): void {
   );
 }
 /**
- * 官方输出环的**字节**留存上限（宿主默认值，离线台架实测见 plugins/docs/harness/f3-equiv/probe-jobs.mjs）。
+ * 官方输出环的**字节**留存上限（宿主默认值，按官方件现解——见下面 `registryDefaults`，
+ * 它在 installed `@deepseek-ai/dsh-jobs-local` 的 `DEFAULT_RETAIN_BYTES` 上取值）。
  * 换装前这里是本包自己的 `JOB_OUT_MAX_BYTES`（名义字节、实按 UTF-16 码元）；换装后
  * 裁剪归注册表，本包只在 4000 字符的尾窗那一步按码元计数，两套单位不再混用。
  */
@@ -239,34 +239,17 @@ interface GuardExec extends MockExec {
   arguments?: unknown;
 }
 
+/** 宿主 webServer.register 收到的路由：这里只关心路径（断"一条路由也没注册"）。 */
+interface CapturedRoute {
+  path: string;
+  handler: unknown;
+}
+
 interface CapturedTool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
   execute: (args: unknown, exec?: MockExec) => Promise<unknown>;
-}
-
-/** 请求替身：guardBody 会 `for await` 读体，故必须可异步迭代。 */
-interface MockReq {
-  method?: string;
-  url?: string;
-  headers?: Record<string, string>;
-  streamError?: boolean;
-  [Symbol.asyncIterator]: () => AsyncIterator<string | Buffer>;
-}
-
-interface MockRes {
-  statusCode: number;
-  body: string;
-  headers: Record<string, string>;
-  setHeader: (key: string, value: string) => void;
-  writeHead: (code: number, headers?: Record<string, string>) => void;
-  end: (body: string) => void;
-}
-
-interface CapturedRoute {
-  path: string;
-  handler: (req: MockReq, res: MockRes) => void | Promise<void>;
 }
 
 interface StdoutShape {
@@ -402,6 +385,8 @@ interface MockCtx {
   noJobs: boolean;
   /** 官方注册表的实现本身（见 makeJobRegistry）；重建作业的真身都在它里面。 */
   jobs: LocalJobRegistry;
+  /** 已登记的作业号，按登记顺序（位置语义的唯一来源，见 withJobIdSink）。 */
+  jobIds: string[];
   /** 官方会话存储的活会话表：`id -> 它的父会话 id`（无父不出现在表里）。 */
   sessionLinks: Record<string, string>;
   /** true ⇒ ctx.get("sessions") 交不出会话存储（宿主没装 dsh-session 的那一档）。 */
@@ -421,6 +406,10 @@ interface MockCtx {
   timerCalls: { fn: () => void; ms: number }[];
   timer: { timeout: (fn: () => void, ms: number) => () => void };
   get: (name: string) => unknown;
+  /** 官方服务注册口（Remote 服务构造时用）；替身只把它存进 services。 */
+  reflect: { provide: (name: string, instance: unknown) => () => void };
+  /** 经 reflect.provide 注册的服务（`ctx.get` 的兜底读面）。 */
+  services: Record<string, unknown>;
   /** ctx.on(event, handler)：登记事件监听；替身按事件名分桶保存，供 preExecuteOf 串联瀑布。 */
   on: (
     event: string,
@@ -447,12 +436,27 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
  * 为什么不用假件：本包这次换装删掉的是自己实现过的环/容量/淘汰，替身若按"我以为的官方
  * 语义"写，测试就是在给我的理解作证——换装类改动最典型的假绿。直接起官方件，卡片契约
  * （status 词表、shown/total、已截断/缓冲区溢出两条打标）就被钉在真行为上；官方改了语义，
- * 这里先红。逐条实测语义见 plugins/docs/harness/f3-equiv/probe-jobs.mjs。
+ * 这里先红。
  *
  * 默认值全部经官方 schema 现解（只把泵拍压小，理由见 PUMP_MS），构造器吃已解析 config。
  */
 function makeJobRegistry(): LocalJobRegistry {
   return new LocalJobRegistry(new Context(), registryDefaults({ pumpPollMs: PUMP_MS }));
+}
+
+/**
+ * 官方发的作业号是 `<kind>-<randomUUID 前 16 位>`（不是 `<kind>-<序号>`），所以用例里任何
+ * "第 n 条"的位置语义都只能来自**登记时收下的号**。这枚壳把 start 的返回值按序记进 sink，
+ * 位置由发起顺序决定、与后来的淘汰无关。
+ */
+function withJobIdSink(registry: LocalJobRegistry, sink: string[]): LocalJobRegistry {
+  const start = registry.start.bind(registry);
+  registry.start = (spec: Parameters<LocalJobRegistry["start"]>[0]) => {
+    const id = start(spec);
+    sink.push(String(id));
+    return id;
+  };
+  return registry;
 }
 
 /**
@@ -475,58 +479,6 @@ async function settledTick(): Promise<void> {
   const gate = deferred();
   setImmediate(gate.resolve);
   return gate.promise;
-}
-
-function makeRes(): MockRes {
-  const res: MockRes = {
-    statusCode: 0,
-    body: "",
-    headers: {},
-    setHeader(key, value) {
-      res.headers[key] = value;
-    },
-    writeHead(code, headers) {
-      res.statusCode = code;
-      if (headers) {
-        Object.assign(res.headers, headers);
-      }
-    },
-    end(body) {
-      res.body = body;
-    },
-  };
-  return res;
-}
-
-function makeReq(init: {
-  method?: string;
-  url?: string;
-  headers?: Record<string, string>;
-  chunks?: (string | Buffer)[];
-  streamError?: boolean;
-}): MockReq {
-  const chunks = init.chunks ?? [];
-  return {
-    ...(init.method === undefined ? {} : { method: init.method }),
-    ...(init.url === undefined ? {} : { url: init.url }),
-    headers: init.headers ?? {},
-    ...(init.streamError === undefined ? {} : { streamError: init.streamError }),
-    [Symbol.asyncIterator]() {
-      let cursor = 0;
-      return {
-        async next(): Promise<IteratorResult<string | Buffer>> {
-          if (init.streamError === true) {
-            throw new Error("stream broke");
-          }
-          const chunk = chunks[cursor];
-          cursor += 1;
-          return chunk === undefined
-            ? { done: true, value: undefined }
-            : { done: false, value: chunk };
-        },
-      };
-    },
-  };
 }
 
 /** 占位方法：只需要「存在且是函数」，不需要行为。 */
@@ -628,6 +580,8 @@ function incompleteHosts(): unknown[] {
 }
 
 function makeCtx(): MockCtx {
+  /** 与 ctx.jobs 同一份数组：登记一条就追加一枚号（见 withJobIdSink）。 */
+  const jobIds: string[] = [];
   /** ctx.on 登记的事件监听（按事件名分桶）：pre-execute 那道用户确认闸就落在这里。 */
   const eventListeners = new Map<
     string,
@@ -750,6 +704,7 @@ function makeCtx(): MockCtx {
     },
   };
   const ctx: MockCtx = {
+    services: {},
     // 复刻 cordis 装载期的结果：volatile 字段的活值 = Config schema 的逐字段默认。
     // 用例要改设置就改这张表（引用现读，等价于用户在设置卡上写了一次）。
     settingsValue: schemaDefaults(),
@@ -763,7 +718,8 @@ function makeCtx(): MockCtx {
     effectDisposers: [],
     noWebServer: false,
     noJobs: false,
-    jobs: makeJobRegistry(),
+    jobs: withJobIdSink(makeJobRegistry(), jobIds),
+    jobIds,
     sessionLinks: {},
     noSessions: false,
     shell,
@@ -840,14 +796,25 @@ function makeCtx(): MockCtx {
       }
       if (name === "jobs") {
         // 官方注册表的实现本身（不是假件，理由见 makeJobRegistry）；noJobs 那一条
-        // 复刻"宿主没装 dsh-jobs-local"的档，此时重建端点必须回答不可用而不是抛穿。
+        // 复刻"宿主没装 dsh-jobs-local"的档，此时重建读面必须回答不可用而不是抛穿。
         // vanished = 第 N 次后台 spawn 之后服务被换掉那一档（判据按 startCalls 计数）。
         const vanished =
           shell.vanishJobsAfterExecute > 0 &&
           shell.startCalls.length >= shell.vanishJobsAfterExecute;
         return ctx.noJobs || vanished ? undefined : ctx.jobs;
       }
-      return ctx.noWebServer || name !== "webServer" ? undefined : webServer;
+      if (name === "webServer") {
+        return ctx.noWebServer ? undefined : webServer;
+      }
+      return ctx.services[name];
+    },
+    reflect: {
+      provide(name: string, instance: unknown) {
+        ctx.services[name] = instance;
+        return () => {
+          ctx.services[name] = undefined;
+        };
+      },
     },
     effect(factory) {
       const dispose = factory();
@@ -901,7 +868,7 @@ function liveConfigRefs(ctx: MockCtx): Record<string, unknown> {
  * win32 不可能到 100%，见 ci.yml 的那段注释）。
  *
  * 写成 `describe.skipIf(realRootUnavailable)` 而不是包一层别名：oxlint 的 vitest 规则按 `describe`
- * 字面量识别 suite，别名会让整个文件被当成一个作用域（实测 221 条 consistent-test-it 噪声）。
+ * 字面量识别 suite，别名会让整个文件被当成一个作用域，于是一片 consistent-test-it 噪声。
  */
 const realRootUnavailable = process.platform === "win32";
 
@@ -933,13 +900,6 @@ function ws(name = "root"): string {
   return created;
 }
 
-/** 名字里带空格的真实目录：验证 query 里 `+` 解码为空格。 */
-function wsWithSpace(): string {
-  const inner = path.join(ws("space"), "my ws");
-  mkdirSync(inner, { recursive: true });
-  return inner;
-}
-
 /**
  * 走真实 apply。第二参是**行 config**（组合包层/用户层行的 `config:`）：0.1.7 由
  * cordis 在装载期把它合进 schema 默认（显式 undefined 的字段不覆盖，等价于旧的
@@ -960,12 +920,6 @@ function toolOf(ctx: MockCtx, name: string): CapturedTool {
   const tool = ctx.toolsRegistered.find((entry) => entry.name === name);
   assert.ok(tool, `expected tool ${name}`);
   return tool;
-}
-
-function routeOf(ctx: MockCtx, url: string): CapturedRoute {
-  const route = ctx.routes.find((entry) => entry.path === url);
-  assert.ok(route, `expected route ${url}`);
-  return route;
 }
 
 function guardOf(ctx: MockCtx): (exec: GuardExec) => string | undefined {
@@ -1050,78 +1004,46 @@ function trackRoot(ctx: MockCtx, cwd: string, id = "sess-1"): void {
   guardOf(ctx)({ name: "read", arguments: {}, agent: { session: { id, header: { cwd } } } });
 }
 
-/**
- * 引导端点 → { csrf, roots, serverReady }。handler 是 async（守护进程就绪态要先探一发），
- * 所以这里必须 await——同步写法拿到的是「还没写完的 res」，JSON.parse 直接空串报错。
- */
-async function fetchAccess(
-  ctx: MockCtx,
-): Promise<{ csrf: string; roots: string[]; serverReady: boolean }> {
-  const res = makeRes();
-  const rootsRoute = routeOf(ctx, REBUILD_ROOTS_PATH);
-  await rootsRoute.handler(makeReq({ method: "GET", url: REBUILD_ROOTS_PATH }), res);
-  const body = JSON.parse(res.body) as {
-    ok: boolean;
-    csrf: string;
-    roots: string[];
-    serverReady: boolean;
-  };
-  assert.equal(body.ok, true);
-  return { csrf: body.csrf, roots: body.roots, serverReady: body.serverReady };
+/** 宿主服务 `zvecGrepRebuild` 的方法面投影：测试直调服务，经真实类型判读。 */
+interface RebuildApi {
+  roots: () => Promise<RebuildRoots>;
+  rebuild: (request: RebuildStartRequest) => Promise<RebuildStartResult>;
+  status: (request: RebuildStatusRequest) => Promise<RebuildStatusResult>;
 }
 
-/** 发起一次重建（默认带同源 + CSRF 两道锁）。 */
-async function postRebuild(
-  ctx: MockCtx,
-  root: string | null,
-  opts?: { csrfToken?: string; extraHeaders?: Record<string, string>; streamError?: boolean },
-): Promise<MockRes> {
-  const issued = await fetchAccess(ctx);
-  const token = opts?.csrfToken ?? issued.csrf;
-  const query = root === null ? "" : new URLSearchParams({ root }).toString();
-  const res = makeRes();
-  await routeOf(ctx, REBUILD_PATH).handler(
-    makeReq({
-      method: "POST",
-      url: `${REBUILD_PATH}?${query}`,
-      headers: { [CSRF_HEADER]: token, ...opts?.extraHeaders },
-      ...(opts?.streamError === undefined ? {} : { streamError: opts.streamError }),
-    }),
-    res,
-  );
-  return res;
+function rebuildApi(ctx: MockCtx): RebuildApi {
+  const service = ctx.services["zvecGrepRebuild"];
+  assert.ok(service !== undefined, "zvecGrepRebuild 没注册到替身上下文");
+  return service as RebuildApi;
 }
 
-async function fetchStatus(ctx: MockCtx, jobId: string | null): Promise<MockRes> {
-  const query = jobId === null ? "" : new URLSearchParams({ jobId }).toString();
-  const res = makeRes();
-  await routeOf(ctx, REBUILD_STATUS_PATH).handler(
-    makeReq({ method: "GET", url: `${REBUILD_STATUS_PATH}?${query}`, headers: {} }),
-    res,
-  );
-  return res;
+/** 拒绝侧保留的语义码（线上没有对应物）；成功侧按 200 读。 */
+function replyCode(reply: RebuildStartResult | RebuildStatusResult): number {
+  return reply.ok ? 200 : reply.status;
 }
 
-/** rebuild-status 的成功应答体（404 分支走 expectStatus + body 原文断言）。 */
-interface StatusBody {
-  ok: boolean;
-  /** 现在是**官方 JobStatus**：比原先的进程态多了 stopping（取消已发出）与 failed。 */
-  status: "running" | "stopping" | "completed" | "killed" | "failed";
-  exitCode: number | null;
-  root: string;
-  output: string;
-  sandbox?: { mode: string; denied: boolean; enforcement?: string; runnerFailed?: boolean };
+/** 失败原文（成功侧为空串），用于断言消息。 */
+function replyText(reply: RebuildStartResult | RebuildStatusResult): string {
+  return reply.ok ? "" : reply.error;
 }
 
-async function pollBody(ctx: MockCtx, jobId: string): Promise<StatusBody> {
-  const res = await fetchStatus(ctx, jobId);
-  assert.equal(res.statusCode, 200, res.body);
-  return JSON.parse(res.body) as StatusBody;
+async function fetchAccess(ctx: MockCtx): Promise<RebuildRoots> {
+  return rebuildApi(ctx).roots();
 }
 
-/** 宿主给本包第 N 条重建作业签发的 id（`<kind>-N`，实测台架第 3 条）。 */
-function rebuildId(index: number): string {
-  return `${JOB_KIND}-${String(index)}`;
+/** 发起一次重建。 */
+async function postRebuild(ctx: MockCtx, root: string | null): Promise<RebuildStartResult> {
+  return rebuildApi(ctx).rebuild({ root: root ?? "" });
+}
+
+async function fetchStatus(ctx: MockCtx, jobId: string | null): Promise<RebuildStatusResult> {
+  return rebuildApi(ctx).status({ jobId: jobId ?? "" });
+}
+
+async function pollBody(ctx: MockCtx, jobId: string): Promise<RebuildSnapshot> {
+  const value = await fetchStatus(ctx, jobId);
+  assert.ok(value.ok, replyText(value));
+  return value;
 }
 
 async function expectStatus(
@@ -1129,21 +1051,25 @@ async function expectStatus(
   jobId: string | null,
   code: number,
   message?: string,
-): Promise<MockRes> {
-  const res = await fetchStatus(ctx, jobId);
-  assert.equal(res.statusCode, code, message ?? res.body);
-  return res;
+): Promise<RebuildStatusResult> {
+  const value = await fetchStatus(ctx, jobId);
+  assert.equal(replyCode(value), code, message ?? replyText(value));
+  return value;
+}
+
+/** 第 index 次**登记成功**的作业号；没登记过（被容量拒、或没有注册表）就是 null，轮询那侧的答法是 404。 */
+function jobIdAt(ctx: MockCtx, index: number): string | null {
+  return ctx.jobIds[index - 1] ?? null;
 }
 
 /** 起一个重建 job，返回 { jobId, proc, status }。 */
 async function startJob(ctx: MockCtx, root: string): Promise<{ jobId: string; proc: MockProc }> {
   trackRoot(ctx, root);
-  const res = await postRebuild(ctx, root);
-  assert.equal(res.statusCode, 200, res.body);
-  const body = JSON.parse(res.body) as { jobId: string };
+  const value = await postRebuild(ctx, root);
+  assert.ok(value.ok, replyText(value));
   const [proc] = ctx.shell.startedProcs;
   assert.ok(proc, "expected a started process");
-  return { jobId: body.jobId, proc };
+  return { jobId: value.jobId, proc };
 }
 
 /**
@@ -1158,15 +1084,15 @@ async function startJob(ctx: MockCtx, root: string): Promise<{ jobId: string; pr
  * @returns {Promise<void>}
  */
 async function startRebuilds(ctx: MockCtx, base: string, count: number): Promise<void> {
-  const starts: Promise<MockRes>[] = [];
+  const starts: Promise<RebuildStartResult>[] = [];
   for (let index = 0; index < count; index += 1) {
     const root = ws(`${base}-${String(index)}`);
     trackRoot(ctx, root);
     starts.push(postRebuild(ctx, root));
   }
   const posted = await Promise.all(starts);
-  for (const res of posted) {
-    assert.equal(res.statusCode, 200, res.body);
+  for (const value of posted) {
+    assert.ok(value.ok, replyText(value));
   }
 }
 
@@ -1255,17 +1181,17 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
     assert.equal(ctx.shell.startCalls.length, 0);
   });
 
-  it("后台索引（设置卡重建端点那条路）也过门槛：一条 zg 都不起", async () => {
+  it("后台索引（设置卡重建读面那条路）也过门槛：一条 zg 都不起", async () => {
     const root = ws();
     const ctx = makeCtx();
     ctx.shell.zgVersionResult = oldVersionRun("0.2.1");
     applyTo(ctx);
     trackRoot(ctx, root);
     const res = await postRebuild(ctx, root);
-    assert.notEqual(res.statusCode, 200, "版本太老时端点不得回答 200");
+    assert.notEqual(replyCode(res), 200, "版本太老时读面不得回答成功");
     // 卡片只看得到响应体，所以可行动的文案必须真的落在 body 里（不是被吞进日志）。
-    assert.match(res.body, /zg 版本过低/u, "响应体要带回门槛文案");
-    assert.match(res.body, /0\.2\.1/u, "并回显实际版本");
+    assert.match(replyText(res), /zg 版本过低/u, "响应体要带回门槛文案");
+    assert.match(replyText(res), /0\.2\.1/u, "并回显实际版本");
     assert.equal(ctx.shell.startCalls.length, 0, "一条后台 zg 都不该起");
     // 门禁那一侧同样不消费配额：门槛没过就没有「已检索」这回事。
     assert.equal(ctx.shell.startedProcs.length, 0);
@@ -1729,17 +1655,18 @@ describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
     assert.notEqual(guard({ name: "zg_status", arguments: {} }), undefined);
   });
 
-  it("注册 rebuild / rebuild-roots / rebuild-status 三个端点", () => {
+  it("注册官方 Typert Remote 服务，不再注册自写 HTTP 端点", () => {
     const ctx = makeCtx();
     applyTo(ctx);
-    const paths = ctx.routes.map((route) => route.path).toSorted();
-    assert.deepEqual(paths, [REBUILD_PATH, REBUILD_ROOTS_PATH, REBUILD_STATUS_PATH]);
+    assert.ok(ctx.services["zvecGrepRebuild"] !== undefined, "Remote 服务必须注册上");
+    assert.deepEqual(ctx.routes, [], "HTTP 数据面已迁走，不该再注册路由");
   });
 
-  it("webServer 缺席时不注册端点（插件其余面照常工作）", () => {
+  it("webServer 缺席时 Remote 服务照常注册（插件其余面也照常工作）", () => {
     const ctx = makeCtx();
     ctx.noWebServer = true;
     applyTo(ctx);
+    assert.ok(ctx.services["zvecGrepRebuild"] !== undefined);
     assert.deepEqual(ctx.routes, []);
     assert.equal(ctx.toolsRegistered.length, 3);
   });
@@ -1753,7 +1680,7 @@ describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
     }
   });
 
-  it("卸载 effect 注销三个端点并终止在跑的重建进程", async () => {
+  it("卸载 effect 终止在跑的重建进程并清空侧表", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws();
@@ -1761,14 +1688,10 @@ describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
     for (const dispose of ctx.effectDisposers) {
       dispose();
     }
-    assert.deepEqual(ctx.unregistered.toSorted(), [
-      REBUILD_PATH,
-      REBUILD_ROOTS_PATH,
-      REBUILD_STATUS_PATH,
-    ]);
+    assert.deepEqual(ctx.routes, [], "HTTP 数据面本就不该存在");
     assert.equal(proc.killCount, 1);
     const status = await fetchStatus(ctx, "zvec-grep-rebuild-1");
-    assert.equal(status.statusCode, 404, "jobs 应已清空");
+    assert.equal(replyCode(status), 404, "侧表应已清空");
   });
 });
 
@@ -2285,6 +2208,16 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     assert.equal(ctx.shell.resolveCalls[0]?.env, undefined);
   });
 
+  it("hfEndpoint 为空/缺省时 rebuild 的 spec 也不传 env", async () => {
+    ctx = makeCtx();
+    ctx.settingsValue["hfEndpoint"] = "   ";
+    applyTo(ctx);
+    await startJob(ctx, ws("noenv-rb"));
+    const spawn = ctx.shell.resolveCalls.find((call) => call.command.startsWith("zg index"));
+    assert.ok(spawn);
+    assert.equal(spawn.env, undefined);
+  });
+
   // ── C4：failureDetail / successNotes 的两道切点都不许留孤立半代理 ──────────
   // 这两处的产物一条走 `throw new Error(...)`、一条并进**成功**的工具结果，两者都被宿主
   // 持久化进会话日志 ⇒ 与 ocr-review 的 failureDetail 是同一条缺陷、同一个 400 预算。
@@ -2727,7 +2660,7 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
     const root = ws("ready");
     trackRoot(ctx, root);
     const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(replyCode(res), 200, replyText(res));
     // 重建本身已经起过后台进程，基线要记在状态查询之前。
     const before = ctx.shell.resolveCalls.length;
     const out = (await toolOf(ctx, "zg_status").execute(
@@ -2740,242 +2673,7 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
   });
 });
 
-// ── 重建端点 ──────────────────────────────────────────────────────────────
-
-describe.skipIf(realRootUnavailable)("rebuild-roots 引导端点", () => {
-  it("GET 回 CSRF token 与已观测工作区列表", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const root = ws("roots");
-    trackRoot(ctx, root);
-    const access = await fetchAccess(ctx);
-    assert.equal(typeof access.csrf, "string");
-    // 加严：原来只验 `length >= 16`，那连形态都不钉（hex 与 uuid 都过）⇒ 现与
-    // 判据与 lesson-loop、ocr-review 两份 host 测试里的那条针同形。
-    assert.match(
-      access.csrf,
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
-      "token 形态要与全仓统一（uuid）",
-    );
-    assert.deepEqual(access.roots, [root]);
-  });
-
-  it("HEAD 允许、POST 405、跨源 403", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const route = routeOf(ctx, REBUILD_ROOTS_PATH);
-    const head = makeRes();
-    await route.handler(makeReq({ method: "HEAD", url: REBUILD_ROOTS_PATH }), head);
-    assert.equal(head.statusCode, 200);
-    const post = makeRes();
-    await route.handler(makeReq({ method: "POST", url: REBUILD_ROOTS_PATH }), post);
-    assert.equal(post.statusCode, 405);
-    assert.equal(post.headers["Allow"], "GET");
-    const cross = makeRes();
-    await route.handler(
-      makeReq({
-        method: "GET",
-        url: REBUILD_ROOTS_PATH,
-        headers: { "sec-fetch-site": SEC_FETCH_CROSS_SITE },
-      }),
-      cross,
-    );
-    assert.equal(cross.statusCode, 403);
-  });
-});
-
-describe.skipIf(realRootUnavailable)("rebuild 启动端点", () => {
-  it("POST 有效 root 返回 jobId 并启动带超时的后台进程", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const root = ws("start");
-    trackRoot(ctx, root);
-    const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 200);
-    const body = JSON.parse(res.body) as Record<string, unknown>;
-    assert.equal(body["ok"], true);
-    assert.equal(typeof body["jobId"], "string");
-    assert.equal(ctx.shell.startCalls.length, 1);
-    // 后台进程必须有超时兜底：resolve 显式带 onExpiry:'none'（宿主不挂 deadline），
-    // 唯一 deadline 由插件自己的 host.timer 提供。
-    assert.equal(ctx.timerCalls.length, 1);
-    assert.equal(ctx.timerCalls[0]?.ms, 10 * 60_000);
-    const [spec] = ctx.shell.startCalls;
-    assert.match(String(spec?.command), /--rebuild/u);
-    assert.equal(spec?.workdir, root);
-    // 后台请求的 stdout 缓冲上限同样走 Config（默认 = 原 STDOUT_MAX_BYTES 400k）。
-    assert.equal(spec.stdoutMaxBytes, 400_000);
-    // 回归护栏：0.1.7 的 bash-local resolve 缺省 onExpiry='kill'，后台漏传就会被
-    // 宿主缺省 timeoutMs（Config.timeoutMs 缺省 120s）杀掉长重建。
-    assert.equal(spec.onExpiry, "none");
-    assert.equal(spec.timeoutMs, undefined, "后台请求不得带宿主 timeoutMs");
-  });
-
-  it("非 POST → 405", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const res = makeRes();
-    await routeOf(ctx, REBUILD_PATH).handler(
-      makeReq({ method: "GET", url: `${REBUILD_PATH}?root=%2Fws` }),
-      res,
-    );
-    assert.equal(res.statusCode, 405);
-    assert.equal(res.headers["Allow"], "POST");
-  });
-
-  it("缺 CSRF / token 不符 / 跨源 → 403（动作端点两道锁）", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const root = ws("csrf");
-    trackRoot(ctx, root);
-    const noToken = await postRebuild(ctx, root, { csrfToken: "" });
-    assert.equal(noToken.statusCode, 403);
-    const wrongToken = await postRebuild(ctx, root, { csrfToken: "deadbeef" });
-    assert.equal(wrongToken.statusCode, 403);
-    const cross = await postRebuild(ctx, root, {
-      extraHeaders: { "sec-fetch-site": SEC_FETCH_CROSS_SITE },
-    });
-    assert.equal(cross.statusCode, 403);
-    assert.equal(ctx.shell.startCalls.length, 0, "被拒的请求不得启动进程");
-  });
-
-  it("body 超限 → 413；坏流 → 400", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const root = ws("body");
-    trackRoot(ctx, root);
-    const access = await fetchAccess(ctx);
-    const token = access.csrf;
-    const res = makeRes();
-    await routeOf(ctx, REBUILD_PATH).handler(
-      makeReq({
-        method: "POST",
-        url: `${REBUILD_PATH}?${new URLSearchParams({ root }).toString()}`,
-        headers: { [CSRF_HEADER]: token, "content-length": "99999" },
-      }),
-      res,
-    );
-    assert.equal(res.statusCode, 413);
-    const broken = await postRebuild(ctx, root, { streamError: true });
-    assert.equal(broken.statusCode, 400);
-  });
-
-  it("依赖抛出跨 realm 的 Error → 500 仍给可读原因", async () => {
-    const ctx = makeCtx();
-    ctx.shell.startThrows = "alien";
-    applyTo(ctx);
-    const root = ws("alien");
-    trackRoot(ctx, root);
-    const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 500);
-    assert.match(res.body, /启动重建失败.*from another realm/u);
-  });
-
-  it("hfEndpoint 未设置时后台进程也不带 env", async () => {
-    const ctx = makeCtx();
-    ctx.settingsValue["hfEndpoint"] = "";
-    applyTo(ctx);
-    const root = ws("noenv");
-    const { proc } = await startJob(ctx, root);
-    assert.equal((ctx.shell.startCalls[0] as { env?: unknown }).env, undefined);
-    assert.ok(proc.killCount === 0);
-  });
-
-  it("root 不在白名单 → 403（任意绝对路径不得被重建）", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const res = await postRebuild(ctx, "/etc");
-    assert.equal(res.statusCode, 403);
-    assert.match(res.body, /白名单/u);
-    assert.equal(ctx.shell.startCalls.length, 0);
-  });
-
-  it("root 非法（相对/缺参/越界）→ 400", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const relative = await postRebuild(ctx, "relative/path");
-    assert.equal(relative.statusCode, 400);
-    const missing = await postRebuild(ctx, null);
-    assert.equal(missing.statusCode, 400);
-    const escape = await postRebuild(ctx, "/../../etc");
-    assert.equal(escape.statusCode, 400);
-  });
-
-  it("白名单里的 root 已被删除 → 400（明确归因）", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const root = ws("gone");
-    trackRoot(ctx, root);
-    rmSync(root, { recursive: true, force: true });
-    const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 400);
-    assert.match(res.body, /已不存在/u);
-  });
-
-  it("shell.execute 抛错 → 500 且带原因", async () => {
-    const ctx = makeCtx();
-    ctx.shell.startThrows = "error";
-    applyTo(ctx);
-    const root = ws("startfail");
-    trackRoot(ctx, root);
-    const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 500);
-    assert.match(res.body, /启动重建失败/u);
-  });
-
-  it("query 解析：+ 解码为空格（URLSearchParams 语义）", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const root = wsWithSpace();
-    trackRoot(ctx, root);
-    // URLSearchParams 把空格编码成 `+`：卡片提交的正是这种形式
-    const encoded = new URLSearchParams({ root }).toString();
-    assert.ok(encoded.includes("+"), "替身须真的走到 + 编码");
-    const access = await fetchAccess(ctx);
-    const token = access.csrf;
-    const res = makeRes();
-    await routeOf(ctx, REBUILD_PATH).handler(
-      makeReq({
-        method: "POST",
-        url: `${REBUILD_PATH}?${encoded}`,
-        headers: { [CSRF_HEADER]: token },
-      }),
-      res,
-    );
-    assert.equal(res.statusCode, 200, res.body);
-    const { jobId } = JSON.parse(res.body) as { jobId: string };
-    const body = await pollBody(ctx, jobId);
-    assert.equal(body.root, root);
-    assert.ok(root.includes(" "), "替身目录名须含空格");
-  });
-
-  it("白名单按归一化键比较（尾斜杠/`.` 段同物异写不绕过）", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const root = ws("norm");
-    trackRoot(ctx, `${root}/./`);
-    const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 200, res.body);
-  });
-
-  it("白名单容量有界（超过 64 个按插入序淘汰最老）", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const roots: string[] = [];
-    for (let index = 0; index <= 64; index += 1) {
-      const root = `/ws-dir/case-${String(index)}`;
-      roots.push(root);
-      trackRoot(ctx, root);
-    }
-    const access = await fetchAccess(ctx);
-    assert.equal(access.roots.length, 64);
-    assert.ok(!access.roots.includes(roots[0] ?? ""), "最老的应被淘汰");
-    assert.ok(access.roots.includes(roots[64] ?? ""));
-    trackRoot(ctx, "relative/not-a-root");
-    const after = await fetchAccess(ctx);
-    assert.equal(after.roots.length, 64, "非法 root 不入账");
-  });
-});
+// ── 重建读面 ──────────────────────────────────────────────────────────────
 
 describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
   it("完成：status/exitCode 原样回给卡片（completed+exit≠0 不得显示成功）", async () => {
@@ -3027,7 +2725,7 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
     await settledTick();
     const body = await pollBody(ctx, jobId);
     assert.ok(body.output.includes("runner 启动失败"));
-    assert.equal(body.sandbox?.runnerFailed, true);
+    assert.equal((body.sandbox as { runnerFailed?: boolean } | undefined)?.runnerFailed, true);
   });
 
   it("沙箱策略拒绝：输出里给不完整警告（read-only 下写不了 .zvec-grep）", async () => {
@@ -3184,8 +2882,9 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
     proc.emit("stdout", "-after");
     await pumpTick();
     const res = await fetchStatus(ctx, jobId);
-    assert.equal(res.statusCode, 200);
-    const body = JSON.parse(res.body) as { output: string; status: string };
+    assert.equal(replyCode(res), 200);
+    assert.ok(res.ok, replyText(res));
+    const body = res;
     assert.match(body.output, /缓冲区溢出/u);
     // 抛错之前那一拍已经搬进环的内容不许被连带丢掉。
     assert.ok(body.output.includes("before the reader broke"));
@@ -3196,20 +2895,28 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
   });
 });
 
-describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
-  it("跨源 → 403", async () => {
+describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
+  it("没被观测过的 root → 403 白名单拒绝，且不起进程", async () => {
+    // 文件系统上存在不等于被本 daemon 观测过：不先经过一次工具调用登记，就不给重建。
+    // 这条不依赖真 zg，故放在单测面——e2e/集成层按 zgAvailable 跳过时它仍要盖住这道拒绝。
     const ctx = makeCtx();
     applyTo(ctx);
-    const res = makeRes();
-    await routeOf(ctx, REBUILD_STATUS_PATH).handler(
-      makeReq({
-        method: "GET",
-        url: `${REBUILD_STATUS_PATH}?jobId=zvec-grep-rebuild-1`,
-        headers: { "sec-fetch-site": SEC_FETCH_CROSS_SITE },
-      }),
-      res,
-    );
-    assert.equal(res.statusCode, 403);
+    const root = ws("untracked");
+    const res = await postRebuild(ctx, root);
+    assert.equal(replyCode(res), 403, replyText(res));
+    assert.match(replyText(res), /工作区白名单/u);
+    assert.equal(ctx.shell.startCalls.length, 0);
+  });
+
+  it("白名单里的 root 已被删除 → 拒绝且不起进程", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("gone");
+    trackRoot(ctx, root);
+    rmSync(root, { recursive: true, force: true });
+    const res = await postRebuild(ctx, root);
+    assert.equal(replyCode(res), 400, replyText(res));
+    assert.equal(ctx.shell.startCalls.length, 0);
   });
 
   it("jobId 缺省/空串/未知 → 404 且给出可行动说明", async () => {
@@ -3218,11 +2925,11 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     await expectStatus(ctx, null, 404);
     await expectStatus(ctx, "", 404);
     const res = await fetchStatus(ctx, "nope");
-    assert.equal(res.statusCode, 404);
+    assert.equal(replyCode(res), 404);
     // 文案里的历史窗口数字必须真在句子出现（卡片只有这一行可看）。
-    assert.match(res.body, /已移出历史窗口/u);
-    assert.match(res.body, /10 条/u, "404 要把窗口大小告诉用户");
-    assert.match(res.body, /请重新发起重建/u, "要给可行动下一步，不是裸 404");
+    assert.match(replyText(res), /已移出历史窗口/u);
+    assert.match(replyText(res), /10 条/u, "404 要把窗口大小告诉用户");
+    assert.match(replyText(res), /请重新发起重建/u, "要给可行动下一步，不是裸 404");
   });
 
   it("已知 jobId → running + root + exitCode 尚未产生", async () => {
@@ -3231,9 +2938,9 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     const root = ws("running");
     const { jobId } = await startJob(ctx, root);
     const res = await fetchStatus(ctx, jobId);
-    const body = JSON.parse(res.body) as { ok: boolean; status: string; root: string };
-    assert.equal(res.statusCode, 200);
-    assert.equal(body.ok, true);
+    assert.ok(res.ok, replyText(res));
+    const body = res;
+    assert.equal(replyCode(res), 200);
     assert.equal(body.status, "running");
     assert.equal(body.root, root);
   });
@@ -3249,13 +2956,13 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
       roots.push(root);
     }
     // 铺满容量（同步按序发起，jobId 即按此序分配），再统一等应答
-    const starts: Promise<MockRes>[] = [];
+    const starts: Promise<RebuildStartResult>[] = [];
     for (const root of roots) {
       starts.push(postRebuild(ctx, root));
     }
     const posted = await Promise.all(starts);
     for (const res of posted) {
-      assert.equal(res.statusCode, 200, res.body);
+      assert.equal(replyCode(res), 200, replyText(res));
     }
     assert.equal(ctx.shell.startedProcs.length, LIVE_CAP);
     // 第 LIVE_CAP+1 次：换装前这里会「终止并淘汰最老的运行中任务」，官方件的答法是
@@ -3263,14 +2970,14 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     const extra = ws("full-overflow");
     trackRoot(ctx, extra);
     const refused = await postRebuild(ctx, extra);
-    assert.equal(refused.statusCode, 500, refused.body);
+    assert.equal(replyCode(refused), 500, replyText(refused));
     // 满员这句在本包**所有**启动失败里最特殊：宿主原话是英文，而它恰恰最该翻成中文
     // （用户要做的是去收作业，不是读一句 "background job limit reached"）。
-    assert.match(refused.body, /后台作业已满/u);
-    assert.match(refused.body, /job_kill/u, "要给出可行动的下一步，而不是只说「失败」");
-    assert.match(refused.body, /10 条/u, "宿主给的上限数字要原样带出来");
+    assert.match(replyText(refused), /后台作业已满/u);
+    assert.match(replyText(refused), /job_kill/u, "要给出可行动的下一步，而不是只说「失败」");
+    assert.match(replyText(refused), /10 条/u, "宿主给的上限数字要原样带出来");
     assert.ok(
-      !refused.body.includes("background job limit reached"),
+      !replyText(refused).includes("background job limit reached"),
       "宿主英文原话不得整句混进中文卡片（双语口径）",
     );
     // 进程是先起后拒的（spawn 在注册之前）：拒绝时必须把它收掉，不能留一条没登记的 zg。
@@ -3280,9 +2987,9 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
       true,
       "在跑的十条一条都不许动",
     );
-    // 被拒不留半条记录：官方 id 序列仍是 1..LIVE_CAP
-    await expectStatus(ctx, rebuildId(LIVE_CAP), 200);
-    await expectStatus(ctx, rebuildId(LIVE_CAP + 1), 404);
+    // 被拒不留半条记录：第 LIVE_CAP+1 枚号压根没发出来
+    await expectStatus(ctx, jobIdAt(ctx, LIVE_CAP), 200);
+    await expectStatus(ctx, jobIdAt(ctx, LIVE_CAP + 1), 404);
   });
 
   it("历史窗口：只淘汰最老的**已落定**记录，窗口内的仍查得到", async () => {
@@ -3291,16 +2998,16 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     // 起满历史窗口并逐条落定（落定的作业不占并发桶，所以能一路起满）
     await startRebuilds(ctx, "history", HISTORY_MAX);
     await settleRebuilds(ctx, 0);
-    await expectStatus(ctx, rebuildId(1), 200);
+    await expectStatus(ctx, jobIdAt(ctx, 1), 200);
     // 不变量：**本 kind 在册记录（含进行中的那条）不超过 HISTORY_MAX 条**。裁剪发生在 start
     // 之前，剪到只剩 HISTORY_MAX-1 条已落定 ⇒ 新起的这条落定后正好 HISTORY_MAX 条，与卡片
-    // 文案「只保留最近 10 条已结束的重建」同一口径。（最初把这里判成"留 9 条差一格"是
-    // 看错了时点——只看了剪完那一刻；后来两份报告都实测到册子里出现 11 条，故回退。）
+    // 文案「只保留最近 10 条已结束的重建」同一口径。（判据的时点是**新作业落定之后**，
+    // 不是剪完那一刻——只看后者会误判成"留 9 条差一格"。）
     await startRebuilds(ctx, "history", 1);
     assert.equal(ctx.shell.startedProcs.length, HISTORY_MAX + 1);
-    await expectStatus(ctx, rebuildId(1), 404, "第 11 次启动把最老的已落定记录移出");
-    await expectStatus(ctx, rebuildId(2), 200);
-    await expectStatus(ctx, rebuildId(HISTORY_MAX + 1), 200);
+    await expectStatus(ctx, jobIdAt(ctx, 1), 404, "第 11 次启动把最老的已落定记录移出");
+    await expectStatus(ctx, jobIdAt(ctx, 2), 200);
+    await expectStatus(ctx, jobIdAt(ctx, HISTORY_MAX + 1), 200);
     // 侧表也必须跟着走：prune 里 `records.delete` 漏掉的话，这条幽灵会一直钉着 proc，
     // 并在卸载那一臂被当成在跑的作业再 kill 一次（下面那条断言就是这一行的牙齿）。
     const [evicted] = ctx.shell.startedProcs;
@@ -3325,8 +3032,8 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     const root = ws("vanish-mid");
     trackRoot(ctx, root);
     const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 503, res.body);
-    assert.match(res.body, /ctx\.jobs/u);
+    assert.equal(replyCode(res), 503, replyText(res));
+    assert.match(replyText(res), /ctx\.jobs/u);
     assert.equal(ctx.shell.startedProcs[0]?.killCount, 1, "进程起在注册之前，必须当场收掉");
     assert.equal(ctx.jobs.list().length, 0, "没有任何作业被登记");
   });
@@ -3339,8 +3046,9 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     const root = ws("dedup");
     const { jobId, proc } = await startJob(ctx, root);
     const again = await postRebuild(ctx, root);
-    assert.equal(again.statusCode, 200, again.body);
-    const second = JSON.parse(again.body) as { jobId: string; reused?: boolean };
+    assert.equal(replyCode(again), 200, replyText(again));
+    assert.ok(again.ok, replyText(again));
+    const second = again;
     assert.equal(second.jobId, jobId, "第二张面板跟随同一条作业");
     assert.equal(second.reused, true, "回执要说清这是复用，不是新起的一条");
     assert.equal(ctx.shell.startedProcs.length, 1, "第二条 zg 根本不该起来");
@@ -3349,30 +3057,30 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     proc.resolveDone();
     await settledTick();
     const third = await postRebuild(ctx, root);
-    assert.equal(third.statusCode, 200, third.body);
+    assert.equal(replyCode(third), 200, replyText(third));
     assert.equal(ctx.shell.startedProcs.length, 2, "那条落定之后再点才是真的一条新作业");
-    assert.equal((JSON.parse(third.body) as { reused?: boolean }).reused, undefined);
+    assert.ok(third.ok, replyText(third));
+    assert.equal(third.reused, undefined);
   });
 
-  it("jobs 被换成另一枚实例：同名 id 拒绝登记、只收自己刚起的那条", async () => {
-    // 实测两枚 LocalJobRegistry 对同一 kind 都签发 `zvec-grep-rebuild-1`（计数器是实例字段）。
-    // 顶掉旧记录会让旧面板从此跟着另一棵树走，故这里反过来：拒绝这条新的、杀掉它的进程，
-    // 旧那条的记录与超时臂原样留着。
+  it("jobs 被换成另一枚实例：新的起在正在服务的那枚里，旧面板改口 404", async () => {
+    // 官方号是 `<kind>-<16 位 hex>`，换一枚实例也不会重发同一个号，所以"新的一条撞上旧记录"
+    // 这一臂已经不存在：新的照常起在正在服务的实例里，旧号在新实例查不到 ⇒ 404，不串台。
     const ctx = makeCtx();
     applyTo(ctx);
-    const rootA = ws("clash-a");
+    const rootA = ws("swap-a");
     const { jobId, proc: procA } = await startJob(ctx, rootA);
     ctx.jobs = makeJobRegistry();
-    const rootB = ws("clash-b");
+    const rootB = ws("swap-b");
     trackRoot(ctx, rootB);
     const res = await postRebuild(ctx, rootB);
-    assert.equal(res.statusCode, 503, res.body);
-    assert.match(res.body, /服务已被替换/u, "要给出可行动的下一步（重载插件），别只说「失败」");
+    assert.equal(replyCode(res), 200, replyText(res));
     const [, procB] = ctx.shell.startedProcs;
-    assert.equal(procB?.killCount, 1, "新起的那条必须当场收掉");
-    assert.equal(procA.killCount, 0, "旧那条的进程不许被动");
-    // 旧卡片也读不到东西了：名册已换主，`bornAt` 对不上 ⇒ 宁 404 也不串台。
-    await expectStatus(ctx, jobId, 404, "身份证对不上时不许把另一枚实例的读数端给旧面板");
+    assert.equal(procB?.killCount, 0, "起成了就不该被收掉");
+    assert.equal(procA.killCount, 0, "旧那条不归这次动作管");
+    const [live] = ctx.jobs.list();
+    assert.ok(live, "新那条登记在正在服务的这枚实例里");
+    await expectStatus(ctx, jobId, 404, "名册换主后旧号读不到东西，也不该读到别人的");
   });
 
   it("两条通道都进环：卡片视图读得到 stdout 与 stderr（合并不许把哪一路丢掉）", async () => {
@@ -3397,14 +3105,14 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     const root = ws("nojobs");
     trackRoot(ctx, root);
     const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 503, res.body);
-    assert.match(res.body, /ctx\.jobs/u, "要把缺的那件点名，别只回「失败」");
+    assert.equal(replyCode(res), 503, replyText(res));
+    assert.match(replyText(res), /ctx\.jobs/u, "要把缺的那件点名，别只回「失败」");
     assert.equal(ctx.shell.startCalls.length, 0, "没有注册表就不该先把 zg 起起来");
     // 引导端点不依赖注册表：卡片仍能取 token 与候选（坏在最小的那一面）。
     const issued = await fetchAccess(ctx);
-    assert.ok(issued.csrf.length > 0);
+    assert.ok(Array.isArray(issued.roots), "引导读面不依赖注册表");
     // 轮询端点在没有注册表时全 404（侧表是空的），不抛穿。
-    await expectStatus(ctx, rebuildId(1), 404);
+    await expectStatus(ctx, jobIdAt(ctx, 1), 404);
   });
 
   it("ctx.jobs 晚到：先 503，服务到位后同一条端点就起得来（不靠重载插件）", async () => {
@@ -3416,17 +3124,18 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     const root = ws("latejobs");
     trackRoot(ctx, root);
     const denied = await postRebuild(ctx, root);
-    assert.equal(denied.statusCode, 503, denied.body);
+    assert.equal(replyCode(denied), 503, replyText(denied));
     ctx.noJobs = false;
     const granted = await postRebuild(ctx, root);
-    assert.equal(granted.statusCode, 200, granted.body);
+    assert.equal(replyCode(granted), 200, replyText(granted));
     assert.equal(ctx.jobs.list().length, 1, "作业登记进了真正在服务的这枚注册表");
   });
 
   it("注册表被重载：轮询回答 404，绝不把异常抛穿（否则卡片就此失明）", async () => {
     // 官方 disposeAll 会清空名册，而侧表里的记录还在（它还钉着 proc）。这条路径上
     // 抛穿到 webServer 的实测后果是"记一条日志 + 写一枚没有 body、没有 content-type 的 400"
-    // （installed dsh-host-webserver lib/index.js:246-256）⇒ 卡片判"取不到 JSON"⇒ error
+    // （installed dsh-host-webserver 里 `res.writeHead(400)` 那一支：没有 body、没有 content-type）
+    // ⇒ 卡片判"取不到 JSON"⇒ error
     // 终止态 ⇒ 停止轮询 ⇒ 一条还在跑的重建从界面上消失。
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3435,13 +3144,40 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     ctx.jobs = makeJobRegistry();
     await expectStatus(ctx, jobId, 404, "换了注册表就是查无此条，必须答 404");
     const gone = await fetchStatus(ctx, jobId);
-    assert.match(gone.body, /历史窗口/u, "404 要带可行动说明，而不是让卡片只显示「查询状态失败」");
+    assert.match(
+      replyText(gone),
+      /历史窗口/u,
+      "404 要带可行动说明，而不是让卡片只显示「查询状态失败」",
+    );
     // 进程归卸载那一臂收：重载后的注册表不再认得它，但它是本包起的（不能留孤儿 zg）。
     ctx.noJobs = true;
     for (const dispose of ctx.effectDisposers) {
       dispose();
     }
     assert.equal(proc.killCount, 1, "名册不认得也要把进程收掉");
+  });
+
+  it("同 id 指向另一条作业：身份证对不上就 404，不把别人的读数端给旧卡片", async () => {
+    // 官方号是 `<kind>-<16 位 hex>`，换一枚实例也不会重发同一个号 ⇒ 这条臂再也造不出公开入口。
+    // 身份证是读侧唯一的闸，所以这里用一枚只交出 get/list/readAt 的替身把输入钉住；视图从
+    // 官方投影复制、只改 label，形状不由本包自造。
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("identity-clash");
+    const { jobId } = await startJob(ctx, root);
+    const real = ctx.jobs;
+    const [mine] = real.list();
+    assert.ok(mine, "起了就该在名册里");
+    const foreign = { ...real.get(mine.id), label: "zg index /another/tree" };
+    ctx.jobs = {
+      get: () => foreign,
+      list: () => [foreign],
+      readAt: (id: Parameters<LocalJobRegistry["readAt"]>[0], offset: number) =>
+        real.readAt(id, offset),
+    } as unknown as LocalJobRegistry;
+    const res = await fetchStatus(ctx, jobId);
+    assert.equal(replyCode(res), 404, replyText(res));
+    assert.match(replyText(res), /历史窗口/u, "答的是查无此条，不是服务坏了");
   });
 
   it("已起作业后 jobs 消失：轮询回答 503 并点名缺的那件", async () => {
@@ -3451,8 +3187,8 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     const { jobId } = await startJob(ctx, root);
     ctx.noJobs = true;
     const res = await fetchStatus(ctx, jobId);
-    assert.equal(res.statusCode, 503, res.body);
-    assert.match(res.body, /ctx\.jobs/u);
+    assert.equal(replyCode(res), 503, replyText(res));
+    assert.match(replyText(res), /ctx\.jobs/u);
   });
 
   it("超时那一拍注册表被关掉：进程照样收掉，超时说明仍给到卡片", async () => {
@@ -3504,10 +3240,10 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
       throw new Error("timer service is gone");
     };
     const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 500, res.body);
-    assert.match(res.body, /启动重建失败/u);
-    assert.match(res.body, /timer service is gone/u);
-    assert.ok(!res.body.includes("后台作业已满"), "不是容量问题就别报容量");
+    assert.equal(replyCode(res), 500, replyText(res));
+    assert.match(replyText(res), /启动重建失败/u);
+    assert.match(replyText(res), /timer service is gone/u);
+    assert.ok(!replyText(res).includes("后台作业已满"), "不是容量问题就别报容量");
     assert.equal(ctx.shell.startedProcs[0]?.killCount, 1, "起都起不来的那条 zg 必须立杀");
     assert.equal(ctx.jobs.list().length, 0, "官方件对 starter 抛错的答法是不注册（序号作废）");
     // 侧表也不能留着它：那条记录钉着一枚 proc，卸载臂会把它当自己的作业再 kill 一次。
@@ -3558,14 +3294,10 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
       run: () => ({ cancel: noop, done: Promise.resolve({ status: "completed" as const }) }),
     });
     detachBash();
-    assert.equal(
-      ctx.jobs
-        .list()
-        .map((job) => job.id)
-        .join(","),
-      "bash-1",
-    );
-    await expectStatus(ctx, "bash-1", 404, "别人的作业不得经本包端点外泄");
+    const [foreignBash] = ctx.jobs.list();
+    assert.ok(foreignBash, "别人的那条应登记在同一枚实例里");
+    assert.equal(ctx.jobs.list().length, 1, "本包这条没起，名册里只有别人的");
+    await expectStatus(ctx, String(foreignBash.id), 404, "别人的作业不得经本包端点外泄");
   });
 
   it("模型侧 job_kill 收掉重建：stopping 按「仍在跑」应答，落定后是 killed", async () => {
@@ -3613,8 +3345,14 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     // 到这一步才有第 11 条已落定记录：多出的最老那条先走，正在收尾的那条例外不动。
     await startRebuilds(ctx, "prunelive", 1);
     const ids = ctx.jobs.list().map((job) => `${String(job.id)}:${job.status}`);
-    assert.ok(ids.includes(`${rebuildId(1)}:stopping`), `stopping 那条必须还在：${ids.join(" ")}`);
-    assert.ok(!ids.includes(`${rebuildId(2)}:completed`), `已落定的最老那条先走：${ids.join(" ")}`);
+    const stoppingId = jobIdAt(ctx, 1);
+    const oldestSettledId = jobIdAt(ctx, 2);
+    assert.ok(stoppingId !== null && oldestSettledId !== null, "这两条都登记过");
+    assert.ok(ids.includes(`${stoppingId}:stopping`), `stopping 那条必须还在：${ids.join(" ")}`);
+    assert.ok(
+      !ids.includes(`${oldestSettledId}:completed`),
+      `已落定的最老那条先走：${ids.join(" ")}`,
+    );
     assert.equal(proc.killCount, 1, "取消只发过一次");
   });
 
@@ -3642,7 +3380,9 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
       ["stopping"],
       "落定的那条已被 remove；在跑的那条只能被 kill（此刻还在收，官方件不许删）",
     );
-    assert.equal(String(left[0]?.id), rebuildId(2), "被 remove 的必须是最老的那条已落定记录");
+    const secondId = jobIdAt(ctx, 2);
+    assert.ok(secondId !== null, "第二条登记过");
+    assert.equal(String(left[0]?.id), secondId, "被 remove 的必须是最老的那条已落定记录");
     assert.equal(runningProc.killCount, 1, "在跑的进程必须经注册表 kill 收到（cancel 那一臂）");
     assert.equal(settledProc.killCount, 0, "已落定不必再 kill");
     // 卸载那条理由要模型看得见（否则它与"用户手工 job_kill"同形）。注意别再补一次 kill：
@@ -3711,7 +3451,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 端点", () => {
     assert.throws(() => ctx.jobs.start(spec), /no job controller serves this agent/u);
     trackRoot(ctx, root);
     const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(replyCode(res), 200, replyText(res));
     // 起完之后再裸 start 仍是拒：本包那枚 token 只在 start 期间挂着。
     // 留一枚常驻 token 的后果是"宿主故意没装 job 工具"的组成里，本包替全宿主把 gate
     // 开着——官方契约写的是"生产者不能起一台 owner 收不掉、停不掉的作业"。
@@ -4505,13 +4245,9 @@ describe.skipIf(realRootUnavailable)("host 侧文案双语", () => {
     );
     const reason = guardOf(ctx)({ name: "zg_index", arguments: { root: "/ws" } });
     assert.match(reason ?? "", /requires an explicit user request/u);
-    const res = makeRes();
-    await routeOf(ctx, REBUILD_STATUS_PATH).handler(
-      makeReq({ method: "GET", url: `${REBUILD_STATUS_PATH}?jobId=zvec-grep-rebuild-9` }),
-      res,
-    );
-    assert.equal(res.statusCode, 404);
-    assert.match(res.body, /left the history window/u);
+    const res = await fetchStatus(ctx, "zvec-grep-rebuild-9");
+    assert.equal(replyCode(res), 404);
+    assert.match(replyText(res), /left the history window/u);
   });
 });
 
@@ -4566,163 +4302,6 @@ describe("0.1.7 隐式注册验收", () => {
         "requireApprovalForExplicitRoot",
       ].toSorted(),
     );
-  });
-});
-
-/** 本机网卡上的非回环 IPv4：`@jayyuen66/dsh-plugin-shared/lib/trust` 的 `interfaceAddresses`
- *  只认"确属本机网卡"的那批地址。
- *  取不到就响亮失败而不是跳过——这条用例是本包唯一把 `servingNonLoopback` 拨到 **true** 的
- *  接线（替身没有 `host` 成员时，那道锁在真实接线上永为合着）。 */
-function lanIpv4(): string {
-  for (const infos of Object.values(networkInterfaces())) {
-    for (const info of infos ?? []) {
-      if (info.family === "IPv4" && !info.internal) {
-        return info.address;
-      }
-    }
-  }
-  throw new Error("这台机器上没有非回环 IPv4 网卡地址：非回环服务面的接线用例无法构造");
-}
-
-describe("信任闸门：/_dsh/zvec-grep/* 的三条路由", () => {
-  // 文件级临时目录回收：require-top-level-describe 不许 hook 裸在文件根，而只含 hook 的
-  // describe 会被 vitest 判 "No test found in suite" ⇒ 挂在本文件最后一套套件上（套件按
-  // 声明顺序串行跑，触发时刻与原来的文件根 afterAll 相同）。新增顶层套件要排在其后，否则
-  // 新套件建的临时目录没人收（rmSync 带 force，漏收只留目录，不改用例结论）。
-  afterAll(() => {
-    for (const dir of createdDirs) {
-      rmSync(dir, { recursive: true, force: true });
-    }
-    createdDirs.length = 0;
-  });
-
-  /** DNS 重绑定：Host 外域而 sec-fetch-site 与 Origin 自洽 ⇒ 只有 Host 腿拒得了。 */
-  const REBINDING: Record<string, string> = {
-    host: FOREIGN_HOST,
-    origin: `http://${FOREIGN_HOST}`,
-    "sec-fetch-site": "same-origin",
-  };
-
-  it("引导端点（发 token 的那条 GET）被重绑定 ⇒ 403，且体里不许带出 csrf", () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const res = makeRes();
-    void routeOf(ctx, REBUILD_ROOTS_PATH).handler(
-      makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers: REBINDING }),
-      res,
-    );
-    assert.equal(res.statusCode, 403);
-    assert.match(res.body, /untrusted host/u);
-    assert.doesNotMatch(res.body, /csrf/u, "被拒的响应体里泄露 token 等于闸门白装");
-  });
-
-  it("servingNonLoopback 由 webServer.host 那枚绑定地址算出，不比字面量", async () => {
-    // 钉的是 host.ts 那一行的接线（`isNonLoopbackBindHost(webServer.host)` ⇒ 喂给 guardTrust），
-    // 不是 trust 的纯函数判据（那份在 shared 的 trust 测试里已经钉过，包括读真网卡的缺省臂）。
-    // 宿主只拒**通配**地址，绑本机网卡的具体 IPv4 是合法配置，而旧写法 `=== "0.0.0.0"` 会把
-    // 这一面读成回环服务，于是同网段一方拿着网卡权威就能过动作端点的闸门。写死 false 由第三、
-    // 四档抓，写死 true 由第一、二档抓。
-    const bindCase = lanIpv4();
-    const headers = {
-      host: `${bindCase}:8787`,
-      origin: `http://${bindCase}:8787`,
-      "sec-fetch-site": "same-origin",
-    };
-    const cases: readonly { bind?: string; status: number }[] = [
-      { status: 403 },
-      { bind: "127.0.0.1", status: 403 },
-      { bind: "0.0.0.0", status: 200 },
-      { bind: bindCase, status: 200 },
-    ];
-    const seen = await Promise.all(
-      cases.map(
-        async (entry): Promise<{ bind: string | undefined; status: number; res: MockRes }> => {
-          const ctx = makeCtx();
-          // 缺省那一档靠「不写这一位」表达：`exactOptionalPropertyTypes` 下 `= undefined` 不合法。
-          if (entry.bind !== undefined) {
-            ctx.webServerHost = entry.bind;
-          }
-          applyTo(ctx);
-          const res = makeRes();
-          await routeOf(ctx, REBUILD_ROOTS_PATH).handler(
-            makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers }),
-            res,
-          );
-          return { bind: entry.bind, status: entry.status, res };
-        },
-      ),
-    );
-    for (const entry of seen) {
-      assert.equal(
-        entry.res.statusCode,
-        entry.status,
-        `绑 ${String(entry.bind)} 时该回 ${entry.status}`,
-      );
-      if (entry.status === 200) {
-        assert.match(entry.res.body, /csrf/u, "过闸的应答该照旧把 token 交给卡片");
-      } else {
-        assert.match(entry.res.body, /untrusted host/u);
-      }
-    }
-  });
-
-  it("写端点 rebuild：恶意 Host 即便带对 token 也在权威那一层被拒", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const { csrf } = await fetchAccess(ctx);
-    const res = makeRes();
-    await routeOf(ctx, REBUILD_PATH).handler(
-      makeReq({
-        method: "POST",
-        url: REBUILD_PATH,
-        headers: { ...REBINDING, "x-zvec-grep-csrf": csrf },
-        chunks: [JSON.stringify({ root: "/tmp/definitely-not-a-workspace" })],
-      }),
-      res,
-    );
-    assert.equal(res.statusCode, 403);
-    assert.match(res.body, /untrusted host/u);
-  });
-
-  it("判据次序：恶意 Host 与 cross-site 同现时报 Host 腿那句", () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const res = makeRes();
-    void routeOf(ctx, REBUILD_ROOTS_PATH).handler(
-      makeReq({
-        method: "GET",
-        url: REBUILD_ROOTS_PATH,
-        headers: { host: FOREIGN_HOST, "sec-fetch-site": SEC_FETCH_CROSS_SITE },
-      }),
-      res,
-    );
-    assert.equal(res.statusCode, 403);
-    assert.match(res.body, /untrusted host/u);
-  });
-
-  it("缺 Host（本地 CLI 与全部既有手搓用例的常态）⇒ 闸门不插手，token 照常下发", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const access = await fetchAccess(ctx);
-    assert.equal(typeof access.csrf, "string");
-    assert.equal(typeof access.csrf, "string");
-    assert.ok(access.csrf.length >= 36, "uuid 形态的 token（形状由上面那条针钉死）");
-  });
-
-  it("回环 Host + 异源 Origin ⇒ 拒（这条与 Host 腿无关，钉的是 Origin 腿还在）", () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const res = makeRes();
-    void routeOf(ctx, REBUILD_ROOTS_PATH).handler(
-      makeReq({
-        method: "GET",
-        url: REBUILD_ROOTS_PATH,
-        headers: { host: "127.0.0.1:8787", origin: `http://${FOREIGN_HOST}` },
-      }),
-      res,
-    );
-    assert.equal(res.statusCode, 403);
-    assert.match(res.body, /cross-origin/u);
   });
 });
 
@@ -4782,7 +4361,7 @@ async function rebuildInFlight(
   trackRoot(ctx, root);
   const before = ctx.shell.startedProcs.length;
   const res = await postRebuild(ctx, root);
-  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(replyCode(res), 200, replyText(res));
   return { release: () => settleRebuilds(ctx, before) };
 }
 
@@ -4847,7 +4426,7 @@ describe.skipIf(realRootUnavailable)("模型侧后台索引", () => {
     const started = ctx.jobs.list();
     assert.equal(started.length, 1, "应登记进官方名册");
     const polled = await fetchStatus(ctx, started[0]?.id ?? "");
-    assert.equal(polled.statusCode, 200, `卡片轮询端点要认这条作业：${polled.body}`);
+    assert.equal(replyCode(polled), 200, `卡片轮询端点要认这条作业：${replyText(polled)}`);
     assert.ok(out.text.includes(started[0]?.id ?? "x"), "交回的作业号要与名册一致");
   });
 
@@ -4860,8 +4439,8 @@ describe.skipIf(realRootUnavailable)("模型侧后台索引", () => {
     const mine = ctx.jobs.list()[0]?.id;
     const before = ctx.shell.startedProcs.length;
     const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 200, "同根已在跑，卡片应跟随而不是拒绝");
-    const followed: unknown = JSON.parse(res.body);
+    assert.equal(replyCode(res), 200, "同根已在跑，卡片应跟随而不是拒绝");
+    const followed: unknown = res;
     assert.equal(
       typeof followed === "object" && followed !== null
         ? Reflect.get(followed, "jobId")
@@ -4948,7 +4527,7 @@ describe.skipIf(realRootUnavailable)("模型侧后台索引", () => {
     const root = bareWs("bg");
     trackRoot(ctx, root);
     const res = await postRebuild(ctx, root);
-    assert.equal(res.statusCode, 200, res.body);
+    assert.equal(replyCode(res), 200, replyText(res));
     const before = ctx.shell.startedProcs.length;
     const out = (await toolOf(ctx, "zg_index").execute(
       { root, confirm: true, background: true },
@@ -5044,6 +4623,20 @@ describe("工作区白名单的有效期与最近使用", () => {
     ledger.add(root(3));
     assert.equal(ledger.has(root(2)), true, "仍有效的条不该被过期清理误伤");
     assert.deepEqual(ledger.list().length, 2, "上界仍是 2");
+  });
+
+  it("过期之后 list() 也不交出它（卡片列出的每一条都必须点得动）", () => {
+    // 判据分叉的形状：`has()` 自己按有效期判，而过期条只在**下一次 add()** 才被 `evictAged`
+    // 扫掉。quiet daemon（没有新的工具调用）里，`list()` 若直接摊开键，卡片就会列出一条
+    // 点下去必被白名单拒的 root，拒绝话还写成「本 daemon 没观测过它」。
+    let now = 1000;
+    const ledger = createRootLedger(MESSAGES.zh, 8, () => now, 500);
+    ledger.add(root(1));
+    now = 1400;
+    ledger.add(root(2));
+    now = 1600;
+    assert.equal(ledger.has(root(1)), false, "root(1) 已过有效期");
+    assert.deepEqual(ledger.list(), [root(2)], "过期的那条不许再当候选，仍有效的那条照旧在");
   });
 
   it("非法 root 不进表（相对路径 / 越界）", () => {
@@ -5722,24 +5315,19 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
     const other = ws("other");
     trackRoot(ctx, other);
     const first = await postRebuild(ctx, other);
-    assert.equal(first.statusCode, 200, first.body);
+    assert.equal(replyCode(first), 200, replyText(first));
     const root = ws();
     trackRoot(ctx, root);
     const second = await postRebuild(ctx, root);
-    assert.equal(second.statusCode, 200, second.body);
+    assert.equal(replyCode(second), 200, replyText(second));
     const before = ctx.shell.startedProcs.length;
-    const secondBody = JSON.parse(second.body) as { jobId?: string };
-    const secondJobId = String(secondBody.jobId);
+    assert.ok(second.ok, replyText(second));
+    const secondJobId = second.jobId;
     const again = await postRebuild(ctx, root);
-    assert.equal(again.statusCode, 200, again.body);
-    const reusedBody = JSON.parse(again.body) as {
-      ok?: boolean;
-      jobId?: string;
-      reused?: boolean;
-    };
-    assert.equal(reusedBody.reused, true, "第二次应复用已在跑的那条");
-    assert.equal(reusedBody.jobId, secondJobId, "复用的应是上一条作业，不是新起的");
-    assert.equal(reusedBody.ok, true);
+    assert.equal(replyCode(again), 200, replyText(again));
+    assert.ok(again.ok, replyText(again));
+    assert.equal(again.reused, true, "第二次应复用已在跑的那条");
+    assert.equal(again.jobId, secondJobId, "复用的应是上一条作业，不是新起的");
     assert.equal(ctx.shell.startedProcs.length, before, "并发重建不得再 spawn 一条");
     await settleRebuilds(ctx, 0);
   });
@@ -5753,7 +5341,7 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
     const both = Promise.all([postRebuild(ctx, root), postRebuild(ctx, root)]);
     const pair = await both;
     for (const res of pair) {
-      assert.ok(res.statusCode === 200 || res.statusCode === 409, res.body);
+      assert.ok(replyCode(res) === 200 || replyCode(res) === 409, replyText(res));
     }
     // 无论走复用还是在飞未就绪，都必须**有应答**：无应答会让卡片停止轮询，
     // 那条重建就在界面上凭空消失。
@@ -5771,7 +5359,7 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
       postRebuild(ctx, root),
       toolOf(ctx, "zg_status").execute({ root }, execOf(root)),
     ]);
-    assert.equal(res.statusCode, 200);
+    assert.equal(replyCode(res), 200);
     await settleRebuilds(ctx, 0);
   });
 
@@ -5858,6 +5446,26 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
       ctx.shell.serverProbeCalls[0]?.workdir,
       tmpdir(),
       "探测是纯读，不挂在被检索的工作区上（与工作区存在与否无关）",
+    );
+  });
+
+  it("hfEndpoint 为空时就绪探测不带 env", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { hfEndpoint: "" });
+    await fetchAccess(ctx);
+    assert.equal(ctx.shell.serverProbeCalls.length, 1);
+    assert.equal(ctx.shell.serverProbeCalls[0]?.env, undefined);
+  });
+
+  it("远程 embedding 配置让就绪探测带上 env", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { allowRemoteEmbedding: true, remoteEmbeddingEndpoint: REMOTE_ENDPOINT });
+    await fetchAccess(ctx);
+    assert.equal(ctx.shell.serverProbeCalls.length, 1);
+    assert.equal(
+      ctx.shell.serverProbeCalls[0]?.env?.["ZVEC_GREP_ENDPOINT"],
+      REMOTE_ENDPOINT,
+      "探测与三条工具共用同一份 zgEnv",
     );
   });
 
@@ -5987,17 +5595,5 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     ready.shell.serverReady = true;
     const on = await fetchAccess(ready);
     assert.equal(on.serverReady, true);
-  });
-
-  it("被信任闸门拒掉的引导端点不起探测：拒一个请求不该先花一发子进程", async () => {
-    const ctx = makeCtx();
-    applyTo(ctx);
-    const res = makeRes();
-    await routeOf(ctx, REBUILD_ROOTS_PATH).handler(
-      makeReq({ method: "GET", url: REBUILD_ROOTS_PATH, headers: { host: FOREIGN_HOST } }),
-      res,
-    );
-    assert.equal(res.statusCode, 403);
-    assert.equal(ctx.shell.serverProbeCalls.length, 0);
   });
 });

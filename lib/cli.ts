@@ -329,14 +329,18 @@ export function resolveRoot(
   throw new Error(messages.rootRequiredWithFallback);
 }
 
-/** limit 钳制：非整数回默认，越界钳到 [LIMIT_MIN, LIMIT_MAX]。 */
-export function clampLimit(value: unknown, fallback: number = DEFAULT_LIMIT): number {
+/** limit 钳制：省略（undefined/null）回默认；给了但不是非负整数即抛；越界钳到 [LIMIT_MIN, LIMIT_MAX]。 */
+export function clampLimit(
+  value: unknown,
+  messages: ZvecGrepMessages,
+  fallback: number = DEFAULT_LIMIT,
+): number {
   if (value === undefined || value === null) {
     return fallback;
   }
   const num = typeof value === "number" ? value : Number(value);
-  if (!Number.isSafeInteger(num)) {
-    return fallback;
+  if (!Number.isSafeInteger(num) || num < 0) {
+    throw new Error(messages.limitInvalid);
   }
   return Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, num));
 }
@@ -500,7 +504,7 @@ function buildIndexedCommand(
   }
   parts.push(
     "--limit",
-    String(clampLimit(args.limit)),
+    String(clampLimit(args.limit, messages)),
     "--preview",
     previewOf(args.preview, messages),
     "--refresh",
@@ -590,7 +594,7 @@ function buildExhaustiveCommand(
   } else {
     parts.push(shq(pattern));
   }
-  parts.push("--limit", String(clampLimit(args.limit)));
+  parts.push("--limit", String(clampLimit(args.limit, messages)));
   pushPathFilters(parts, args, messages);
   pushTimeFilters(parts, args, messages);
   parts.push(deviceFlag(args.device, messages), modeFlag(mode));
@@ -701,10 +705,12 @@ function pushIndexBoolFlags(parts: string[], flags: IndexFlags): void {
  * type-not → 密钥排除 → ignore-file）。
  *
  * 密钥排除走 --iglob 而非 --glob，两个原因都是实测得来的：
- *   - 扩展名大小写：真正会被索引的密钥库格式里，`.p12` / `.pfx` / `.keystore` 都存在
- *     混合大小写变体（`secret.P12`、`secret.PfX`、`secret.KEYSTORE` 皆实测入索引）。
+ *   - 扩展名大小写：`.pem` / `.p12` / `.pfx` / `.keystore` 都**确实会被索引**（真 zg 0.2.2 实测：
+ *     一份只有 `secret.pem` / `secret.P12` / `a.ts` 的工作区，`zg index` 回执就是
+ *     `3 scanned, 3 added`，随后 `zg query MARKERPEMLINE` 交回 `#1 matchedBy=fts+vector secret.pem:1-2`），
+ *     且都存在混合大小写变体（`secret.P12` / `secret.PfX` / `secret.KEYSTORE` 同样入索引）。
  *     --glob 的 `!*.p12` 匹配不到 `secret.P12`，--iglob 走大小写不敏感匹配才能全部排除。
- *     （`.pem` 不在此列：它本就不在 zg 的可索引类型里，不下发任何规则也不会进索引。）
+ *     判据钉在 test/e2e/zg-cli.test.ts 的「密钥排除真的在挡东西」那一组。
  *   - 规则次序：引擎把全部 --glob 规则排在全部 --iglob 规则之前有序求值。密钥规则若
  *     用 --glob，用户一条宽泛的正向 --iglob（如 `**`）会在其后求值并把无扩展名的
  *     `id_rsa*` 救回索引（实测「被索引」）；用 --iglob 且排在本函数最后（用户 iglob

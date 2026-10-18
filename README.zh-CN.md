@@ -15,7 +15,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 ```
 
 - 包在公共 npm 上，安装不需要凭据；发布态产物只有 host.js、client.js、cordis.patch.yml（package.json 的 files）。
-- 运行期值 import `@jayyuen66/dsh-plugin-shared`（lib/http、lib/locale、lib/text）与 `@deepseek-ai/schemastery`（宿主 fork：0.1.7 的 `.volatile()` 解析只有它有实现，公共 schemastery 既没这个方法、解析出的也仍是普通值），装不上就是 ERR_MODULE_NOT_FOUND。
+- 运行期值 import `@jayyuen66/dsh-plugin-shared`（`lib/locale`、`lib/text`、`lib/record`、`lib/errors`、`lib/job-outcome`、`lib/card-diff`）、`@deepseek-ai/schemastery`（宿主 fork：0.1.7 的 `.volatile()` 解析只有它有实现，公共 schemastery 既没这个方法、解析出的也仍是普通值）与 `@deepseek-ai/dsh-typert-protocol`（Remote 基类：`TypertRemoteService` 是个**要 `extends` 的类**，没有 type-only 的取法，因此落必需 peer 并在 devDependencies 里同版精确钉），装不上就是 ERR_MODULE_NOT_FOUND。
   - shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`，所以那枚宿主包也得在提供面上：本包按 `schemastery` 同一口径处理（非 optional `peerDependencies` + `devDependencies` 同枚精确版本，**不进 `dependencies`**）。这条只能靠门禁钉：漏它时本包的类型检查、构建与测试全绿，故障只在装出去之后以 ERR_MODULE_NOT_FOUND 出现。
   - 只有 shared 那枚在 `dependencies` 里。`@deepseek-ai/schemastery` 是宿主包：声明为**非 optional 的 `peerDependencies`**，并在 `devDependencies` 里以同一枚精确版本再写一份给本包的编译与测试用——它**不进 `dependencies`**。这条不是风格偏好：消费侧 profile 的安装布局是 `nodeLinker: hoisted` 且 `autoInstallPeers: false`，宿主包一旦进了 `dependencies` 就会被落成真实目录，与宿主进程已加载的那份并存；而 `@deepseek-ai/dsh-tools` 的 `TOOL_RUNTIME_SCHEDULER` 是普通 `Symbol`（不是 `Symbol.for`），符号身份按模块实例计算，宿主 `dsh-agent-loop` 于是读到 `undefined`，每一次原生工具调用都抛 `Cannot read properties of undefined (reading 'prepare')`，整个 profile 的工具一起失效——本包的构建、类型检查与测试在这之前全部照绿。判据钉在 `test/publish-manifest.test.ts`。
 
@@ -23,11 +23,12 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 - add/remove 按包内 cordis.patch.yml 维护注册行 `- id: zvec-grep`（name 指向本包）；该文件由 `package.json` 的 `dsh.bundle.patch` 指向。
 - 宿主兼容性按 **peer 声明**判，不按 `engines.dsh`：装配前逐条比对 `@deepseek-ai/dsh` 与每一枚 `@deepseek-ai/dsh-*` 的区间与当前 runtime 版本，prerelease 也参与匹配（官方口径见 dsh-app-boot README）。不符即该条目被拒；组合包（bundle）没有豁免时整枚跳过并列进 `skippedBundles`。
-  - 本包把 `dsh-*` 一律**精确钉**（`test/publish-manifest.test.ts` 的要求，理由是「装出第二份宿主类型面」比版本冲突更坏），所以**高于 `0.2.1-alpha.2` 的宿主同样需要授权**，出路是宿主点名的那句：`dsh plugin --profile web allow-version @jayyuen66/dsh-zvec-grep@<版本> --dsh-version <确切版本> --accept-risk`。
-  - `engines.dsh` 只是声明，无人读；`>= 0.2.1-alpha.2` 与 peer 同值仅为不留下互相矛盾的数。
+  - 本包把 `dsh-*` 一律**精确钉**（`test/publish-manifest.test.ts` 的要求，理由是「装出第二份宿主类型面」比版本冲突更坏），所以**高于 `0.2.1-rc.2` 的宿主同样需要授权**，出路是宿主点名的那句：`dsh plugin --profile web allow-version @jayyuen66/dsh-zvec-grep@<版本> --dsh-version <确切版本> --accept-risk`。
+  - `engines.dsh` 只是声明，无人读；`>= 0.2.1-rc.2` 与 peer 同值仅为不留下互相矛盾的数。
 - `dsh.client.platform` 为 web 且 immediately，设置卡的 client 半随宿主下发；bundle 安装走 pnpm（>= 12.3.0）。
 - apply 需要 settings/shell/tools/systemPrompt/timer 五个服务面：它们都在 `inject` 里，缺任一 cordis 就不激活本条目（宿主启动诊断点名 `pending (waiting for service: …)`）；apply 里的守卫再兜一层，ctx 形状不对时抛 `required services … missing`。
-  - 三条 `/_dsh/zvec-grep/*` 端点挂在 `inject(["webServer"])` 的子 fiber 上：宿主没有 webServer（如 TUI）时子 fiber 不激活，端点不存在而工具照常。真实宿主上 webServer 比本条目晚到位约 1 秒，所以这里必须是依赖、不能只在 apply 里 `ctx.get` 读一次。
+  - 设置卡的读面是一枚官方 Typert Remote 命名空间，由 `installRebuildRemote` 注册在 apply fiber 上（`lib/rebuild-remote.ts`），因此不需要 `webServer`、也没有子 fiber：宿主没有 web 层（如 TUI）时服务照旧注册，只是卡片没有地方渲染。
+  - 状态轮询是客户端自己的定时器（`src/client-entry.ts` 的 `REBUILD_POLL_MS = 2000`），不是服务端推送；每次读都以结果对象回答，不抛错——见「对外接口」。
 
 ### 支持面
 
@@ -48,7 +49,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - 某组命中数正好等于 `--limit` 时只作**观察陈述**并显式说明「zg 不提供截断信号，此处不作断言」——zg 的输出没有任何截断标记，不能把"可能还有未显示的命中"说成事实。输出被宿主按 stdout 上限截尾时另附「只含保留部分」。
 - zg_index：confirm 必填且必须为 true（required 校验 + guard 双层拒绝）。
   - `background=true` 走**模型侧后台索引**：一次调用把「起 zg 进程 + 登记进官方作业注册表 + 挂超时回收」全做完，把可轮询的作业号交回后**立即返回**。建索引可能要下载 embedding 权重、等很久，后台执行免得工具调用一直挂着。
-    - 不依赖宿主作业工具：宿主作业工具在 web 平面已停用，模型侧那条路根本不可走。插件复用与设置卡**完全相同**的 spawn/登记/占位三步（同一个函数，不是复制品），所以两条入口起的作业在名册、状态投影、轮询端点上完全同形——卡片能看见模型起的索引，反之亦然。
+    - 不依赖宿主作业工具：宿主作业工具在 web 平面已停用，模型侧那条路根本不可走。插件复用与设置卡**完全相同**的 spawn/登记/占位三步（同一个函数，不是复制品），所以两条入口起的作业在名册、状态投影、`status` 读面上完全同形——卡片能看见模型起的索引，反之亦然。
     - 占位与设置卡的重建互斥，且跨入口成立：同根已在跑索引写时，模型侧与卡片侧都只会跟随那一条，不会各起一条 zg 去啃同一份索引。
     - 官方作业注册表缺席时**根本不起进程**并直接报错：起一条没有环、没有容量、也没人能收的 zg 比不起更糟——它会一直占着同根的写锁，把这棵树的后续索引全堵死。
     - 落定前该根的语义检索会等它完成再自动重试，期间 grep/rg 不受门禁限制。
@@ -110,23 +111,23 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 - 这一档不是「快一点」的区别。`--mode auto` 的两侧是两种能力面：direct 每发 `zg query` 都要新建再关闭一次引擎、**embedding 模型逐次冷加载**；而索引的增量刷新（watcher）、`refresh=background` 与常驻模型池**只在 server 模式下存在**。上游对 `auto` 只做就绪探测、不会替用户拉起 daemon。
 - 本包**不代为起一个长驻进程**：`zg server on` 会在用户机器上落下 detached 进程与 token 文件，那是该由用户点头的动作，不是插件替部署做的决定。本包做的是把这一档**显式化**，不再让它藏在「检索超时给 5 分钟」和「改动搜不到」这类使用限制背后：
   - 按 TTL（60 秒）缓存 `zg server status --check-ready` 的**退出码**（就绪 0、未就绪非零；读 stdout 文本不行，那是给人看的状态表、不在本包的依赖契约里）。探测失败一律按未就绪收口，**绝不外抛**基础设施故障。
-  - 据此收口 `refresh=background`（见工具一节），并在 `zg_status` 的输出尾部与设置卡各回显一行就绪态。被信任闸门拒掉的请求不起探测；重建期那条「合成投影」也不起（它本来的契约就是不启子进程）。
+  - 据此收口 `refresh=background`（见工具一节），并在 `zg_status` 的输出尾部与设置卡各回显一行就绪态。探测只由 `roots()` 触发：`rebuild` 与 `status` 不起探测，重建期那条「合成投影」也不起（它本来的契约就是不启子进程）。
   - 设置卡的 `serverReady` 只可能是 `true` / `false`；旧版 host 的应答里根本没有这一位，卡片对「未知」的那一臂**不显示**，而不是把它说成「未就绪」。
 - 想把红利拿到手：在持有终端时执行 `zg server on`（起停与状态另有 `zg server off` / `zg server status`）。本包只读它的就绪态，不拥有它的生命周期。
 
 ### 对外接口
 
-- 三条路由的 handler 第一句都是 `guardTrust(req, res, { servingNonLoopback })`（`shared/lib/trust`），任一判据不过即 `403` + `{ ok:false, error: ... }`。
-  - 判据次序：Host 权威 → `sec-fetch-site` 白名单 → `origin` 与 Host 逐字比对；两句错误文本是 `"untrusted host authority"` 与 `"cross-origin request rejected"`。
-  - `servingNonLoopback` 由 `isNonLoopbackBindHost(webServer.host)` 按**绑定地址本身**算出（宿主只拒通配地址，绑本机网卡的具体 IPv4/IPv6 是合法配置，比字面量会漏判这一面）；非本方法的 `405` 带 `Allow` 与 `{ ok:false, error:"GET only" | "POST only" }`，不再是空回显。
-- `GET /_dsh/zvec-grep/rebuild-roots`：只回本包自己的数据（每次 apply 重新生成的 CSRF token + 已观测工作区列表 + 卡片要显示的那行守护进程就绪态），允许 GET/HEAD，过不了上面那道闸门即 403。就绪探测排在**两道闸门之后**，被拒的请求不起子进程。
-- `POST /_dsh/zvec-grep/rebuild?root=...`：闸门 + 头 `x-zvec-grep-csrf` + body <= 4096 字节 + root 命中白名单 + 目录存在，成功回 `{ ok, jobId }`；否则 405/403/400/500。
-- `/_dsh/zvec-grep/rebuild-status?jobId=...`：闸门后轮询（卡片每 2 秒一次），回 status/exitCode/root/output（有沙箱时带 sandbox），未知 jobId 回 404 并说明多半是出了本包那条 10 条落定窗口。
+- 重建面是一枚**官方 Typert Remote 命名空间** `zvecGrepRebuild`（`lib/rebuild-shape.ts` 的 `REBUILD_REMOTE_NAMESPACE`），三个方法用程序化方式打标记（`lib/rebuild-remote.ts` 的 `markRemote`），注册在 apply fiber 上。没有 `/_dsh/*` 路由、没有 CSRF token、本包也不再自带 body 上限：认证与 Host / DNS 重绑定 / Origin 判据、请求体上限都由宿主 `/api` 网关承担，本包连 `webServer` 依赖都不再声明。
+  - `roots()` → `{ roots, serverReady }`:本 daemon 真实观测到的白名单工作区，加上卡片那一行守护进程就绪态。`zg server status --check-ready` 探测**只在这里发**，与三条工具共用同一份 60 秒 TTL 缓存。`serverReady` 在探测答不出时是 `undefined`，卡片对这一臂什么都不显示，而不是把「不知道」说成「未就绪」。
+  - `rebuild({ root })` → `{ ok: true, jobId, reused? }` 或 `{ ok: false, error, status }。判据与 HTTP 版一模一样，因为它们护的是动作本身、与传输方式无关：非 `/` 开头的路径先拒（`assertAbsoluteRoot`），不在观测白名单里的拒，目录已消失的拒，宿主 `jobs` 服务不在场时**一条都不 spawn**（503 那一臂）。同根占位在第一个 `await` 之前取，是唯一的互斥依据，因此第二次点击跟随在跑的那条（`reused: true`），跟不到也只是被拒，不会在同一份索引上再起一条 `zg`。版本门槛与 ignore 文件预检排在命令构造之前；启动失败会交回自己的码并归还占位，那棵树不会被永久标成「重建中」。
+  - `status({ jobId })` → `{ status, exitCode, root, output }`（有沙箱时带 `sandbox`）或 `{ ok: false, error, status: 404 | 503 }`。它只认本包侧表里的 id——保留最近 10 条**已落定**记录（`REBUILD_HISTORY_MAX`，在跑的永不淘汰），所以别人的作业（如宿主的 `bash-1`）经这里读不到。三档 404 分别是「窗口过去了」「注册表那一行不再持有它」「身份三元组（kind / label / startedAt）与这条记录不符」；503 那一档是两次启动之间注册表消失。卡片每 2 秒敲一次（`REBUILD_POLL_MS = 2000`）。
+  - 拒绝结果里的 `status` 是**保留下来的语义码，不是 HTTP 状态**：应答由网关成框，所以拒绝就是一个普通结果对象，卡片渲染 `error`，那个数字存在是为了让测试钉住是哪条判据拦的。这三个方法都不许把异常抛穿到网关——一次被拒的 Remote 调用对卡片只是一条笼统的失败，会停掉轮询并让还在跑的重建从此看不见。
 - 另有 systemPrompt 段 `zvec-grep-routing`（order 1550）与 settings 命名空间 `zvec-grep`。
-  - 白名单只记本 daemon 真实观测到的会话工作区，容量 64（超出按插入序淘汰）。
+  - 客户端那一侧（`src/rebuild-reader.ts`）用 `$mount` 挂三条手写 descriptor（`kind: "direct"`、`result: { mode: "src-json" }`，两个入参各带 strict codec），挂载只发生一次，随后按派生键 `remote.zvecGrepRebuild` 取服务。宿主没有 `remote` 服务时根本不构造读面；服务在、命名空间没挂上时读面抛 `… 未提供`，卡片显示 `rebuildUnavailable` 那一行而不是整片空白。
+  - 白名单只记本 daemon 真实观测到的会话工作区，容量 64；**命中会触摸**该条（挪到队尾），淘汰先掉已过期的、再按**最久未触摸**依次淘汰，不是按插入序。
   - 同时能跑几个重建由**宿主注册表**决定（实测默认未拥有桶 10），本包不再自带并发上限；
-    满员时 `POST /rebuild` 直接回 500 并带上官方的点名文案，**不会**再杀掉已经在跑的重建。
-  - `rebuild-status` 的 `jobId` 只在本包侧表里查得到：本包保留最近 10 条**已结束**的记录
+    满员时 `rebuild` 直接交回拒绝结果并带上官方的点名文案，**不会**再杀掉已经在跑的重建。
+  - `status` 的 `jobId` 只在本包侧表里查得到：本包保留最近 10 条**已结束**的记录
     （超出即从注册表 remove ⇒ 404），进行中的记录永不被动。
 
 ### 后台作业面（官方 `ctx.jobs`）
@@ -136,16 +137,16 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 | 面                      | 事实                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 模型侧能看见了          | 官方 `job_list` / `job_output` / `job_kill` 现在列得出这次重建，退出码与信号名走作业的 `detail`（口径与宿主的 bash 工具同形，实测 `plugins/docs/harness/f3-equiv/probe-jobs.mjs`）。输出走官方 **pull source**（`proc.observed[*].readFrom`）⇒ 环由注册表按它自己的节拍推进，**设置面板关着也照样前进**；官方那条观察者面与 `readOutput()` 互不偷字节（d.ts 原文 "without stealing bytes from `readOutput`"）。controller 只在 `start` 那一瞬挂、摘掉即恢复官方拒绝（见跨包纪律） |
-| 未拥有 ⇒ 对全部会话可见 | 官方件按 owner 隔离，未拥有作业任何 caller 都能 `list`/`read`/`kill`。这是本波**已知并接受**的暴露面（卡片是会话外的 webServer 生产者，受有作业则要 `dsh-agent` 注册表，实测不可得）。要收回去只有一条路：回滚这次换装。注意 `/_dsh/zvec-grep/rebuild-status` 仍只认本包侧表里的 id，别人的作业（如宿主的 `bash-1`）经这个端点读不到                                                                                                                                              |
+| 模型侧能看见了          | 官方 `job_list` / `job_output` / `job_kill` 现在列得出这次重建，退出码与信号名走作业的 `detail`（口径与宿主的 bash 工具同形）。输出走官方 **pull source**（`proc.observed[*].readFrom`）⇒ 环由注册表按它自己的节拍推进，**设置面板关着也照样前进**；官方那条观察者面与 `readOutput()` 互不偷字节（d.ts 原文 "without stealing bytes from `readOutput`"）。controller 只在 `start` 那一瞬挂、摘掉即恢复官方拒绝（见跨包纪律） |
+| 未拥有 ⇒ 对全部会话可见 | 官方件按 owner 隔离，未拥有作业任何 caller 都能 `list`/`read`/`kill`。这是本波**已知并接受**的暴露面（卡片经 Remote 读面触达注册表，本身在会话之外，而受有作业则要 `dsh-agent` 注册表，实测不可得）。要收回去只有一条路：回滚这次换装。注意 `status` 读面仍只认本包侧表里的 id，别人的作业（如宿主的 `bash-1`）经它读不到                                                                                                                                              |
 | 多了两个状态词          | `stopping`（取消已发出、进程还没收完 ⇒ 卡片按「仍在跑」显示）与 `failed`（注册表侧判定失败 ⇒ 给专门文案，不显示成「退出码 null」）                                                                                                                                                                                                                                                                                                                                                |
 
-不留存的东西也写清楚：输出环按 **UTF-8 字节**留存（实测宿主默认 262144 字节），卡片的 4000 字符尾窗与 `shown/total` 按 **UTF-16 码元**计——两套单位各管各的。因此 `total` 说的是**留存窗内**的码元数（官方那个字节真值在 `view.output.total`，单位不同不混用），而中文输出下这只窗比换装前（按码元留 256 KiB）**小约 1/3**，这是采用官方件的代价。两条丢失标记各说一件事：`已截断` = 环按留存窗裁掉了头部（`view.output.earliest > 0`，看不见了）；`缓冲区溢出` = 执行器的读者报 lossy 或干脆抛了（真少了字节，可能有 spill 文件）。超时说明与沙箱事实**不进环**：环的写权归注册表的泵，而它在落定之后丢弃一切写入（实测），所以这两条由端点在投影时合成，永远不会因为"写晚了"而消失。注册表被重载或记录被别人收走时轮询答 **404**（官方 `get`/`readAt` 对未知 id 抛错，而宿主对 handler 抛出的兜法是记一条日志再写一枚没有 body、没有 content-type 的 **400**，只有头已发时才断掉 socket —— installed dsh-host-webserver `lib/index.js:246-256` ⇒ 卡片会进终止态并停轮询，那条还在跑的重建就再也看不见）。
+不留存的东西也写清楚：输出环按 **UTF-8 字节**留存（实测宿主默认 262144 字节），卡片的 4000 字符尾窗与 `shown/total` 按 **UTF-16 码元**计——两套单位各管各的。因此 `total` 说的是**留存窗内**的码元数（官方那个字节真值在 `view.output.total`，单位不同不混用），而中文输出下这只窗比换装前（按码元留 256 KiB）**小约 1/3**，这是采用官方件的代价。两条丢失标记各说一件事：`已截断` = 环按留存窗裁掉了头部（`view.output.earliest > 0`，看不见了）；`缓冲区溢出` = 执行器的读者报 lossy 或干脆抛了（真少了字节，可能有 spill 文件）。超时说明与沙箱事实**不进环**：环的写权归注册表的泵，而它在落定之后丢弃一切写入（实测），所以这两条由 `status` 读面在投影时合成，永远不会因为"写晚了"而消失。注册表被重载或记录被别人收走时 `status` 交回拒绝结果（`status: 404`），而不是让官方的 `unknown job` 异常抛穿到网关——一次被拒的调用对卡片只是一条笼统失败，会停掉轮询并让还在跑的重建从此看不见。
 
 ### 数据与隐私
 
 - 索引的唯一落盘形状是被检索 root 下的 `.zvec-grep/` 目录，由 zg 写入（read-only 沙箱下写不了它，会明确报索引可能不完整）。
-- 重建有两条路：模型侧 `zg_index`（rebuild=true、confirm=true），或设置卡「工作区重建」走上面的 rebuild 路由；删除是 `zg_index` drop=true（拼成 `zg index <root> --drop --yes`）。
+- 重建有两条路：模型侧 `zg_index`（rebuild=true、confirm=true），或设置卡「工作区重建」走上面的 `rebuild` 方法；删除是 `zg_index` drop=true（拼成 `zg index <root> --drop --yes`）。
 - 本包自身不写任何文件（唯一的 fs 调用是索引探测：existsSync + 读一次清单），也不向宿主数据目录 `$DSH_HOME`（`<dsh 数据目录>`）落数据。
   - 索引探测不只判「`.zvec-grep/manifest.json` 在不在」：还要**解析清单**并确认它的 `rootPaths` 真的覆盖这个目录。两种实况会被「只判存在」误判成有索引，而实际检索必然失败——文件在但不是一份清单（半截写入/同名占用），以及清单在但根路径指向别处。此时门禁若还按「已建索引」拦着 grep/rg，就等于把检索与门禁双向堵死。
   - 认的结构只有 `manifestVersion`（**严格等于 1**）与 `rootPaths`（非空数组、每项带非空 `absolutePath`）两处——版本不等时上游读它会直接抛 `MANIFEST.INVALID`，此时这个目录一次检索都做不了，宽松放行只会把用户卡在「门禁拦着、检索又必失败」的死角里。刻意不校验 embedding / policy 等字段——那些变了索引照样能用，判成「无索引」反而是错的。
@@ -163,7 +164,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 - grep/rg 被拒且提示「尚未执行过 zg_search」：这是 search-first 门禁，先 zg_search；配额用尽或过期同理，换个更准的 query/fts 重搜即可续上，不必关插件。
 - 检索超时：默认 `--refresh wait` 会同步刷新既有索引，大工作区请用 globs/fileTypes 缩小范围或调小 limit，也可先手写字面检索；想让超时这件事本身变小，就起守护进程（见「守护进程」一节）——直连模式每次都要冷加载 embedding 模型，那才是超时预算被抬到 5 分钟的原因。
-- 重建按钮回 403「root 不在本 daemon 观测到的工作区白名单内」：该目录从未在本 daemon 开过会话；先在该目录起会话，或让模型带 confirm=true 调 zg_index。
+- 重建按钮的拒绝文案是「root 不在本 daemon 观测到的工作区白名单内」：该目录从未在本 daemon 开过会话；先在该目录起会话，或让模型带 confirm=true 调 zg_index。
 - 卡片显示重建失败而 zg 看着像跑完了：成功判据是 completed 且 exit 0——exit 127（zg 没装）也落在 completed，看输出尾部原因。
 - 从未建索引的 root：zg_search 明确报错而不是静默建索引；建索引只在用户明确要求时由 zg_index 做。
 - 换了 embedding 却搜不到语义结果：切换 embedding 必须 rebuild=true 重建后才生效。

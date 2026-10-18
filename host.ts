@@ -15,25 +15,26 @@
 //   3. 注册 systemPrompt 硬规则段（routing，order 1550）+ tools.guard 安全兜底
 //      + search-first 门禁（工作区已建索引时 grep/rg 前必须先 zg_search，
 //      每次成功 zg_search 发放配额：grepBudgetPerSearch 次 / unlockWindowMin 分钟）。
-//   4. 为设置卡片的「工作区重建」按钮提供 webServer 端点（后台进程 + 轮询状态）。
+//   4. 为设置卡片的「工作区重建」按钮提供官方 Typert Remote 读面（后台进程 + 轮询状态，
+//      见 lib/rebuild-remote.ts）。
 //
 // 安全要点：
 //   - 所有用户可控字符串经 lib/cli.ts 的 shq() 单引号转义；root 走 workdir 字段
 //     （query）或转义后的位置参数（index/status），绝不裸拼进命令。
 //   - zg_index 被 guard 强制要求 confirm=true，防止模型静默建/删索引。
 //   - 工具入参在 lib/cli.ts 里逐项严格取值（harness 不校验 parameters，见该文件头）。
-//   - 「工作区重建」是**动作端点**：webServer 可被绑到本机网卡的具体地址（宿主只拒通配
-//     地址），故除 sec-fetch-site 同源校验外还要求每次 apply 生成的 CSRF 头，且 root 必须
-//     落在「本 daemon 实际观测到的会话工作区」白名单内——否则任意绝对路径都能被拿去
-//     `zg index --rebuild`。
+//   - 「工作区重建」是**动作**：root 必须落在「本 daemon 实际观测到的会话工作区」白名单内，
+//     否则任意绝对路径都能被拿去 `zg index --rebuild`。这条闸门与传输方式无关，长在
+//     lib/rebuild-remote.ts 的方法体里。
 //
 // 运行方式：包入口是构建产物 host.js（`npm run build` 由 host.ts + lib/*.ts 打包而来）。
 // 发布态必须走产物：Node 对躺在 node_modules 里的 .ts 直接抛
 // ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING，而本包正是躺在 profile 的 node_modules 里被
 // 载入的。构建侧的逐字节新鲜度由 test/host-freshness.ts 钉住。
-// 运行时值导入只有 @jayyuen66/dsh-plugin-shared 的 lib 子路径与 @deepseek-ai/schemastery，
-// 且后者必须是**宿主 fork**：只有它的 resolve 会把标了 .volatile() 的字段包成 Volatile 引用
-// （公共 schemastery 既没有 .volatile()，解析出来的也仍是普通值，设置卡写进去的值永远读不到）。
+// 运行时值导入只有 @jayyuen66/dsh-plugin-shared 的 lib 子路径、@deepseek-ai/schemastery
+// 与 @deepseek-ai/dsh-typert-protocol，且 schemastery 必须是**宿主 fork**：只有它的 resolve
+// 会把标了 .volatile() 的字段包成 Volatile 引用（公共 schemastery 既没有 .volatile()，解析
+// 出来的也仍是普通值，设置卡写进去的值永远读不到）。
 // shared 自己的 dist/text.js 又值导入 @deepseek-ai/dsh-output-retention，所以那枚宿主包也在
 // 必填 peer 面上——缺席只在装出去之后才现形，判据钉在 test/publish-manifest.test.ts。
 // @deepseek-ai/cordis 一律 type-only（运行时由 ctx 注入）。@deepseek-ai/dsh-tools 同样
@@ -43,23 +44,20 @@
 // `ToolDefinition` 检查、guard 谓词由官方 `ToolGuard` 检查——两者都随官方成员走，本文件不
 // 重述它们的签名；工具体收到的执行面走官方 ToolRunContext（详见下面 ToolsService / ToolExec
 // 与 lib/routing.ts 的读取面）。
-// 五个宿主服务面（@deepseek-ai/dsh-shell / dsh-host-webserver / dsh-system-prompt /
-// cordis-plugin-timer / dsh-jobs）同样 type-only + 全面绑定官方声明：Shell 的请求/规格/句柄/结果
-// 与沙箱事实直接用它交出的类型名，WebServer / SystemPrompt / TimerService / JobRegistry 是带
-// private 字段的 cordis Service 类（TS 名义比较，结构替身与测试桩都满足不了），故按 ToolsService
-// 的既有口径只取**方法面投影** Pick<官方类, 用到的方法>——投影不重述任何签名，参数与返回
-// 类型全部由官方成员交出（含 WebRoute.kind 的 WebRouteKind 字面量联合，见下面注释）。
-// dsh-jobs 还带一条 declare module 增强（本包的作业 kind），见 import 处。
+// 四个宿主服务面（@deepseek-ai/dsh-shell / dsh-system-prompt / cordis-plugin-timer /
+// dsh-jobs）同样 type-only + 全面绑定官方声明：Shell 的请求/规格/结果与沙箱事实直接用它
+// 交出的类型名，SystemPrompt / TimerService / JobRegistry 是带 private 字段的 cordis
+// Service 类（TS 名义比较，结构替身与测试桩都满足不了），故按 ToolsService 的既有口径只取
+// **方法面投影** Pick<官方类, 用到的方法>——投影不重述任何签名，参数与返回类型全部由官方
+// 成员交出。作业 kind 的 declare module 增强随 lib/rebuild-remote.ts 的导入走。
 // 支持行级 config（导出 Config schema，cordis 经 Standard Schema 校验并填 `.default()`
 // 后传入 apply，volatile 字段以引用形态交进来）；defineTool 不引入——运行时值
 // 导入违反上述解耦原则，且文件形态插件无 bare-import 解析路径，required
 // 校验已在 define() 内以零依赖方式等效实现。
 
 import Schema from "@deepseek-ai/schemastery";
-import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
-import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Context, Fiber, Volatile } from "@deepseek-ai/cordis";
 // 官方工具契约（@deepseek-ai/dsh-tools 根模块 = lib/types/index.d.ts）：注册的工具定义、
 // guard 谓词、工具体收到的执行面、输出 schema 一律绑它，不再本地镜像。
@@ -78,41 +76,15 @@ import type { SettingsForms } from "@deepseek-ai/dsh-settings";
 // Context，本包经 `host.get("sessions")` 可选地取它。type-only，产物零运行时引用。
 import type { SessionStore, SessionHeader } from "@deepseek-ai/dsh-session";
 // 宿主服务面的官方声明（全部 type-only：运行时由 ctx 注入，值导入会破坏 host.js 自包含）。
-// dsh-shell 的执行词表直接用它交出的类型名；WebServer / SystemPrompt / TimerService 是
+// dsh-shell 的执行词表直接用它交出的类型名；SystemPrompt / TimerService 是
 // cordis Service 类（private/protected 字段 → 名义比较），只能经 Pick<> 取方法面投影。
-import type {
-  ShellExecution,
-  ShellExecutor,
-  ShellRunResult,
-  ShellSandboxInfo,
-} from "@deepseek-ai/dsh-shell";
-import type { WebServer } from "@deepseek-ai/dsh-host-webserver";
-// 官方后台作业注册表（ctx.jobs）的类型面（全部 type-only：那枚注册表由宿主注入，
-// dsh-base 默认装载 dsh-jobs-local；值导入会破坏 host.js 的自包含）。
-// JobRegistry 是 abstract Service（protected ctx → 名义比较），只能按本包既有口径取
-// 方法面投影；其余是它交出的类型名，本文件不重述任何签名。
-import type {
-  JobId,
-  JobOutputRead,
-  JobSourceRead,
-  JobOutputSource,
-  JobRegistry,
-  JobSpec,
-  JobStatus,
-  JobView,
-} from "@deepseek-ai/dsh-jobs";
+import type { ShellExecutor, ShellRunResult } from "@deepseek-ai/dsh-shell";
 import type { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 // 官方内容块（type-only：dsh-tools 自己也从这里取 ContentBlock，值导入会破坏 host.js 自包含）。
 // 只取 TextBlock 而不是 ContentBlock——理由见 textBlock 的注释。
 import type { TextBlock } from "@deepseek-ai/dsh-llm";
 import type { TimerService } from "@deepseek-ai/cordis-plugin-timer";
-// 共享 webServer 样板：sendJson/queryParam/guardBody（自家 isCrossOrigin 支在信任闸门
-// 落地后不可达，已随那道闸门收敛）
-// 与 session-rescue/lesson-loop/ocr-review 原来各自复制，现统一由 shared 提供。
-import { sendJson, queryParam, guardBody } from "@jayyuen66/dsh-plugin-shared/lib/http";
-// 信任闸门：三条路由 handler 的第一条语句。
-import { guardTrust, isNonLoopbackBindHost } from "@jayyuen66/dsh-plugin-shared/lib/trust";
-import { DEFAULT_EMBEDDING, isLocalEmbedding } from "./lib/embedding-catalog.ts";
+import { DEFAULT_EMBEDDING } from "./lib/embedding-catalog.ts";
 import {
   assertAbsoluteRoot,
   buildSearchCommand,
@@ -122,17 +94,13 @@ import {
   resolveRoot,
   clampLimit,
   requestsBackgroundRefresh,
-  clientModeOf,
   DEFAULT_CLIENT_MODE,
   DEFAULT_LIMIT,
   PREVIEW_NAMES,
   REFRESH_NAMES,
   SYMBOL_TYPE_NAMES,
 } from "./lib/cli.ts";
-// ignoreFiles 的存在性预检要与命令构造期用**同一个**取值器（单值/数组都收）：两处各读一遍
-// 就会出现"预检放过、构造期才拒"的缝隙。
-import { singleOrList } from "./lib/argv-guard.ts";
-import type { BackgroundSupport, ClientMode, SearchArgs, IndexArgs } from "./lib/cli.ts";
+import type { BackgroundSupport, ClientMode, IndexArgs, SearchArgs } from "./lib/cli.ts";
 import {
   ROUTING_NAME,
   ROUTING_ORDER,
@@ -175,19 +143,18 @@ import {
 import { truncateEnd, truncateStart } from "@jayyuen66/dsh-plugin-shared/lib/text";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
-// 落定进程 → 官方作业结局的映射与 ocr-review 逐字同构，收在 shared（口径本身
-// 抄的是宿主 bash 工具的 processOutcome，见该文件头）。
-import { jobOutcomeOf } from "@jayyuen66/dsh-plugin-shared/lib/job-outcome";
-
-// 官方给生产者的 kind 扩展点（installed dsh-jobs/lib/types/view.d.ts 的 JobKindMap，
-// dsh-tool-pwsh / dsh-tool-workflow 同款写法）：kind 既是 id 命名空间也是 id 前缀。
-// 位置在 import 块之后：declare module 是一条语句，夹在 import 中间会让后面每条 import
-// 都违反 import/first（ESM 下 import 本就被提升，先于模块体执行，挪动不改运行时行为）。
-declare module "@deepseek-ai/dsh-jobs" {
-  interface JobKindMap {
-    "zvec-grep-rebuild": "zvec-grep-rebuild";
-  }
-}
+// 工作区重建的宿主读面（官方 Typert Remote）与它背后的作业编排：起写操作、登记、
+// 状态投影、卸载收口都在那一层，设置卡与模型侧后台索引共用同一个 spawn/attach。
+import { attachIndexWrite, installRebuildRemote, spawnIndexWrite } from "./lib/rebuild-remote.ts";
+import type { IndexWriteRoutes, JobsService, RebuildRecord } from "./lib/rebuild-remote.ts";
+import { assertIgnoreFilesExist } from "./lib/index-preflight.ts";
+import { deniedNote, sandboxFacts } from "./lib/sandbox-note.ts";
+import {
+  allowRemoteEmbedding,
+  readClientMode,
+  readDefaultEmbedding,
+  zgEnv,
+} from "./lib/zg-config.ts";
 
 // 设置命名空间不再由本包声明：0.1.7 隐式注册取 profile 条目 id（`zvec-grep`，
 // 见 cordis.patch.yml 的 `- id:`），与本包卡片用的 namespace 同一个串。
@@ -209,14 +176,6 @@ const STDOUT_MAX_BYTES = 400_000;
 /** 检索等待同根重建落定的上限（ms）。部署值：大型工作区的重建可能跑很久，
  *  但也不该让一次检索无限期挂着。 */
 const REBUILD_WAIT_MS = 2 * 60_000;
-const REBUILD_PATH = "/_dsh/zvec-grep/rebuild";
-const REBUILD_STATUS_PATH = "/_dsh/zvec-grep/rebuild-status";
-/** 卡片取「可选工作区 + CSRF token」的引导端点（GET，只回本插件自己的数据）。 */
-const REBUILD_ROOTS_PATH = "/_dsh/zvec-grep/rebuild-roots";
-/** 动作端点的 CSRF 头名（值是每次 apply 重新生成的随机 token）。 */
-const REBUILD_CSRF_HEADER = "x-zvec-grep-csrf";
-/** rebuild 端点没有业务请求体，但必须把它读完（keep-alive 残留字节的协议正确性）。 */
-const REBUILD_BODY_MAX_BYTES = 4096;
 /** 工作区白名单容量：超过按最近使用淘汰最冷的一条（常驻进程内存有界）。 */
 const MAX_LEDGER_ROOTS = 64;
 /**
@@ -342,15 +301,6 @@ type ToolsService = Pick<ToolRuntime, "register" | "guard">;
 type SystemPromptService = Pick<SystemPrompt, "section">;
 
 /**
- * 官方 WebServer（dsh-host-webserver，Service 类 + 一整套 private 路由表字段 → 名义
- * 比较）的方法面投影：本包只 `register()`。路由字面量直接交官方 `WebRoute`，
- * 于是 `kind` 受官方 `WebRouteKind = 'exact' | 'prefix'` 字面量联合约束——旧镜像把它
- * 写成了 `string`（一处静默加宽，写错 kind 只能在运行时被路由表默默拒掉）。
- * disposer 语义也来自官方签名（`() => void`，重复 (kind, path) 抛错）。
- */
-type WebServerService = Pick<WebServer, "register" | "host">;
-
-/**
  * 官方会话存储（`ctx.sessions`）本包唯一用到的那一面：**列出活会话**，由本包自己按 id 找父。
  *
  * 为什么不用官方那个 `get(id: SessionId)`：它收的是品牌串，而本包手里只有从 header 读出来的
@@ -361,27 +311,6 @@ type WebServerService = Pick<WebServer, "register" | "host">;
  * 表；活会话是「此刻在跑的会话」这个量级的小表，而每一跳只扫一次。
  */
 type SessionsFace = Pick<SessionStore, "list">;
-
-/**
- * 官方 JobRegistry（@deepseek-ai/dsh-jobs，abstract Service → 名义比较）的方法面投影：
- * 本包用这七位。三条不是可选的：
- *  - `attachController`：官方件在「没有 controller 服务这个 owner」时**直接拒绝 start**
- *   （离线台架实测，见 plugins/docs/harness/f3-equiv/probe-jobs.mjs）。本包的作业是**未拥有**的（受有作业要
- *   dsh-agent 注册表，第 2 条实测），而未拥有作业只被 global 层服务；落哪一层由**访问方
- *   ctx 的作用域**决定（复核后补测：同一枚注册表，从未绑作用域的插件 ctx attach
- *   ⇒ global 层非空、未拥有 start 放行；改从 createScope 出来的作用域 ctx attach ⇒ 只建
- *   scoped 层、未拥有 start 仍被拒）。官方注释里那句"global 层放的是一台宿主自己的控制面"
- *   正是本包这一枚的归属；web 面上宿主的 `tool-jobs` 被移进了各 preset realm
- *   （packages/bundle/web-app/cordis.patch.yml 明写 `tool-jobs disabled: true`），
- *   所以在这台宿主上"从插件自己 attach"不是冗余，而是未拥有作业起得来的唯一原因。
- *  - `get` / `readAt`：卡片投影的两个读数（状态与非消费的输出窗）。
- *  - `list`：历史窗口要按 kind 在**整个注册表**里找本包的已落定记录（卸载后的残留记录不在
- *   本包的侧表里，只清侧表等于把环留在宿主内存里）。
- */
-type JobsService = Pick<
-  JobRegistry,
-  "start" | "list" | "get" | "readAt" | "kill" | "remove" | "attachController"
->;
 
 /**
  * 官方 `SettingsForms`（installed `@deepseek-ai/dsh-settings/lib/types/index.d.ts`，
@@ -433,13 +362,9 @@ interface HostCtx {
   fiber: Fiber;
   /** 服务读取面取官方 `Context["get"]`（installed `@deepseek-ai/cordis/lib/types/reflect.d.ts`
    *  `get<K extends string & keyof this>(name: K, strict?: boolean): undefined | this[K]`），
-   *  本地不再重述一枚 `get`。本包只读 `webServer`，而它**是**官方声明进 `Context` 的成员
-   *  （installed `@deepseek-ai/dsh-host-webserver/lib/types/index.d.ts`），故走泛型臂拿到
-   *  `undefined | WebServer`，不走那条 `get(name: string): any` 兜底（reflect.d.ts）。
-   *  旧镜像多出的 `(name: string): unknown` 是「还会读别的名字」的占位，实际没有；删它不减防御。
-   *  `undefined` 是官方语义（"or `undefined` when not (yet) provided"）：非 web profile 的宿主确实
-   *  交不出服务，`registerRebuildEndpoints` 里那道 `!webServer` 闸照旧。返回整类而非本包投影不是
-   *  加宽——投影留在**使用点**上（见那里的显式标注）。 */
+   *  本地不再重述一枚 `get`。本包读 `jobs` 与 `sessions` 两枚**可选**服务：它们缺席时只有
+   *  对应的一档功能不可用（后台重建 / 委派树解锁），其余照常。`undefined` 是官方语义
+   *  （"or `undefined` when not (yet) provided"），故两处调用点都必须每次现读、并按缺席分支收口。 */
   get: Context["get"];
   /**
    * 事件订阅面：官方 `Context["on"]` 的那一位。T6 的用户确认闸就挂在
@@ -536,15 +461,6 @@ const TEXT_OUTPUT_SCHEMA: JsonSchemaNode = {
 
 // ── shell 执行与错误映射 ────────────────────────────────────────────────────
 
-/** 沙箱事实的公共后缀（把 mode/enforcement 一并交代清楚，避免只说「被拒」）。 */
-function sandboxFacts(info: ShellSandboxInfo, messages: ZvecGrepMessages): string {
-  const enforcement =
-    info.enforcement === undefined
-      ? ""
-      : fill(messages.sandboxEnforcement, { value: info.enforcement });
-  return fill(messages.sandboxFacts, { mode: info.mode, enforcement });
-}
-
 /**
  * 沙箱侧的**硬**失败：命令根本没跑起来。
  * runnerFailed 与 exitCode 无关——runner 在命令执行前就挂了，exit 码是 runner 的，
@@ -559,11 +475,6 @@ function sandboxFailure(result: ShellRunResult, messages: ZvecGrepMessages): str
     return null;
   }
   return fill(messages.runnerFailed, { facts: sandboxFacts(info, messages) });
-}
-
-/** 沙箱策略拒绝的可读说明（拒绝 ≠ 崩溃：既用于失败消息，也用于成功但残缺的结果）。 */
-function deniedNote(info: ShellSandboxInfo, messages: ZvecGrepMessages): string {
-  return fill(messages.sandboxDenied, { facts: sandboxFacts(info, messages) });
 }
 
 /** 错误详情：首尾各留一段（zg/cargo 等错误的最终原因常在尾部）。
@@ -727,76 +638,6 @@ function successNotes(
     notes.push(fill(messages.stderrNote, { marked: truncatedMark, tail }));
   }
   return notes;
-}
-
-/** 各环境读一个 HF 镜像/代理基地址的优先级：显式入参 > 设置。
- *  `typeof` 判断是 host 侧兜底：值域正常时 schema 的 `.default()` 已保证是字符串，
- *  引用被交回 undefined（条目未投影/宿主退化）时宁可不带 env，也不发一个空 HF_ENDPOINT。 */
-function hfEndpointEnv(config: Config): Record<string, string> | undefined {
-  const endpoint = config.hfEndpoint.get();
-  let env: Record<string, string> | undefined;
-  if (typeof endpoint === "string" && endpoint.trim().length > 0) {
-    // 规范化：去掉尾部斜杠，node-llama-cpp 的 resolveHuggingFaceEndpoint 自会补尾斜杠。
-    const normalized = endpoint.trim().replace(/\/+$/u, "");
-    env = { HF_ENDPOINT: normalized };
-  }
-  return env;
-}
-
-/**
- * 部署值里的可选字符串：空串/空白/非字符串一律归一成 undefined（=「没配」）。
- * 收 `string | undefined` 而不是 `string`：这两个字段是**非 volatile** 部署值，正常装载
- * 下必有值（schema 的 `.default("")`），但行 config 若被绕过 schema 直接塞进来，
- * 这里仍要能判成「没配」而不是 `undefined.trim()` 抛在命令构造的中途。
- */
-function trimmedConfigString(value: string | undefined): string | undefined {
-  const trimmed = typeof value === "string" ? value.trim() : "";
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-/**
- * 远程 embedding 是否被本部署显式开放。默认 false ⇒ 命令构造期就拒掉一切非本地引用。
- * 取值直接用字段本身：schema 声明的是 boolean，cordis 装载期已按它校验过行 config，
- * 再写一遍 `=== true` 只会多一条恒真判断（lint 会当场判它 unnecessary）。
- */
-function allowRemoteEmbedding(config: Config): boolean {
-  return config.allowRemoteEmbedding;
-}
-
-/**
- * zg 子进程的环境变量：HF 镜像 + （仅在部署开放远程 embedding 时的）远程端点与凭据。
- *
- * **密钥只走环境变量，绝不进 argv**。两道原因，都是实测/读源码得来的：
- *   - 本包把整条命令当官方作业的 `JobSpec.label` 回显给卡片，argv 里的密钥会进界面、
- *     进日志、进 `ps` 的进程列表；
- *   - 上游自己就优先读环境变量（zvec-grep v0.2.2 `src/engine/config.ts`：
- *     `nonEmptyEnvironmentValue(environment.ZVEC_GREP_ENDPOINT)`、
- *     `environmentApiKey()` 依次试 `ZVEC_GREP_API_KEY` / `DASHSCOPE_API_KEY` / `QWEN_API_KEY`），
- *     走 env 既是它的正路，也省掉一条 argv 泄露面。
- *
- * **凭据为什么是「宿主进程里某个环境变量的名字」而不是值本身**：官方 subprocess 层会把
- * 名字命中 `/KEY|PASSWORD|SECRET|TOKEN/i` 的变量从子进程环境里**剔掉**
- * （`packages/subprocess/subprocess/src/index.ts` 的 `scrubbedParentEnv`），所以光靠在
- * 宿主进程里 export 一个 `ZVEC_GREP_API_KEY` 是到不了 zg 的——必须由本插件显式转发。
- * 于是配置里只记**名字**、值现读现转：密钥不必落进插件配置文件，也不进 argv、不进日志。
- * 两项都只在 allowRemoteEmbedding 打开时才读：默认部署下这段代码根本不执行。
- */
-function zgEnv(config: Config): Record<string, string> | undefined {
-  const env = { ...hfEndpointEnv(config) };
-  if (allowRemoteEmbedding(config)) {
-    const endpoint = trimmedConfigString(config.remoteEmbeddingEndpoint);
-    if (endpoint !== undefined) {
-      env["ZVEC_GREP_ENDPOINT"] = endpoint;
-    }
-    const keyName = trimmedConfigString(config.remoteEmbeddingApiKeyFrom);
-    // 只读那一个被点名的变量名，不把整份 process.env 倒出去。
-    const key = keyName === undefined ? undefined : process.env[keyName];
-    const secret = key?.trim();
-    if (secret !== undefined && secret.length > 0) {
-      env["ZVEC_GREP_API_KEY"] = secret;
-    }
-  }
-  return Object.keys(env).length > 0 ? env : undefined;
 }
 
 /** 版本探测结果的缓存时长：够长到一次会话里基本只探一次，够短到用户中途升级 zg 也算数。 */
@@ -1191,14 +1032,6 @@ function assertRootExists(root: string, messages: ZvecGrepMessages): string {
 // 保留 `typeof`/`??` 兜底只针对一个真实退化——条目没有 volatile 投影、宿主交回空引用。
 // 值域（1-50 / 1-20 / 1-240）由 Config schema 保证，越界的最终兜底在 lib/cli.ts。
 
-function readDefaultEmbedding(config: Config): string {
-  const raw = config.defaultEmbedding.get();
-  if (typeof raw === "string" && isLocalEmbedding(raw)) {
-    return raw;
-  }
-  return DEFAULT_EMBEDDING;
-}
-
 /**
  * 默认每组结果数：值域 1-50 由 Config schema（隐式命名空间与行 config 共用）保证，
  * 这里只处理「字段缺省」。真正兜住越界的是 cli.clampLimit（命令构造边界）。
@@ -1210,15 +1043,6 @@ function readDefaultLimit(config: Config): number {
 /** search-first 解锁配额：每次成功 zg_search 发放的 grep/rg 次数（值域 1-20 由 schema 保证）。 */
 function readGrepBudget(config: Config): number {
   return config.grepBudgetPerSearch.get() ?? DEFAULT_GREP_BUDGET;
-}
-
-/**
- * zg 传输模式：域内取值由 schema 保证，这里只处理「字段缺省」与宿主退化时交回的非域值。
- * 读一次即传给检索、索引、状态与后台重建四条命令路径——混用模式会在守护进程持有索引
- * 租约时让写侧直接失败，故四条路径必须同源。
- */
-function readClientMode(config: Config, messages: ZvecGrepMessages): ClientMode {
-  return clientModeOf(config.clientMode, messages);
 }
 
 /** search-first 解锁时效（分钟，值域 1-240 由 schema 保证）。 */
@@ -1238,7 +1062,7 @@ function comparablePath(root: string): string {
   return root.startsWith("/private/") ? root.slice("/private".length) : root;
 }
 
-/** 认的清单版本：与上游 `CURRENT_MANIFEST_VERSION` 同值（[v0.2.2] src/engine/manifest.ts:8）。 */
+/** 认的清单版本：与上游 v0.2.2 的 `export const CURRENT_MANIFEST_VERSION = 1` 同值。 */
 const SUPPORTED_MANIFEST_VERSION = 1;
 
 /**
@@ -1509,375 +1333,11 @@ const configSchema = Schema.object({
 });
 export { configSchema as Config };
 
-/** 官方注册表里本包作业的 kind；宿主据此发出的 id 形如 `zvec-grep-rebuild-N`。 */
-const REBUILD_JOB_KIND = "zvec-grep-rebuild";
-
 /**
- * 本 kind 在注册表里的**已落定**记录上限：每次 start 前先剪到 `MAX-1` 条，新那条落定后
- * 正好 `MAX` 条在册（文案与卡片 404 提示都按这个数说）。同时能跑几个不在这里——那是
- * 注册表的容量闸（实测未拥有桶 10，满员是**拒绝**新 start，不是淘汰旧的）。官方件**不会**
- * 自行回收落定记录（"A settled record stays listed until its owner's disposal, service
- * disposal, or an explicit remove"），而注册表又随宿主活着、不随本插件卸载而死 ⇒ 这条
- * 裁剪是本包的责任。注意它只管历史窗口：**同时能跑几个**由注册表的容量说了算
- * （实测默认 10，且超限是**拒绝**，不是替我们杀在跑的任务）。
- */
-const REBUILD_HISTORY_MAX = 10;
-
-/** 卡片视图的尾部长度（打标文案在 lib/messages.ts，随语言走）。 */
-const JOB_OUT_VIEW_CHARS = 4000;
-
-/**
- * 侧表记录：官方注册表管身份、生命周期与输出环，这里只存**注册表给不出**的本包事实。
- *  - `proc`：沙箱事实与 `exitCode` 的现读来源（卡片契约要这两件，官方 JobView 没有槽）；
- *  - `root`：卡片要回显重建的是哪棵树；
- *  - `id`：宿主签发的那枚 `JobId`（品牌类型）。回注册表只用它，绝不把请求带来的字符串递进去；
- *  - `state`：这条作业的**可变**部分，见 {@link RebuildState}。
- *
- * 这里**不存注册表引用**：jobs 每次用时现读（见 `registerRebuildEndpoints` 里的 `jobsOf`），
- * 于是服务被重载时侧表里的旧记录只会走 404 那一臂，而不是继续往一枚已销毁的实例里读。
- */
-interface RebuildRecord {
-  proc: ShellExecution;
-  root: string;
-  id: JobId;
-  state: RebuildState;
-}
-
-/**
- * 一条作业的身份证：官方 `JobView` 上三段**值稳定**的事实（kind / label / startedAt）。
- *
- * 为什么不存「注册表实例引用」：`ctx.get("jobs")` 每读一次都会新建一枚 traceable 代理
- * （installed `@deepseek-ai/cordis/lib/index.js` 的 `getTraceable` → `createTraceable`，
- * 对带 tracker 的服务值恒返回新 Proxy），于是**同一枚服务**的两次读也不 `===`（实测：
- * 真实宿主里 `ctx.get("jobs") === ctx.get("jobs")` 为 false）。拿实例引用做身份比较在真实
- * 宿主上恒为假：轮询端点会对每条活着的重建回 404，卸载效应也只会 kill 进程而不 remove
- * 作业、把环留在宿主内存里。故身份必须由投影**值**推导——换一枚实例时它从 1 重签发 id，
- * 而 startedAt 与 label 同时撞上意味着"同毫秒又发出一条一模一样的命令"，与"用户在服务
- * 重载后一毫秒内又起一次重建"同阶，那时卡片 404 重来即可。
- */
-interface JobIdentity {
-  readonly kind: JobView["kind"];
-  readonly label: JobView["label"];
-  readonly startedAt: JobView["startedAt"];
-}
-
-/** 从名册投影推导身份证（官方 `JobView` 的三段稳定事实）。 */
-function identityOf(view: JobView): JobIdentity {
-  return { kind: view.kind, label: view.label, startedAt: view.startedAt };
-}
-
-/** 两段身份证是否同一回事（三段全同才算）。 */
-function sameIdentity(left: JobIdentity, right: JobIdentity): boolean {
-  return (
-    left.kind === right.kind && left.label === right.label && left.startedAt === right.startedAt
-  );
-}
-
-/**
- * 身份证尚未盖章时的占位出生时刻。
- *
- * `startedAt` 由官方签发（`Date.now()`，永不为 0），而 kind/label 在 `start` 之前就已
- * 已知——那正是本包递给官方的那份规格。于是"start 的同步块里就跑到了 `run()`"那一档读取
- * （官方 `start` 会同步跑第一拍）比对时必然落到"对不上"：那一刻还没有可比的出生时刻，
- *  不该把同 id 的另一条作业当成自己的收走。
- */
-const UNSIGNED_STARTED_AT = 0;
-
-/**
- * 名册里那条 id 是不是**我们**的那条作业。
- *
- * 只比 id 不够：计数器是注册表的实例字段（实测两枚实例对同一 kind 都从 1 开始），换一枚
- * 实例就重名；那时同 id 指向的是另一条作业（另一棵树/另一条命令），旧卡片跟上去就是串台。
- * @param state 这条记录的状态盒
- * @param view 名册里同 id 的那条投影
- * @returns 同一条作业
- */
-function sameJob(state: RebuildState, view: JobView): boolean {
-  // 身份证是投影值三段（kind/label/startedAt），不是服务实例引用——理由见 JobIdentity。
-  return sameIdentity(state.identity, identityOf(view));
-}
-
-/** 终止重建进程：kill 异常忽略（进程可能已自然退出/已被回收）。 */
-function killProc(proc: ShellExecution): void {
-  try {
-    proc.kill();
-  } catch {
-    // 忽略
-  }
-}
-
-/**
- * 一条重建的**可变**状态，与 {@link RebuildRecord} 分开是有原因的：记录要等 `start` 交回 id
- * 与出生时刻才建得出来（在那之前进侧表，`run()` 抛错时就留下一条"名册不认、却永远钉着一枚
- * proc"的幽灵），而 `run()` 里的超时臂与源的读数必须先有一个能写的地方。两边共用这只盒子。
- *
- * 丢失记账为什么归我们：注册表的环只知道自己裁了头部（`output.earliest`，那是**显示**口径），
- * 而执行器的读者抛错或报 lossy 是"zg 的输出确实少了一段"——两者必须分开标，否则会把
- * "看不见了"说成"没跑出来"。
- */
-interface RebuildState {
-  /** 这条作业的身份证（kind/label/startedAt 三段）。`start` 交回投影前
-   *  `startedAt` 是未盖章占位值（见 UNSIGNED_STARTED_AT）。 */
-  identity: JobIdentity;
-  /** 执行器的读者报 lossy 或抛错 ⇒ 真少了字节（与"环按留存窗裁过头部"分开标）。 */
-  lost: boolean;
-  /** 超时说明。不进环（环的写权归注册表的泵），由投影端点合成。 */
-  timeoutNote: string | null;
-}
-
-/**
- * 本包作业的输出面：官方 pull source，stdout/stderr 各一只游标，外加一层"读失败不许
- * 拖垮泵"的兜。选 pull 而不是生产者 push（`JobHandle.append`）是复核
- * 后按实测定下的：
- *  - `proc.observed[*].readFrom` 是**非消费**的独立观察者面（installed dsh-shell
- *    types.d.ts："without stealing bytes from `readOutput`"），与本包前台用的
- *    消费式游标互不干扰——此前本仓写的"官方泵会与 readOutput 争同一份游标"是错的；
- *  - 泵按注册表自己的节拍跑（实测默认 150ms，落定前再排最后一次）⇒ **卡片关着环也前进**，
- *    模型侧 job_output 随时看得见进度；push 形态把可见性绑在了轮询上。
- * @param proc 后台进程句柄
- * @param state 这条重建的状态盒（见 {@link RebuildState}）
- * @returns 交给 JobSpec.output 的两条源
- */
-function rebuildSources(proc: ShellExecution, state: RebuildState): JobOutputSource[] {
-  return (["stdout", "stderr"] as const).map((channel) => {
-    // 官方 `guardSource` 会把抛错的源读作"此后已尽"（实测：400ms 里第 3 抛之后不再敲第四下），
-    // 但那道兜**只把抛错记进宿主日志，环里什么标记都不留** ⇒ 卡片看不出少了一段。本包因此
-    // 自己兜一层：抛错转成"游标原地不动 + 空增量 + 记进 state.lost"。也正因为我们兜住了，
-    // 官方的 exhausted 替身永远不会生效 ⇒ **闩得我们自己上**，否则每 150ms 敲一只已经坏掉的
-    // 读者，一直敲到落定。
-    let failed = false;
-    return {
-      channel,
-      read: (fromByte: number): JobSourceRead => {
-        if (failed) {
-          return { text: "", nextOffset: fromByte, lossy: true };
-        }
-        try {
-          const read = proc.observed[channel].readFrom(fromByte);
-          if (read.lossy) {
-            state.lost = true;
-          }
-          return read;
-        } catch {
-          state.lost = true;
-          failed = true;
-          return { text: "", nextOffset: fromByte, lossy: true };
-        }
-      },
-    };
-  });
-}
-
-/** 官方件对未知/已淘汰 id 抛错；本包的判据要的是"有没有"，不是异常（无 ⇒ null）。 */
-function jobView(jobs: JobsService, id: JobId): JobView | null {
-  try {
-    return jobs.get(id);
-  } catch {
-    return null;
-  }
-}
-
-/** 轮询端点的一次成对读数：状态投影 + 留存窗内容；注册表已无此 id ⇒ undefined。 */
-function readRebuildOutput(
-  jobs: JobsService,
-  id: JobId,
-): { view: JobView; retained: JobOutputRead } | null {
-  // 侧表里有、注册表里没有是**合法事件**（宿主重载了 jobs 那一行 ⇒ 它清空名册，而我们
-  // 手里的记录还在）。必须折成 null 让调用方回 404，绝不能让异常抛穿到 webServer：
-  // 宿主对 handler 抛出的兜法是 `logger.warn` 一条 + **写一枚没有 body、也没有 content-type
-  // 的 400**（只有头已发时才 `res.destroy()`；installed dsh-host-webserver lib/index.js:246-256
-  // 实测原码）。卡片见到没有 json 类型的响应就判"取不到载荷"⇒ error 终止态 ⇒ 停止轮询 ⇒
-  // 一条还在跑的重建从此在界面上消失，而它自己也再不可能被窗口裁剪回收。
-  // （归因从旧注释的"不写响应 / socket hang up"改过来：后果一样糟，但照旧注释去查 socket
-  // 的人会查错地方。）
-  try {
-    return { view: jobs.get(id), retained: jobs.readAt(id, 0) };
-  } catch {
-    return null;
-  }
-}
-
-/** 官方 JobStatus 里"仍在跑"的两枚：`stopping` 是取消已发出、进程还没收完。 */
-function isLiveStatus(status: JobStatus): boolean {
-  return status === "running" || status === "stopping";
-}
-
-/**
- * 历史窗口有界：按注册表的**可见集合**淘汰本 kind 最老的已落定记录。
- *
- * 剪到**只剩 `MAX-1` 条**才是对的：这一剪发生在 start 之前，紧接着就有一条新作业进来，
- * 它落定之后名册里正好是最近 `MAX` 条已落定记录 ⇒ 与卡片文案「只保留最近 10 条已结束的重建」
- * 同一口径。剪到 `MAX` 条会让册子在任何时刻都有 `MAX+1` 条已结束记录（实测 11 条），
- * 最初把这条判反了（只看剪完那一刻的 9 条），后来回退。
- * 在跑的一条不动——官方件对超额的答法是拒绝 start（实测），不是替我们杀任务，
- * 这里跟着杀等于把"用户的重建被静默终止"重新发明一遍。
- * 侧表里没有的 id（上一次 apply 卸载后残留的记录）同样要能清掉，所以遍历的是
- * `list()` 而不是 `records`。
- * @param jobs 官方注册表
- * @param records 本包侧表（被淘汰记录同步删掉）
- * @returns {void}
- */
-function pruneRebuildHistory(jobs: JobsService, records: Map<string, RebuildRecord>): void {
-  const ours = jobs.list().filter((job) => job.kind === REBUILD_JOB_KIND);
-  const settled = ours.filter((job) => !isLiveStatus(job.status));
-  for (const job of settled.slice(0, Math.max(settled.length - (REBUILD_HISTORY_MAX - 1), 0))) {
-    jobs.remove(job.id);
-    records.delete(job.id);
-  }
-}
-
-/**
- * 从官方容量闸的错误文本里取出上限（实测原文：`background job limit reached for this
- * owner (limit: 10)`）。认不出来 ⇒ undefined，调用方退回通用的启动失败文案。
- * 为什么单独认这一条：它是本包唯一会把宿主英文原话插进中文卡片的错误，又恰恰最该翻成
- * 人话的那一条——用户此时要做的是去 job_list 里收掉不需要的作业，而不是读一句英文。
- */
-function capacityLimitOf(error: unknown): string | undefined {
-  const matched = /\(limit: (?<limit>\d+)\)/u.exec(errorText(error));
-  return matched?.groups?.["limit"];
-}
-
-/**
- * 「工作区重建」动作端点的四道前置校验：绝对路径 + 归一化、本 daemon 观测过的白名单、
- * 目录此刻仍存在。不过就把错误就地答完并返回 undefined（错误文本全走双语字典）。
- *
- * 这四道是**动作**端点的闸门：webServer 可被绑到本机网卡的具体地址，没有白名单的话任何能连上
- * 服务面的一方都能拿任意绝对路径去 `zg index --rebuild`——读遍那棵树、写 `.zvec-grep/`，
- * 还可能把其中的非隐藏敏感文件灌进向量库并回显到上下文。
- * @param req 请求对象
- * @param res 响应对象（不过时由本函数就地应答）
- * @param ledger 观测到的工作区白名单
- * @param started 本次请求语言的文案表
- * @returns 归一化后可用的绝对路径；不合格时 null（那时本函数已经答过）
- */
-function acceptableRebuildRoot(
-  req: IncomingMessage,
-  res: ServerResponse,
-  ledger: RootLedger,
-  started: ZvecGrepMessages,
-): string | null {
-  let root: string;
-  try {
-    root = assertAbsoluteRoot(queryParam(req, "root"), started);
-  } catch (error) {
-    sendJson(res, 400, {
-      ok: false,
-      error: fill(started.endpointRootInvalid, { reason: errorText(error) }),
-    });
-    return null;
-  }
-  if (!ledger.has(root)) {
-    sendJson(res, 403, { ok: false, error: fill(started.endpointRootUntracked, { root }) });
-    return null;
-  }
-  if (!existsSync(root)) {
-    sendJson(res, 400, { ok: false, error: fill(started.endpointRootGone, { root }) });
-    return null;
-  }
-  return root;
-}
-
-/**
- * 这个 root 上有没有**仍在跑**的本包重建？有 ⇒ 返回那枚作业 id 让新面板跟随。
- *
- * 判据是三条一起："侧表里有这条" + "名册里同 id 的那条确实是我们那条（比出生时刻）" +
- * "状态还在跑/正在收"。第二条不能省：jobs 被重载之后 id 会重名，只查侧表就把一张新面板
- * 领到别人的作业上。
- * 就地答完（200 + 复用旗标）并返回 true ⇒ 调用方直接 return；否则返回 false 继续起进程。
- * @param jobs 调用方已确认在场的注册表（缺席那一支在启动端点更早就答过 503）
- * @param records 本包侧表
- * @param res 响应对象
- * @param root 已归一化的工作区
- * @returns 是否已把这张面板领到在跑的那条上（领到了就地答完 200）
- */
-function followRunningRebuild(
-  jobs: JobsService,
-  records: Map<string, RebuildRecord>,
-  res: ServerResponse,
-  root: string,
-): boolean {
-  // 调用方已保证注册表在场（缺席的那一支在启动端点更早就答过 503），故这里不再判
-  // 一次：那个分支只会是永远走不到的死代码，而死代码正是覆盖率门禁要抓的东西。
-  const following = [...records.values()].find((record) => {
-    if (record.root !== root) {
-      return false;
-    }
-    const view = jobView(jobs, record.id);
-    return view !== null && sameJob(record.state, view) && isLiveStatus(view.status);
-  });
-  if (following === undefined) {
-    return false;
-  }
-  sendJson(res, 200, { ok: true, jobId: following.id, reused: true });
-  return true;
-}
-
-/**
- * 把「起一条 zg 失败」的原因翻成卡片文案。
- *
- * **本函数不再杀进程**：杀现在由 `attachIndexWrite` 负责——它才是真正握着那条进程句柄、
- * 且知道作业有没有登记成功的地方（preflight 在 controller/容量/入参上拒掉作业时，spawn
- * 已经发生，不杀就会留下一条没登记、谁也停不掉的 zg）。这里只管文案。
- *
- * 满员那一档单独翻文案：它是本包唯一会把宿主英文原话插进卡片的错误，又最该翻成人话
- * （用户要做的是去 job_list 收作业，不是读一句英文）。
- * @param error 官方件（或本包 starter）抛出的原因
- * @param started 本次请求语言的文案表
- * @returns 可直接进响应体的错误文案
- */
-function startupFailureText(error: unknown, started: ZvecGrepMessages): string {
-  const capacity = capacityLimitOf(error);
-  return capacity === undefined
-    ? fill(started.endpointStartFailed, { reason: errorText(error) })
-    : fill(started.endpointJobsAtCapacity, { limit: capacity });
-}
-
-/**
- * 在 controller 闸门下起一条未拥有作业。
- *
- * 官方件在"没有 controller 服务这个 owner"时直接拒绝 `start`（实测台架第 1 条），而未拥有
- * 作业只被 global 层服务；web 面上宿主自己的 `tool-jobs` 被移进了各 preset realm
- * （packages/bundle/web-app/cordis.patch.yml 把 tool-jobs 在宿主平面 disabled），
- * 所以本包必须自带一枚从无作用域上下文 attach 的 controller。但**只在 start 这一瞬挂**：
- * 实测挂上即放行、摘掉即恢复拒绝、可反复，而 global 层的 controller 只被 `servesOwner`
- * 读（installed dsh-jobs-local 全文只有那一处消费），作业的后续（read/kill/落定）都不
- * 依赖它。留一枚常驻 token 等于在"宿主故意没装 job 工具"的组成里替全宿主开着那道闸门——
- * 官方契约写的是"生产者不能起一台 owner 收不掉、停不掉的作业"，常驻就是把它反过来做。
- */
-function startUnderController(jobs: JobsService, spec: JobSpec): JobId {
-  const detach = jobs.attachController("zvec-grep: rebuild");
-  try {
-    return jobs.start(spec);
-  } finally {
-    detach();
-  }
-}
-
-/**
- * 后台进程的沙箱事实提示。runner 失败 / 策略拒绝都不许被显示成「完成」：
- * dsh-shell 只在有沙箱的执行器下填 proc.sandbox，读了它才能把「zg 自己失败」
- * 与「zg 根本没跑起来」分开。
- */
-function procSandboxNote(proc: ShellExecution, messages: ZvecGrepMessages): string | null {
-  const info = proc.sandbox;
-  if (info === undefined) {
-    return null;
-  }
-  if (info.runnerFailed === true) {
-    return fill(messages.rebuildRunnerFailed, { facts: sandboxFacts(info, messages) });
-  }
-  if (info.denied) {
-    return fill(messages.rebuildDenied, { denied: deniedNote(info, messages) });
-  }
-  return null;
-}
-
-/**
- * 工作区白名单：重建端点只接受**本 daemon 真实观测到过的会话工作区**
+ * 工作区白名单：重建读面只接受**本 daemon 真实观测到过的会话工作区**
  * （guard 每次工具调用、execute 每次 root 解析都会登记）。
- * webServer 可被绑到本机网卡的具体地址，端点又是一个会读遍整棵树、写 .zvec-grep/ 的
- * 动作，绝不能接受任意绝对路径；键经 assertAbsoluteRoot 归一，
- * `/repo/../repo` 与 `/repo/` 这类同物异写不再能绕过比较。
+ * 重建是一个会读遍整棵树、写 .zvec-grep/ 的动作，绝不能接受任意绝对路径；
+ * 键经 assertAbsoluteRoot 归一，`/repo/../repo` 与 `/repo/` 这类同物异写不再能绕过比较。
  */
 export interface RootLedger {
   add: (root: string) => void;
@@ -1997,7 +1457,7 @@ export function createIndexProbeCache(
 }
 
 /**
- * 工作区白名单：只认本 daemon 真实观测过的会话工作区（重建端点与 root 授权共用）。
+ * 工作区白名单：只认本 daemon 真实观测过的会话工作区（重建与 root 授权共用）。
  *
  * 条目记的是**最后一次被提到**的时刻，不是第一次：白名单的用途是「这棵树刚被用过」，
  * 一直热着的键理应活得比冷键久。故 `has` 命中即触摸，淘汰先按有效期、再按最近使用。
@@ -2034,635 +1494,13 @@ export function createRootLedger(
       return true;
     },
     list(): string[] {
-      return [...seen.keys()];
+      // 与 has() 同一口径过滤：过期没被清扫掉的键仍占在表里（`evictAged` 只在每次 add 时
+      // 全量扫一遍），但「列给卡片当候选」与「点下去会不会被拒」必须是同一个答案，
+      // 否则界面列出的一条，点重建只会得到一句「本 daemon 没观测过它」。
+      const at = now();
+      return [...seen].filter(([, seenAt]) => at - seenAt < ttlMs).map(([root]) => root);
     },
   };
-}
-
-/** 重建端点组的依赖（对象化以避开 max-params；文案按请求现取）。 */
-interface RebuildEndpointDeps {
-  /** 只用来挂释放器：给的是 `inject(["webServer"])` 子 fiber 的上下文，故收窄到效应面。 */
-  ctx: Pick<Context, "effect">;
-  host: HostCtx;
-  /** apply 收到的那份 volatile 引用配置（端点每次现读，改完不必重载插件）。 */
-  config: Config;
-  csrf: string;
-  ledger: RootLedger;
-  /** 现取一份文案（语言随官方 locale 偏好，改语言不必重载插件）。 */
-  messages: () => ZvecGrepMessages;
-  /** 活跃重建状态源（与工具面共用同一份，占位与去重才真正跨两条入口生效）。 */
-  rebuilds: RebuildRegistry;
-  /** 官方注册表现读面（与工具面共用同一份名册）。 */
-  jobsOf: () => JobsService | undefined;
-  /** 本包作业侧表（与工具面共用同一张表）。 */
-  records: Map<string, RebuildRecord>;
-  /** zg 版本门槛（与工具面共用同一份缓存，探测结果不该因入口不同而分叉）。 */
-  versionGate: ZgVersionGate;
-  /** 守护进程就绪门槛（卡片要显示这一档，与三条工具共用同一份缓存）。 */
-  serverGate: ZgServerGate;
-}
-
-/**
- * 起一条 `zg index` 写操作所需的那部分依赖。
- *
- * 单独成一层是因为它有**两类调用方**：三条 HTTP 路由，以及模型侧的 `zg_index
- * background=true`。后者不是 HTTP 请求，过去要凑出 `RebuildRoutes` 就得给 `csrf` 塞一个
- * 空串、给 `servingNonLoopback` 塞一个 `false`——两个哑值，它们的「没被用到」只靠当前
- * 这两个函数恰好不读它们来保证。收窄成这一层之后，哑值在类型上不再可能构造。
- */
-interface IndexWriteRoutes {
-  host: HostCtx;
-  /** apply 收到的那份 volatile 引用配置（每次现读，改完不必重载插件）。 */
-  config: Config;
-  /** 现取一份文案（语言随官方 locale 偏好，改语言不必重载插件）。 */
-  messages: () => ZvecGrepMessages;
-  /** 官方注册表每次用时现读（理由见 registerRebuildEndpoints）。 */
-  jobsOf: () => JobsService | undefined;
-  /** 本包侧表（引用共享：三条路由、模型侧后台索引与卸载效应读写同一张表）。 */
-  records: Map<string, RebuildRecord>;
-  /** 活跃重建状态源：端点与模型侧索引工具共用，占位互斥跨入口成立。 */
-  rebuilds: RebuildRegistry;
-  /** zg 版本门槛：起 zg 之前先过一道（与三条工具共用同一份缓存）。 */
-  versionGate: ZgVersionGate;
-}
-
-/**
- * 三条重建路由共享的运行时依赖：每次 `registerRebuildEndpoints` 一份，闭包量对象化
- * 是为了让拆出来的 handler 函数不越 over `max-params`（同一份状态，不是新的持有者）。
- * 比 {@link IndexWriteRoutes} 多的四位全属 HTTP 面：CSRF token、白名单、绑定地址，
- * 以及卡片要显示的守护进程就绪态（与三条工具共用同一份门槛缓存，两个入口不该各探各的）。
- */
-interface RebuildRoutes extends IndexWriteRoutes {
-  csrf: string;
-  ledger: RootLedger;
-  servingNonLoopback: boolean;
-  serverGate: ZgServerGate;
-}
-
-/** 引导端点：交回本次 apply 生成的 CSRF token、白名单里观测到的工作区，以及守护进程就绪态。 */
-async function handleRebuildRoots(
-  routes: RebuildRoutes,
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> {
-  const { csrf, ledger, servingNonLoopback, serverGate } = routes;
-  // 信任闸门（shared/lib/trust）：必须是 handler 体的第一条语句——先验权威再谈方法/参数。
-  if (!guardTrust(req, res, { servingNonLoopback })) {
-    return;
-  }
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    res.setHeader("Allow", "GET");
-    sendJson(res, 405, { ok: false, error: "GET only" });
-    return;
-  }
-  // 自家 isCrossOrigin 支在信任闸门之后不可达：trust 的 sec-fetch-site 白名单更严、错误文本同一句
-  // （既有的「跨源 403」用例仍然绿，拒它的是闸门）。
-  // 守护进程就绪态排在两道闸门**之后**才探：不该让一个被拒的请求起一发子进程。
-  // 这条探测走 TTL 缓存（与三条工具同一份），卡片每开一次不至于多起一次 zg。
-  const serverReady = await serverGate.ready();
-  sendJson(res, 200, { ok: true, csrf, roots: ledger.list(), serverReady });
-}
-
-/**
- * 交给注册表的作业规格：输出源 + `run` 的两枚钩子（cancel / done）与那枚 kill 定时器。
- * 单独成一段是因为它只在 `start` 的那一拍被同步调用一次，与「登记进侧表」是两件事。
- * @param routes 本次注册的共享依赖（config 现读超时、host 挂 timer、jobsOf 现读注册表）
- * @param proc 已经起来的 zg 进程
- * @param state 这条重建的状态盒（与侧表记录共用）
- * @param command 实际执行的命令行（作业 label，模型在 job_list 里看见的那句）
- * @returns 官方 JobSpec：kind / label / output / run
- */
-function rebuildJobSpec(
-  routes: IndexWriteRoutes,
-  proc: ShellExecution,
-  state: RebuildState,
-  command: string,
-  root: string,
-): JobSpec {
-  const { config, host, jobsOf, messages } = routes;
-  return {
-    kind: REBUILD_JOB_KIND,
-    label: command,
-    output: rebuildSources(proc, state),
-    run: (handle) => {
-      // 名册里那条还是不是我们这条：换过注册表就不是（id 会重名），那就谁也不许动它。
-      const liveJob = (): { jobs: JobsService; status: JobStatus } | null => {
-        const live = jobsOf();
-        if (live === undefined) {
-          return null;
-        }
-        const view = jobView(live, handle.id);
-        if (view === null || !sameJob(state, view)) {
-          return null;
-        }
-        return { jobs: live, status: view.status };
-      };
-      // 后台进程必须显式加超时：dsh-shell 契约明确 start 不应用 timeoutMs
-      //（"no timeout applies to background processes"），否则 zg 挂住即 job
-      // 永远 running、卡片每 2s 无限轮询。用宿主 timer 归属插件纤维，插件
-      // 卸载时随 effect 自动回收；进程先结束则取消定时器。
-      const cancelKillTimer = host.timer.timeout(() => {
-        // 进程可能恰在超时点自然完成——注册表的落定排在 done 的微任务链上，此刻
-        // 名册里仍是 running。以实时的 proc.status 为准，否则会给一条已成功的重建
-        // 记下超时，并与随后落定的 completed 矛盾。
-        if (proc.status !== "running") {
-          return;
-        }
-        // 名册里已在收（stopping）或已收完 ⇒ 有人负责了，不再重复。
-        const live = liveJob();
-        if (live !== null && live.status !== "running") {
-          return;
-        }
-        const minutes = Math.round(config.indexTimeoutMs / 60_000);
-        state.timeoutNote = fill(messages().rebuildTimeout, { minutes });
-        if (live === null) {
-          // 注册表已经不认这条了（服务被重载）⇒ 只剩我们手里的进程可收，直接杀。
-          killProc(proc);
-          return;
-        }
-        // 超时也经注册表收，而不是绕过它直接杀进程：官方件据此把记录推到 stopping，
-        // 并把 reason 追加进模型可见的 detail（实测），模型因此分得清"超时回收"与
-        // "用户手工 job_kill"；进程本身由它回调上来的 cancel() 终止。
-        live.jobs.kill(handle.id, undefined, fill(messages().jobReasonTimeout, { minutes }));
-      }, config.indexTimeoutMs);
-      return {
-        cancel: () => {
-          killProc(proc);
-        },
-        // pull source 形态下生产者不再往环里折任何东西（官方契约："a producer folds
-        // nothing into its done"）——最后一次排水由注册表在落定前自己跑（实测）。
-        // await 形态取代 .then 链：官方 JobSpec.run 必须**同步**交出 JobHooks
-        // （dts 原文 "Start the work after preflight and synchronously return its
-        // hooks"），所以 await 只能装在一枚立即执行的 async 箭头里当场产出
-        // Promise<JobOutcome>，不能把 run 本身改成 async（那会让 run 返回 Promise）。
-        done: (async () => {
-          await proc.done;
-          cancelKillTimer();
-          // 进程落定即交还占位并唤醒等锁的检索者。放在 finally 里：无论产出成败都
-          // 必须释放，否则这棵树会被永久标成「重建中」，检索一直排队等一条已死的重建。
-          try {
-            return jobOutcomeOf(proc);
-          } finally {
-            routes.rebuilds.release(root);
-          }
-        })(),
-      };
-    },
-  };
-}
-
-/**
- * `ignoreFiles` 的可用性预检：模型给的第 N 条忽略文件必须是**当前进程读得了的普通文件**。
- *
- * 为什么必须预检（全部实测，见 test/e2e/zg-cli.test.ts）：真 zg 遇到读不成的 ignore 文件
- * **不是**按"没有这条规则"继续，而是整次索引失败（`ZVEC_GREP.ENGINE.INDEXING.WORKSPACE_FAILED`，
- * 原因是 ENOENT / EACCES / EISDIR），并且那个坏路径会**写进工作区索引的状态**——此后这条树上的
- * `zg index` 与 `zg status` 都报同一个错，`--reset-paths` 清不掉，只有 `zg_index drop`（整棵
- * 索引删掉重来）能救。一个拼错的文件名、一个存在但读不了的文件（mode 000 / 他人属主，用绝对路径
- * 还够得着系统文件）、或一个目录，就把用户的工作区索引弄坏，属于必须在起进程之前拦下的那一类。
- *
- * 判据「读得了 + 是文件」合成**一次** try（accessSync 在前）：`statSync().isFile()` 对 mode 000
- * 的文件照样返回 true（stat 只要父目录可搜索、不要文件本身可读），故先 `accessSync(R_OK)` 补上
- * "当前进程真能 open 来读"这半段——它与 zg 的读权限同 uid 同源（root 下两者都放行、非 root 下
- * 两者都拒）；再用 `isFile()` 挡掉目录。**不拆成「不存在」与「读不了」两条独立分支**：可读性那
- * 一档在 windows（chmod 只翻只读位，属主仍读得了）与 root（绕过 DAC）下根本造不出来，拆成独立
- * 分支会让 CI 的 windows 那格在 100% 覆盖率门禁下无从而钉（本仓不用 coverage-ignore 逃生口）。
- * 合成一句「不是存在且可读的文件」文案，三种成因都准确覆盖，且 catch 由「不存在」这一档跨平台钉住。
- *
- * drop 那一臂整段跳过：`--drop` 的命令只有 `zg index <root> --drop --yes`，ignoreFiles 被
- * buildIndexCommand 静默丢掉、根本不进 zg（见 lib/cli.ts 的 drop 分支），预检它没有意义，还会
- * 拿"给一个真实存在的忽略文件"这句误导文案把一次合法的删索引拦下。判 drop 用与构造器**同一个**
- * `boolOf`，两处口径不会漂。
- * @param args 索引入参（`ignoreFiles` 单值或数组；`drop` 为真时整段跳过）
- * @param root 已归一的工作区根（相对路径按它解析）
- * @param messages 文案表
- * @returns {void}
- * @throws Error 指向第一个不可用的条目（不静默丢弃用户给的那一项）
- */
-function assertIgnoreFilesExist(args: IndexArgs, root: string, messages: ZvecGrepMessages): void {
-  if (boolOf(args.drop, "drop", messages)) {
-    return;
-  }
-  for (const entry of singleOrList(args.ignoreFiles, "ignoreFiles", messages)) {
-    const target = entry.startsWith("/") ? entry : `${root}/${entry}`;
-    let usable = false;
-    try {
-      // 先判可读（不存在 / 无权限 / 父目录不可搜索都在这里抛），再判是普通文件（挡掉目录）。
-      accessSync(target, constants.R_OK);
-      usable = statSync(target).isFile();
-    } catch {
-      // 读不到就不是可用文件：保留初始的 false，统一走下面那句文案。
-    }
-    if (!usable) {
-      throw new Error(fill(messages.ignoreFileMissing, { path: entry, root }));
-    }
-  }
-}
-
-/**
- * 起一条 `zg index`：命令构造 + resolve + execute 三步。
- *
- * 设置卡重建端点与模型侧后台索引**共用**这一个函数（不是复制品），所以两条入口起的作业
- * 在名册、状态投影、轮询端点上完全同形。命令形态由 `indexArgs` 决定，故它也服务普通建索引。
- *
- * 版本门槛排在命令构造**之前**：确知装的是太老的 zg 时，在这一行就给出可照做的指引，
- * 而不是起一条命令形态对不上的 zg 再让人对着结果猜。注意这个顺序也保证了「门槛失败」
- * 发生在任何进程存在之前，调用方那条 `release` 出口足以收干净。
- *
- * 任一步抛错即就地翻成 `{ error, status }`；**本函数不写响应、不释放占位**，两件事都由
- * 调用方做（它们才持有 root 与响应对象）。
- * @param routes 本次注册的共享依赖（现读 config / host / jobsOf）
- * @param started 本次请求语言的文案表
- * @param indexArgs 已归一 root 的索引入参
- * @param embedding 设置里的默认 embedding（`indexArgs.embedding` 为空时用它）
- * @returns 起来的进程与它跑的命令；失败为 `{ error, status }`
- */
-async function spawnIndexWrite(
-  routes: IndexWriteRoutes,
-  started: ZvecGrepMessages,
-  indexArgs: IndexArgs,
-  embedding: string,
-): Promise<{ proc: ShellExecution; command: string } | { error: string; status: number }> {
-  const { config, host } = routes;
-  let spawned: { proc: ShellExecution; command: string };
-  try {
-    // 版本门槛先于命令构造：太老的 zg 会在这一行就拿到可照做的指引，而不是起一条
-    // 命令形态对不上的 zg 再让人对着结果猜。
-    await routes.versionGate.ensure(started);
-    // 与前台索引同一道预检（见 assertIgnoreFilesExist）：后台这条路的入参同样来自模型。
-    assertIgnoreFilesExist(indexArgs, assertAbsoluteRoot(indexArgs.root, started), started);
-    const built = buildIndexCommand(
-      indexArgs,
-      embedding,
-      started,
-      readClientMode(config, started),
-      allowRemoteEmbedding(config),
-    );
-    const env = zgEnv(config);
-    // 注：后台路径显式带 onExpiry:'none' 取无界（0.1.7 起 bash-local resolve 缺省
-    // 'kill'，不传就会被缺省 timeoutMs 杀掉），deadline 由下面宿主 timer 挂的 kill
-    // 定时器兜底。stdoutMaxBytes 在 0.1.7 对每次 spawn 都生效（bash-local execute 把
-    // spec.stdoutMaxBytes 传进 spawnSpec），它约束的是**执行器**那段缓冲；进了官方环
-    // 之后的留存窗另算（retainBytes，实测 262144 UTF-8 字节）。两项都是部署值，现读
-    // Config（行 config 改了这里立即跟着走，不留写死的常量分支）。
-    const spec = host.shell.resolve({
-      command: built.command,
-      workdir: built.workdir,
-      onExpiry: "none",
-      stdoutMaxBytes: config.stdoutMaxBytes,
-      ...(env ? { env } : {}),
-    });
-    spawned = { proc: await host.shell.execute(spec), command: built.command };
-  } catch (error) {
-    return { error: fill(started.endpointStartFailed, { reason: errorText(error) }), status: 500 };
-  }
-  return spawned;
-}
-
-/**
- * 把起来的那条进程登记进官方注册表与本包侧表，交回宿主签发的 id。
- *
- * 三种失败（注册表换人 / 同名不同命 / start 抛错）都**先把那条进程杀掉**再交回错误：
- * 此刻作业没进名册，没人能通过 job 工具收它，不杀就是一条孤儿 zg 占着这棵树的写锁。
- * 同样地，本函数不写响应、不释放占位——那两件事由调用方做。
- * @param routes 本次注册的共享依赖（jobsOf 现读、侧表引用）
- * @param root 已过前置校验的工作区（写进侧表供卡片回显）
- * @param started 本次请求语言的文案表
- * @param spawned spawnIndexWrite 交回的进程与命令
- * @returns 宿主签发的 `{ jobId }`；失败为 `{ error, status }`
- */
-function attachIndexWrite(
-  routes: IndexWriteRoutes,
-  root: string,
-  started: ZvecGrepMessages,
-  spawned: { proc: ShellExecution; command: string },
-): { jobId: JobId } | { error: string; status: number } {
-  const { jobsOf, records } = routes;
-  const { proc, command } = spawned;
-  // 上面 `await host.shell.execute()` 让出了一拍：那期间 `jobs` 可能被关掉或换成另一枚
-  // 实例。用** spawn 之前**那枚引用去 prune/start 等于往一枚可能已死的注册表里登记
-  // （现在只是恰好不炸：实测已 dispose 的 fiber 上 attachController 抛
-  // `cannot create effect on inactive context`，被下面的 catch 收成 500）。现读现用。
-  const starting = jobsOf();
-  if (starting === undefined) {
-    killProc(proc);
-    return { error: started.endpointJobsUnavailable, status: 503 };
-  }
-  pruneRebuildHistory(starting, records);
-  // 丢失记账先于 start：源的 read 可能在 start 里同步跑第一拍。
-  const state: RebuildState = {
-    // kind/label 与下面那份规格同源（就是命令本身）；startedAt 等官方签。
-    identity: { kind: REBUILD_JOB_KIND, label: command, startedAt: UNSIGNED_STARTED_AT },
-    lost: false,
-    timeoutNote: null,
-  };
-  let jobId: JobId;
-  try {
-    jobId = startUnderController(starting, rebuildJobSpec(routes, proc, state, command, root));
-    // 登记进侧表与身份证都在 start **成功之后**：`run()` 里任何一步抛错（宿主 timer 面
-    // 已拆就是这一档）都会被官方件按"不注册、序号作废"处理，那时侧表里不该留着这条。
-    // 身份证与登记同一步完成：`run()` 若抛错，官方件按"不注册、序号作废"处理（实测），
-    // 那时侧表里不该留着这条记录。
-    state.identity = identityOf(starting.get(jobId));
-    const clashed = records.get(jobId);
-    // 换过注册表 ⇒ 同 id 是另一条作业（新实例的计数器又从 1 开始）。顶掉旧记录会让那张旧
-    // 面板从此跟着**另一棵树**的重建走（root 当场换人），而旧的 zg 也没人再管——两边都是坏
-    // 结果。所以这里反过来：把刚起的这条收掉、拒绝登记，并响亮地告诉调用方换过服务了要重载
-    // 插件。旧那条的记录与超时臂都原样留着。
-    if (clashed !== undefined && !sameIdentity(clashed.state.identity, state.identity)) {
-      killProc(proc);
-      return { error: started.endpointRegistryReplaced, status: 503 };
-    }
-    records.set(jobId, { proc, root, id: jobId, state });
-  } catch (error) {
-    killProc(proc);
-    return { error: startupFailureText(error, started), status: 500 };
-  }
-  return { jobId };
-}
-
-/** 启动端点：四道前置校验（同源 / CSRF / 白名单 / 目录存在）后复用或起一条重建。 */
-async function handleRebuildStart(
-  routes: RebuildRoutes,
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> {
-  const { csrf, jobsOf, ledger, messages, records, servingNonLoopback } = routes;
-  // 信任闸门（shared/lib/trust）：必须是 handler 体的第一条语句——先验权威再谈方法/参数。
-  if (!guardTrust(req, res, { servingNonLoopback })) {
-    return;
-  }
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    sendJson(res, 405, { ok: false, error: "POST only" });
-    return;
-  }
-  const guarded = await guardBody(req, res, {
-    maxBytes: REBUILD_BODY_MAX_BYTES,
-    csrf: { token: csrf, headerName: REBUILD_CSRF_HEADER },
-  });
-  if (guarded === null) {
-    // guardBody 已就地响应（403 跨域 / 403 CSRF / 413 超限 / 400 坏流）。
-    return;
-  }
-  const started = messages();
-  const root = acceptableRebuildRoot(req, res, ledger, started);
-  if (root === null) {
-    return;
-  }
-  const jobs = jobsOf();
-  if (jobs === undefined) {
-    // 官方注册表不在（宿主没装 dsh-jobs-local）：这条动作没有降级形态——没有环、
-    // 没有容量、也没有人能在 job_list 里看到它，起一条没人管的 zg 比不起更糟。
-    sendJson(res, 503, { ok: false, error: started.endpointJobsUnavailable });
-    return;
-  }
-  // 占位是**互斥的唯一依据**，必须落在第一个 await 之前。先「查在不在跑」再占位，
-  // 两次并发点击会同时通过那次查询、各自 spawn——两个进程在同一份索引上互相啃，
-  // 后一条被 zg 的写锁直接顶掉并报成「启动失败」。改成「先占位、抢不到就跟随」，
-  // 这条竞态就没有窗口了。
-  if (routes.rebuilds.claim(root, "card") === null) {
-    // 抢不到说明同根已有一条在跑：把那条的 id 回给这张面板跟随。
-    // 跟不到（它正在落定、或注册表刚被换过）也要**答完**：这一支早返回又不写响应，
-    // 卡片侧只会看到一次「查询状态失败」并停止轮询，而那条重建还在界面上凭空消失。
-    if (!followRunningRebuild(jobs, records, res, root)) {
-      sendJson(res, 409, { ok: false, error: started.endpointRebuildInFlight });
-    }
-    return;
-  }
-  const embedding = readDefaultEmbedding(routes.config);
-  const spawned = await spawnIndexWrite(
-    routes,
-    started,
-    { root, embedding, rebuild: true },
-    embedding,
-  );
-  if ("error" in spawned) {
-    // spawn 抛错或被拒：占位必须交还，否则这棵树会被永久标记成「重建中」。
-    routes.rebuilds.release(root);
-    sendJson(res, spawned.status, { ok: false, error: spawned.error });
-    return;
-  }
-  const attached = attachIndexWrite(routes, root, started, spawned);
-  if ("error" in attached) {
-    routes.rebuilds.release(root);
-    sendJson(res, attached.status, { ok: false, error: attached.error });
-    return;
-  }
-  routes.rebuilds.attach(root, attached.jobId);
-  sendJson(res, 200, { ok: true, jobId: attached.jobId });
-}
-
-/** 轮询端点：官方状态投影 + 退出码/沙箱事实 + 打标后的输出尾窗（卡片每 2s 敲一次）。 */
-function handleRebuildStatus(
-  routes: RebuildRoutes,
-  req: IncomingMessage,
-  res: ServerResponse,
-): void {
-  const { jobsOf, messages, records, servingNonLoopback } = routes;
-  // 信任闸门（shared/lib/trust）：必须是 handler 体的第一条语句——先验权威再谈方法/参数。
-  if (!guardTrust(req, res, { servingNonLoopback })) {
-    return;
-  }
-  // 自家 isCrossOrigin 支在信任闸门之后不可达：trust 的 sec-fetch-site 白名单更严、错误文本同一句
-  // （既有的「跨源 403」用例仍然绿，拒它的是闸门）。
-  const jobId = queryParam(req, "jobId");
-  // 侧表就是这条投影的授权边界：官方 id 是可预测的 `<kind>-N`（宿主 bash 工具的
-  // `bash-1` 同样猜得到），而它不在本包表里 ⇒ 一律 404，绝不代读别人的作业。
-  const record = jobId === null || jobId === "" ? undefined : records.get(jobId);
-  if (record === undefined) {
-    // 历史窗口用尽后旧 jobId 会消失——给出可行动提示，而非裸 404 让卡片只显示"查询状态失败"。
-    sendJson(res, 404, {
-      ok: false,
-      error: fill(messages().unknownJobId, { maxJobs: REBUILD_HISTORY_MAX }),
-    });
-    return;
-  }
-  const marks = messages();
-  const jobs = jobsOf();
-  if (jobs === undefined) {
-    // 与启动端点同一口径：注册表不在就没有读数。这条分支在"服务起得来、后来被关掉"
-    // 那一档才走到（侧表里还有记录），此时进程可能仍在跑，由卸载效应负责收。
-    sendJson(res, 503, { ok: false, error: marks.endpointJobsUnavailable });
-    return;
-  }
-  const output = readRebuildOutput(jobs, record.id);
-  if (output === null) {
-    // 名册里已经没有这条了（`jobs` 那一行被重载 ⇒ 它清空名册，或记录已被别人收走）。
-    // 侧表条目留着——它还钉着 proc，卸载时那一臂要凭它杀进程——但这一轮只能答 404。
-    sendJson(res, 404, {
-      ok: false,
-      error: fill(marks.unknownJobId, { maxJobs: REBUILD_HISTORY_MAX }),
-    });
-    return;
-  }
-  if (!sameJob(record.state, output.view)) {
-    // 同名不同命：`jobs` 那一行被重载后新实例重新签发了这个 id。旧卡片读不到新作业，
-    // 新作业也不许被旧卡片的轮询/超时/卸载臂碰到。
-    sendJson(res, 404, {
-      ok: false,
-      error: fill(marks.unknownJobId, { maxJobs: REBUILD_HISTORY_MAX }),
-    });
-    return;
-  }
-  const { view, retained } = output;
-  // 状态取官方投影（多出的 stopping/failed 由卡片按"仍在跑/出错"归位），退出码与沙箱
-  // 事实仍从 proc 现读——JobView 没有这两个槽。这一对读都是**非消费**的：
-  // 卡片每 2s 一次轮询，不许把模型的 job_output 游标推走（实测台架第 7 条）。
-  const text = retained.chunks.map((chunk) => chunk.text).join("");
-  // shown/total 一律按 **UTF-16 码元**计数（命名口径：`.length` 就是码元，
-  // 文案说的"字符"也是它）；环的留存按 UTF-8 字节裁，两套单位各管各的，别混称。
-  // 切点走 shared 的 truncateStart：官方环的裁切按 UTF-8 边界，但我们这道 4000 的
-  // 尾切若用裸 slice 会在切点留下孤立低代理项。
-  const shown = truncateStart(text, JOB_OUT_VIEW_CHARS);
-  const viewMark =
-    text.length > JOB_OUT_VIEW_CHARS
-      ? fill(marks.jobOutputView, { shown: JOB_OUT_VIEW_CHARS, total: text.length })
-      : "";
-  sendJson(res, 200, {
-    ok: true,
-    status: view.status,
-    exitCode: record.proc.exitCode,
-    root: record.root,
-    // 沙箱事实原样透传：runnerFailed 让卡片判「未执行」而非「完成」。
-    ...(record.proc.sandbox === undefined ? {} : { sandbox: record.proc.sandbox }),
-    // 打标顺序 = 环裁过头部 → 泵读不到过字节 → 超时 → 沙箱事实 → 尾窗说明 → 正文。
-    // 后两条从前是**写进环尾**的，现在由投影层合成：注册表在落定之后丢弃一切写入
-    // （实测），把"为什么这次重建没跑成"寄存在一条会被丢掉的写上，正是最不该丢的信息。
-    output:
-      // 两条丢失各自独立可观测：`earliest > 0` 是官方环按留存窗裁掉了头部（显示口径）；
-      // `state.lost` 是执行器的读者报 lossy 或干脆抛了（真少了字节，可能有 spill 文件）。
-      // 合用一条标就会把"看不见了"说成"没跑出来"。
-      (view.output.earliest > 0 ? marks.jobOutputTruncated : "") +
-      (record.state.lost ? marks.jobOutputLost : "") +
-      (record.state.timeoutNote ?? "") +
-      (procSandboxNote(record.proc, marks) ?? "") +
-      viewMark +
-      shown,
-  });
-}
-
-/**
- * 卸载效应的收口：三条路由已由调用方摘掉，这里把侧表里的进程与在册作业收干净。
- * @param routes 本次注册的共享依赖（jobsOf 现读、侧表引用、文案现取）
- * @returns {void}
- */
-function releaseRebuildRecords(routes: RebuildRoutes): void {
-  const { jobsOf, messages, records } = routes;
-  // 注册表随宿主活着，**不**随本插件卸载而死：在跑的作业必须我们杀（否则那条 zg 继续
-  // 读整棵树，而且再没有人能在 job_list 里收它）；已落定的顺手 remove（环还占着宿主内存）。
-  // 刚被 kill 的那几条此刻移不走（官方件不许删在跑作业），由下一次 apply 的
-  // pruneRebuildHistory 按 kind 清掉——那正是它遍历 `list()` 而不是遍历侧表的原因。
-  // reason 在这里就算好，不留到循环里现取：文案要走官方 locale 的翻译服务，而卸载效应
-  // 跑到一半时本包 fiber 已经在拆。
-  const unloadReason = messages().jobReasonUnload;
-  const jobs = jobsOf();
-  if (jobs === undefined) {
-    // 注册表已经不在了（`jobs` 那一行被关掉/重载 ⇒ 它清空了名册）：没东西可标记，
-    // 但进程还是我们的，只把它们收干净。
-    for (const record of records.values()) {
-      killProc(record.proc);
-    }
-  } else {
-    for (const record of records.values()) {
-      const view = jobView(jobs, record.id);
-      if (view === null || !sameJob(record.state, view)) {
-        // 名册里没有这条（已被别人收走），或者同名不同命（`jobs` 换过一枚实例）：
-        // 两种都只剩我们手里的进程可收，绝不去 kill/remove 别人那条健康作业。
-        killProc(record.proc);
-      } else if (isLiveStatus(view.status)) {
-        // 走注册表而不是直接杀进程：官方件据此把记录推到 stopping、把 reason 落进
-        // detail，再经本包的 cancel() 收到 proc.kill()。绕过它会让模型名册里那条
-        // 永远停在 running，环也一直不关（实测：本包测试就先被这条抓到过）。
-        jobs.kill(record.id, undefined, unloadReason);
-      } else {
-        jobs.remove(record.id);
-      }
-    }
-  }
-  records.clear();
-}
-
-/** 设置卡片的「工作区重建」端点组（引导 / 启动 / 轮询）。按语义拆离 apply 主体。 */
-function registerRebuildEndpoints(deps: RebuildEndpointDeps): void {
-  const { ctx, host, config, csrf, ledger, messages, rebuilds, versionGate, serverGate } = deps;
-  // 官方 `Context["get"]` 交出的是整个 `WebServer` 类；这里显式收回本包的方法面投影，
-  // 于是「只用 register」仍是编译期约束（误用别的成员即报错），不必再镜像一次签名。
-  const webServer: WebServerService | undefined = host.get("webServer");
-  if (!webServer) {
-    return;
-  }
-
-  // 非回环服务面按**绑定的那枚地址本身**判，不比字面量：宿主只拒通配地址（`0.0.0.0`/`::`），
-  // 绑本机网卡的具体 IPv4/IPv6 是合法配置，而那正是需要收紧权威的一面。判据取自 shared 的
-  // `isNonLoopbackBindHost`，它同时覆盖 IPv6 回环的多种拼法（`::1`、`::0.0.0.1`、全写零形）。
-  const servingNonLoopback = isNonLoopbackBindHost(webServer.host);
-  // 后台重建交给官方注册表（ctx.jobs）：环、留存、容量、生命周期，以及"模型侧
-  // job_list/job_output/job_kill 看不看得见这次重建"都在它那边。
-  //
-  // **每次用时现读**，不在闭包里钉住一枚实例。`ctx.get` 是无 inject 语义的存储读（官方
-  // reflect.d.ts："or `undefined` when not (yet) provided"，实测读一次就只那一次）——
-  // 在 apply 里读会把两种正常事件变成永久故障：服务比本插件晚到位 ⇒ 启动端点从此一直
-  // 回答 503（还指着用户去装一个其实装好了的包）；服务被重载 ⇒ 从此往一枚已销毁的实例里
-  // 起作业。本包也不把 `jobs` 列进 `inject` 名单：那会让缺席的**整张设置卡**三条路由都不
-  // 注册（实测 inject 会一直等依赖），而缺席只该让"启动/轮询"这一档不可用。
-  const { jobsOf } = deps;
-  // 本包侧表。键是**普通字符串**（查询参数直接能对上），真正的 `JobId` 存在记录里
-  // （`record.id`，宿主签发的高价值 id）——回环时只用记录里那一枚，绝不把请求带来
-  // 的字符串塞给注册表，于是"表里没有即 404"这条边界不需要任何类型断言撑着。
-  const { records } = deps;
-  const routes: RebuildRoutes = {
-    host,
-    config,
-    csrf,
-    ledger,
-    messages,
-    jobsOf,
-    records,
-    rebuilds,
-    versionGate,
-    serverGate,
-    servingNonLoopback,
-  };
-
-  // 引导端点：卡片先拿 CSRF token、可选工作区列表与守护进程就绪态（都是本插件自己的数据）。
-  // 也带同源校验——token 泄露给跨源页面等于白名单 + CSRF 两道锁一起白给。
-  const disposeRoots = webServer.register({
-    kind: "exact",
-    path: REBUILD_ROOTS_PATH,
-    handler: async (req: IncomingMessage, res: ServerResponse) => {
-      await handleRebuildRoots(routes, req, res);
-    },
-  });
-  // 启动端点：POST + 同源 + CSRF（guardBody 三道一次做完）+ 白名单 root + 目录存在。
-  // 旧实现只查 `startsWith("/")`：任何能连到 webServer（可绑本机网卡地址）的一方都能
-  // 拿任意绝对路径触发 `zg index --rebuild`——读遍那棵树、写 .zvec-grep/、
-  // 还可能把其中的非隐藏敏感文件灌进向量库并回显到上下文。
-  const disposeRebuild = webServer.register({
-    kind: "exact",
-    path: REBUILD_PATH,
-    handler: async (req: IncomingMessage, res: ServerResponse) => {
-      await handleRebuildStart(routes, req, res);
-    },
-  });
-  // 轮询端点：卡片每 2s 一次的读数（状态 / 退出码 / 沙箱事实 / 输出尾窗）。
-  const disposeStatus = webServer.register({
-    kind: "exact",
-    path: REBUILD_STATUS_PATH,
-    handler: (req: IncomingMessage, res: ServerResponse) => {
-      handleRebuildStatus(routes, req, res);
-    },
-  });
-
-  ctx.effect(
-    () => () => {
-      disposeRoots();
-      disposeRebuild();
-      disposeStatus();
-      releaseRebuildRecords(routes);
-    },
-    "zvec-grep: rebuild endpoints",
-  );
 }
 
 /**
@@ -2685,7 +1523,7 @@ function configureSettingsPage(host: HostCtx): void {
 
 /**
  * 文案语言随官方 locale 偏好走的读取器：用户在「设置 → 常规」里改语言后，下一次工具回显、
- * guard 拒绝与端点应答就是新文案（不重启、不加本包自己的 locale 设置项）。
+ * guard 拒绝与重建应答就是新文案（不重启、不加本包自己的 locale 设置项）。
  * 跨命名空间读在 0.1.7 只有 describe() 一条路：挑出 ns === 'locale' 那条的 value
  * （未装 client-locale / 该条目未被投影 → undefined → 中文默认）。
  * @param host 已通过服务面守卫的宿主上下文
@@ -2701,7 +1539,7 @@ function createLocaleMessages(host: HostCtx): () => ZvecGrepMessages {
     );
 }
 
-/** 观测到的工作区：既给重建端点当白名单，也让卡片能列出可重建的 root。 */
+/** 观测到的工作区：既给重建当白名单，也让卡片能列出可重建的 root。 */
 function trackObservedRoot(ledger: RootLedger, exec: ToolExec): void {
   const cwd = sessionHeaderCwd(exec);
   if (cwd !== undefined) {
@@ -2794,17 +1632,17 @@ interface PluginRuntime {
   /** 索引探测的按目录缓存（同一 apply 内 guard 与 zg_search 共用一份，见 createIndexProbeCache）。 */
   indexProbe: (dir: string) => boolean;
   /**
-   * 活跃重建的统一状态源。设置卡重建端点、前台索引工具、模型侧后台索引、检索等待与门禁
+   * 活跃重建的统一状态源。设置卡重建读面、前台索引工具、模型侧后台索引、检索等待与门禁
    * 放行都读它，不再各自判断「这条树上是不是已经在重建」。
    */
   rebuilds: RebuildRegistry;
   /**
-   * zg 版本门槛：三条工具与卡片重建端点共用的同一份带 TTL 缓存。命令形态与旗标名是照
+   * zg 版本门槛：三条工具与卡片重建共用的同一份带 TTL 缓存。命令形态与旗标名是照
    * MINIMUM_ZG_VERSION 写的，确知装的是更老的 zg 就在发命令前停住（见 lib/zg-version.ts）。
    */
   versionGate: ZgVersionGate;
   /**
-   * 守护进程（`zg server`）就绪门槛：三条工具与卡片引导端点共用的同一份带 TTL 缓存。
+   * 守护进程（`zg server`）就绪门槛：三条工具与卡片引导读面共用的同一份带 TTL 缓存。
    * `--mode auto` 在 daemon 缺席时静默落回 direct，而 `refresh=background`、索引增量刷新
    * 与常驻模型池只在 daemon 上存在——这档能力差不该由使用方自己从超时里猜，见 createZgServerGate。
    */
@@ -2823,13 +1661,13 @@ interface PluginRuntime {
     | ((id: string) => { parentSession?: SessionHeader["parentSession"] } | undefined)
     | undefined;
   /**
-   * 官方作业注册表每次用时现读（不存引用，见 registerRebuildEndpoints 里的理由）。
+   * 官方作业注册表每次用时现读（不存引用，理由见 lib/rebuild-remote.ts 的类文档）。
    * 放在 runtime 上是为了让**模型侧后台索引**与设置卡那条重建路径共用同一份名册。
    */
   jobsOf: () => JobsService | undefined;
   /**
-   * 本包侧表：键是普通字符串，真正的 JobId 存在记录里。回环时只用记录里那一枚，
-   * 「表里没有即 404」这条边界不需要任何类型断言撑着。与 jobsOf 同一理由提到 runtime。
+   * 本包侧表：键是普通字符串，真正的 JobId 存在记录里。读侧只用记录里那一枚，
+   * 「表里没有即拒绝」这条边界不需要任何类型断言撑着。与 jobsOf 同一理由提到 runtime。
    */
   records: Map<string, RebuildRecord>;
 }
@@ -2929,7 +1767,7 @@ function pickExhaustive(value: unknown, hasIndex: boolean): boolean {
  *
  * 没人要这一档时交回 `daemon-down`——构造器只在 `refresh` 真的是 background 时才读它，
  * 于是「不为没人要的档位起一发探测」与「拿不到判据时保守拒绝」两头同时成立，不必再引入
- * 第三种「不适用」状态。探测结果与 zg_status 的回显、设置卡的引导端点共用同一份 TTL 缓存。
+ * 第三种「不适用」状态。探测结果与 zg_status 的回显、设置卡的引导读面共用同一份 TTL 缓存。
  */
 async function backgroundSupportFor(
   runtime: PluginRuntime,
@@ -3002,7 +1840,7 @@ async function runSearchTool(
     messages,
     // 命中摘要（仅 search）：limit 用与命令同一 clamp，摘要口径与实际请求一致。
     // 穷举模式的输出没有 `hits:` 计数行，摘要会按「不数就不谎称」自动不出——不必特判。
-    summaryLimit: clampLimit(searchArgs.limit),
+    summaryLimit: clampLimit(searchArgs.limit, messages),
     // 重建感知：同根正在重建时等它落定后重试一次，而不是把该根的检索通道整个关掉。
     rebuildWait: {
       root: resolvedRoot,
@@ -3074,7 +1912,7 @@ function indexToolParameters(registered: ZvecGrepMessages): ToolParameters {
  * 为什么不要求模型自己去起作业：宿主作业工具在 web 平面已停用，模型侧那条路根本不可走；
  * 插件自己复用与设置卡**完全相同**的 spawn/登记/占位三步（`spawnIndexWrite` 与
  * `attachIndexWrite` 是同两个函数，不是复制品），所以两条入口起的作业在名册、状态投影、
- * 轮询端点上完全同形——卡片能看见模型起的重建，反之亦然。
+ * 轮询读面上完全同形——卡片能看见模型起的重建，反之亦然。
  *
  * 占位在 `runIndexTool` 里、且落在第一个 await 之前就抢好了；本函数只管把已占的位接上作业号。
  * 三条失败出口（注册表缺席 / spawn 失败 / attach 失败）都**交还占位**再抛或答复。
@@ -3099,7 +1937,7 @@ async function startBackgroundIndex(
     rebuilds: runtime.rebuilds,
     versionGate: runtime.versionGate,
   };
-  // 与设置卡那条启动端点同一道预检：官方注册表不在时**根本不起进程**。起一条没有环、没有
+  // 与设置卡那条重建同一道预检：官方注册表不在时**根本不起进程**。起一条没有环、没有
   // 容量、也没人能收的 zg 比不起更糟——它会一直占着同根的写锁，把这棵树的后续索引全堵死。
   if (runtime.jobsOf() === undefined) {
     runtime.rebuilds.release(root);
@@ -3262,7 +2100,7 @@ async function runStatusTool(
   });
   // 守护进程就绪态跟着状态报告一起交回：这一档决定检索是逐次冷加载 embedding 模型、还是走
   // 常驻模型池与增量刷新，而读状态报告正是用户/模型最该知道它的时刻。走 TTL 缓存，与
-  // zg_search 的门槛和设置卡引导端点共用同一份探测结果。
+  // zg_search 的门槛和设置卡引导读面共用同一份探测结果。
   // 只在这条「真读了状态」的出口上补：上面那条「正在重建中」的合成投影刻意不起任何进程，
   // 在那里插一发探测会破掉它自己的契约。
   const daemonNote = (await runtime.serverGate.ready())
@@ -3423,40 +2261,6 @@ function registerToolGuards(runtime: PluginRuntime): void {
   });
 }
 
-/**
- * 设置卡片的「工作区重建」端点组（引导 + 后台进程 + 轮询状态）。
- *
- * ⚠ 这三条路由的归属方必须对 webServer **建立依赖**，不能在 apply 里读一次就算完：
- * `ctx.get` 是无 inject 语义的存储读（官方 reflect.d.ts 明写 "or `undefined`
- * when not (yet) provided"），而真实宿主上 webServer 比本条目晚到位——隔离 DSH_HOME
- * 实测 apply 当场读到 undefined、+1.3s 才交得出实例。旧写法的结果是三条路由在任何
- * web profile 上都不注册，卡片的「工作区重建」永远 404。子 fiber 只在依赖到位时激活、
- * 依赖换实例时先卸后装（registry.d.ts），故效应挂在**子上下文**上即得「后到即注册、
- * 重启即重注册」。不写进插件级 inject：那会让没有 webServer 的宿主（TUI）连三个工具
- * 一并失活。
- * @param runtime apply 的运行时依赖（host / config / 白名单 / 文案读取器）
- * @param csrf 本次 apply 生成的 CSRF token
- * @returns {void}
- */
-function registerRebuildRoutes(runtime: PluginRuntime, csrf: string): void {
-  const { config, host, ledger, messages, rebuilds, versionGate, serverGate } = runtime;
-  host.inject(["webServer"], (child) => {
-    registerRebuildEndpoints({
-      ctx: child,
-      host,
-      config,
-      csrf,
-      ledger,
-      messages,
-      rebuilds,
-      jobsOf: runtime.jobsOf,
-      records: runtime.records,
-      versionGate,
-      serverGate,
-    });
-  });
-}
-
 function apply(ctx: Context, config: Config): void {
   // inject 服务面运行期保证存在；守卫理论不失败，失败即硬错快速暴露。
   if (!isZvecGrepHost(ctx)) {
@@ -3468,13 +2272,7 @@ function apply(ctx: Context, config: Config): void {
 
   configureSettingsPage(host);
   const localeMessages = createLocaleMessages(host);
-
-  // 重建端点的两道锁：每次 apply 重新生成的 CSRF token（webServer 可绑到本机网卡的具体地址，
-  // sec-fetch-site 只是浏览器侧的纵深防御，本地进程可伪造/直连）+ 工作区白名单
-  // （只认本 daemon 真实观测到过的会话工作区，见 createRootLedger）。
-  // token 形态与本仓其余五包统一为 `randomUUID()`（此前只有本包是 hex，
-  // 而那条断言只验长度 ⇒ 形态分歧没人钉得住）。熵不减（122 bit 随机 vs 128 bit）。
-  const csrf = randomUUID();
+  // 工作区白名单只认本 daemon 真实观测到过的会话工作区（见 createRootLedger）。
   const ledger = createRootLedger(localeMessages());
 
   // zg 索引探测的按目录缓存（P2）与 search-first 解锁表都随 apply 闭包生死（重载即清空），
@@ -3509,7 +2307,18 @@ function apply(ctx: Context, config: Config): void {
   registerRoutingSection(host, registered);
   registerToolGuards(runtime);
   registerRootApproval(runtime);
-  registerRebuildRoutes(runtime, csrf);
+  // 设置卡的重建读面：构造即注册到本插件 fiber 上，卸载效应随 apply 的 fiber 收口。
+  installRebuildRemote(host, {
+    host,
+    config,
+    messages: localeMessages,
+    jobsOf: runtime.jobsOf,
+    records: runtime.records,
+    rebuilds: runtime.rebuilds,
+    versionGate: runtime.versionGate,
+    ledger,
+    serverGate: runtime.serverGate,
+  });
 }
 
 export default {

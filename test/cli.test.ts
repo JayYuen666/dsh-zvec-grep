@@ -102,23 +102,29 @@ describe("resolveRoot（0.1.5：root 缺省=会话工作区兜底）", () => {
 });
 
 describe("clampLimit", () => {
-  it("未定义/非法回默认 10", () => {
-    assert.equal(clampLimit(undefined), 10);
-    assert.equal(clampLimit("x"), 10);
-    assert.equal(clampLimit(null), 10);
+  it("未定义或 null 回默认 10（省略是合法用法）", () => {
+    assert.equal(clampLimit(undefined, zhMessages), 10);
+    assert.equal(clampLimit(null, zhMessages), 10);
+  });
+
+  it("给了但不是非负整数即抛（不再静默回默认）", () => {
+    assert.throws(() => clampLimit("x", zhMessages), /非负整数/u);
+    assert.throws(() => clampLimit(1.5, zhMessages), /非负整数/u);
+    assert.throws(() => clampLimit(-1, zhMessages), /非负整数/u);
+    assert.throws(() => clampLimit(Number.NaN, zhMessages), /非负整数/u);
   });
 
   it("越界钳到 [1,50]", () => {
-    assert.equal(clampLimit(0), 1);
-    assert.equal(clampLimit(99), 50);
+    assert.equal(clampLimit(0, zhMessages), 1);
+    assert.equal(clampLimit(99, zhMessages), 50);
   });
 
   it("区间内原样", () => {
-    assert.equal(clampLimit(7), 7);
+    assert.equal(clampLimit(7, zhMessages), 7);
   });
 
   it("自定义回退值", () => {
-    assert.equal(clampLimit(undefined, 20), 20);
+    assert.equal(clampLimit(undefined, zhMessages, 20), 20);
   });
 });
 

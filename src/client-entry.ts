@@ -5,9 +5,8 @@
 // 就是 profile 条目 id（host.ts 只导出带 .volatile() 字段的 Config，不再 register），
 // 两侧同一个 id 即同源；
 // <select> 候选来自 lib/embedding-catalog.ts（单一数据源）。
-// 「工作区重建」：先从 host 的 rebuild-roots 引导端点取 CSRF token + 可选工作区，
-// 再 POST /_dsh/zvec-grep/rebuild（带 x-zvec-grep-csrf 头），轮询
-// /_dsh/zvec-grep/rebuild-status 直到后台进程结束。
+// 「工作区重建」：经官方 Typert Remote 读宿主侧重建服务（roots / rebuild / status），
+// 卡片轮询同一个读面直到后台进程结束（读取器见 src/rebuild-reader.ts）。
 // 取值/判定逻辑全部在 lib/card-logic.ts（草稿、终态判据、应答体检），本文件只渲染。
 //
 // 界面文案双语：apply 里把 src/ui-messages.ts 的两语字典注册进官方
@@ -26,17 +25,17 @@ import type { LocaleDictOf } from "@deepseek-ai/dsh-client-ui-slots";
 import type { SlotRegistry } from "@deepseek-ai/dsh-client-ui-renderer/client";
 import { LOCAL_EMBEDDINGS } from "../lib/embedding-catalog.ts";
 import type { LocalEmbeddingBackend } from "../lib/embedding-catalog.ts";
+import { diffTouched } from "@jayyuen66/dsh-plugin-shared/lib/card-diff";
 import {
   cardStore,
   daemonNoteKey,
   draftFields,
-  httpProblem,
-  isOkBody,
   limitDraftOf,
-  parseJsonRecord,
   parseRebuildPoll,
 } from "../lib/card-logic.ts";
 import type { CardFields, CardSnapshot, SettingScope } from "../lib/card-logic.ts";
+import { createRebuildReader } from "./rebuild-reader.ts";
+import type { RebuildReader } from "./rebuild-reader.ts";
 import { UI_MESSAGES } from "./ui-messages.ts";
 import type { LocaleNs, Translate, UiMessages } from "./ui-messages.ts";
 import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
@@ -46,28 +45,21 @@ export { cardStore, draftFields, parseRebuildPoll, resolveLimitInput } from "../
 const NS: LocaleNs = "zvec-grep";
 /**
  * `plugins.bundle.config` 的 key = **bundle 的 npm 包名**（不是裸条目 id）。
- * 派发证据（installed dsh 0.1.7）：
- *   · dsh-client-ui-plugin-manager/lib/client.js:1821 `renderSlot("plugins.bundle.config",
+ * 派发证据（installed dsh 0.2.1-rc.2，按符号核对）：
+ *   · dsh-client-ui-plugin-manager 的 client.js 里 `renderSlot("plugins.bundle.config",
  *     { view: "page" }, { entryKey: pkg.name })`——pkg.name 是 bundle 包名；
- *   · 同文件 :2698 `configured: ledger.bundles.has(openPkg.name)`，:306/:320 的
- *     `packageView()` 里 `name: bundle.name`（= bundle 包），所以没有第二条可匹配的 key；
+ *   · 同文件里 `configured: ledger.bundles.has(openPkg.name)` 与 `packageView()` 的
+ *     `name: bundle.name`（= bundle 包），所以没有第二条可匹配的 key；
  *   · 同包 lib/types/client/slot-contract.d.ts「A bundle's own configuration,
  *     **keyed by the bundle's package name**」，且 kind 为 `keyed` → `key` 必填；
- *   · dsh-client-ui-renderer/lib/client.js:1154 逐字相等匹配 `entry.options.key === entryKey`，
- *     错一个字符就是「整张卡不渲染」（不是回落、不是报错）；
- *   · 官方占位者 dsh-experimental-client-ui-voice-input/lib/client.js:5659-5661 同样把
- *     key 写成包名 `@deepseek-ai/dsh-experimental-voice-input-bundle`。
- * 行槽（本包未用）则是 `<pkg>#<rowId>`（plugin-manager/lib/client.js:27-28 `rowConfigKey`）。
+ *   · dsh-client-ui-renderer 的 `entriesOfSlot(...).find((e) => e.options.key === opts?.entryKey)`
+ *     是逐字相等匹配，错一个字符就是「整张卡不渲染」（不是回落、不是报错）。
+ * 行槽（本包未用）则是 `<pkg>#<rowId>`（同包的 `rowConfigKey(bundle, rowId)`）。
  * 值 = 本包 package.json 的 name，且必须出现在 profile 的 `dsh.profile.bundles` 里；
  * test/build-client.test.ts 从 `~/.dsh/profiles/web/package.json` 解析校验，不在此处硬抄。
  * 设置命名空间**不跟着改**：`ctx.configForms.get(entryId)` 仍吃裸条目 id（见 apply）。
  */
 const BUNDLE_PKG = "@jayyuen66/dsh-zvec-grep";
-const REBUILD_ROOTS_URL = "/_dsh/zvec-grep/rebuild-roots";
-const REBUILD_URL = "/_dsh/zvec-grep/rebuild";
-const REBUILD_STATUS_URL = "/_dsh/zvec-grep/rebuild-status";
-/** 与 host.ts REBUILD_CSRF_HEADER 一致：动作端点要求回填这个头。 */
-const REBUILD_CSRF_HEADER = "x-zvec-grep-csrf";
 /** 重建轮询间隔（宿主后台进程，2s 足够跟上 zg 的进度输出）。 */
 const REBUILD_POLL_MS = 2000;
 /** 解锁配额/时效的合法上限（与 host Config 的 schema 同范围，输入框与提示共用）。 */
@@ -204,20 +196,11 @@ interface CardSlotProps {
    */
   set: (field: string, value: unknown) => Promise<boolean>;
   unset: (field: string) => Promise<boolean>;
-}
-
-/** touched 层与快照的差异字段（值语义比较；undefined 与缺失等价）。 */
-export function diffTouched(
-  touched: Record<string, unknown>,
-  value: Record<string, unknown>,
-): string[] {
-  const out: string[] = [];
-  for (const key of Object.keys(touched)) {
-    if (JSON.stringify(touched[key] ?? null) !== JSON.stringify(value[key] ?? null)) {
-      out.push(key);
-    }
-  }
-  return out;
+  /**
+   * 宿主重建读面（官方 Remote 的消费侧，见 src/rebuild-reader.ts）。
+   * `undefined` = 当前部署没有远程面：卡片照常渲染，点重建时给出错误。
+   */
+  rebuildRemote: RebuildReader | undefined;
 }
 
 /** 保存条（全自研插件统一）。 */
@@ -629,71 +612,30 @@ function pushFieldWrite(
   }
 }
 
-/** 服务端 `{ok:false,error}` 里的可行动文案（无 error 字段给通用兜底）。 */
-function serverErrorOf(body: Record<string, unknown> | null, t: Translate): string | null {
-  if (body === null) {
-    return null;
+/** 读取器缺席时的可行动文案：宿主没装远程面（或网关没挂上这枚命名空间）。 */
+function requireReader(reader: RebuildReader | undefined, t: Translate): RebuildReader {
+  if (reader === undefined) {
+    throw new Error(t("rebuildUnavailable"));
   }
-  const { error } = body;
-  return typeof error === "string" && error.length > 0 ? error : t("requestRejected");
-}
-
-/**
- * 一次 JSON 往返：先按 content-type 决定能不能当 JSON 读（未注册的路径会被前端
- * SPA fallback 兜成 200 + text/html，直接 JSON.parse 只能给出
- * `SyntaxError: Unexpected token '<'`），再让服务端的 error 文案优先于 HTTP 层
- * 的笼统描述。
- */
-async function requestJson(
-  url: string,
-  t: Translate,
-  init?: RequestInit,
-): Promise<Record<string, unknown>> {
-  const res = await fetch(url, init);
-  const contentType = res.headers.get("content-type") ?? "";
-  const record = contentType.toLowerCase().includes("json")
-    ? parseJsonRecord(await res.text())
-    : null;
-  const problem = serverErrorOf(record, t) ?? httpProblem(res.ok, res.status, contentType, t);
-  if (problem !== null) {
-    throw new Error(problem);
-  }
-  if (record === null) {
-    throw new Error(t("notJsonBody", { url }));
-  }
-  return record;
+  return reader;
 }
 
 interface RebuildAccess {
-  csrf: string;
   roots: string[];
   /**
-   * 守护进程就绪态。`undefined` = 应答里读不出这个字段（旧版 host 的响应就没有它），
-   * 那一档在卡上**不显示**，而不是说成「未就绪」——把「不知道」讲成「没有」正是本包
-   * 一直在避免的那类谎称。
+   * 守护进程就绪态。`undefined` = 引导读面读不出这一位，那一档在卡上**不显示**，
+   * 而不是说成「未就绪」——把「不知道」讲成「没有」正是本包一直在避免的那类谎称。
    */
   serverReady: boolean | undefined;
 }
 
-const NO_ACCESS: RebuildAccess = { csrf: "", roots: [], serverReady: undefined };
-
-/** 引导端点应答 → { csrf, roots, serverReady }（字段缺失/类型不对一律当作没拿到）。 */
-function readAccess(body: Record<string, unknown>): RebuildAccess {
-  const { csrf, roots, serverReady } = body;
-  return {
-    csrf: typeof csrf === "string" ? csrf : "",
-    roots: Array.isArray(roots)
-      ? roots.filter((item): item is string => typeof item === "string")
-      : [],
-    serverReady: typeof serverReady === "boolean" ? serverReady : undefined,
-  };
-}
+const NO_ACCESS: RebuildAccess = { roots: [], serverReady: undefined };
 
 /** 重建视图（ZgCard 渲染所需 + start 动作）。 */
 interface RebuildView {
   root: string;
   roots: string[];
-  /** 守护进程就绪态（undefined = 引导端点没交出这一档，见 RebuildAccess.serverReady）。 */
+  /** 守护进程就绪态（undefined = 读面没交出这一档，见 RebuildAccess.serverReady）。 */
   serverReady: boolean | undefined;
   state: RebuildState;
   setRoot: (value: string) => void;
@@ -702,11 +644,12 @@ interface RebuildView {
 }
 
 /**
- * 「工作区重建」状态机：取 token/白名单 → POST 启动 → 2s 轮询到终态。
+ * 「工作区重建」状态机：取白名单 → 起一条重建 → 2s 轮询到终态。
  * 从 ZgCard 拆出，保持组件体在一屏内可读。
  * @param t - 取文案（官方 locale 的 translator，随卡片一起下发）。
+ * @param reader - 宿主重建读面；`undefined` = 当前部署没有远程面（点重建时报错）。
  */
-function useRebuild(t: Translate): RebuildView {
+function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildView {
   const [root, setRoot] = useState("");
   const [access, setAccess] = useState<RebuildAccess>(NO_ACCESS);
   const [rebuild, setRebuild] = useState<RebuildState>({ phase: "idle", output: "" });
@@ -719,7 +662,7 @@ function useRebuild(t: Translate): RebuildView {
     }
   }
 
-  // 卸载时一定停轮询：卡片关闭后继续 setInterval 会一直打 rebuild-status。
+  // 卸载时一定停轮询：卡片关闭后继续 setInterval 会一直打 status。
   useEffect(
     () => () => {
       stopPolling();
@@ -727,15 +670,19 @@ function useRebuild(t: Translate): RebuildView {
     [],
   );
 
-  /** 拉 CSRF token + 白名单。失败**不**改重建面板：面板 idle 时冒一个红字只是噪音，
+  /** 拉白名单 + 就绪态。失败**不**改重建面板：面板 idle 时冒一个红字只是噪音，
    *  用户真点「重建」时 start() 会把同一错误显示出来。 */
-  // useCallback 稳定化：t 每次 apply 只有一个稳定实例（ctx.locale.bind 的返回），依赖只留 t；
-  // 效果是 refreshAccess 跨渲染代同一引用，三个调用点（挂载拉取与重建流程内两处）拿到同一支。
+  // useCallback 稳定化：t 与 reader 每次 apply 各只有一个稳定实例，依赖只留这两位；
+  // 效果是 refreshAccess 跨渲染代同一引用，挂载拉取拿到同一支。
   const refreshAccess = useCallback(async (): Promise<RebuildAccess> => {
-    const next = readAccess(await requestJson(REBUILD_ROOTS_URL, t));
-    setAccess(next);
-    return next;
-  }, [t]);
+    const next = await requireReader(reader, t).roots();
+    const view: RebuildAccess = {
+      roots: [...next.roots],
+      serverReady: next.serverReady,
+    };
+    setAccess(view);
+    return view;
+  }, [reader, t]);
 
   useEffect(() => {
     // await 形态取代 .catch 链（promise/prefer-await-to-then）：useEffect 的回调按官方契约
@@ -748,13 +695,13 @@ function useRebuild(t: Translate): RebuildView {
         setAccess(NO_ACCESS);
       }
     })();
-    // refreshAccess 经 useCallback 稳定（t 每次 apply 只有一个稳定实例，ctx.locale.bind 的
-    // 返回），入依赖后行为不变：仍只在挂载时拉一次。
+    // refreshAccess 经 useCallback 稳定（t 与 reader 都是 apply 期一次性实例），入依赖后
+    // 行为不变：仍只在挂载时拉一次。
   }, [refreshAccess]);
 
   async function pollStatus(jobId: string): Promise<void> {
     try {
-      const body = await requestJson(`${REBUILD_STATUS_URL}?jobId=${encodeURIComponent(jobId)}`, t);
+      const body = await requireReader(reader, t).status(jobId);
       const poll = parseRebuildPoll(body, t);
       if (poll.phase !== "running") {
         stopPolling();
@@ -766,16 +713,13 @@ function useRebuild(t: Translate): RebuildView {
     }
   }
 
-  /** 发起一次重建（带 token）；成功后进入轮询。 */
-  async function startOnce(token: string): Promise<void> {
-    const body = await requestJson(`${REBUILD_URL}?root=${encodeURIComponent(root.trim())}`, t, {
-      method: "POST",
-      headers: { [REBUILD_CSRF_HEADER]: token },
-    });
-    const { jobId } = body;
-    if (!isOkBody(body) || typeof jobId !== "string") {
-      throw new Error(t("rebuildMissingJobId"));
+  /** 发起一次重建；成功后进入轮询。 */
+  async function startOnce(): Promise<void> {
+    const started = await requireReader(reader, t).rebuild(root.trim());
+    if (typeof started.jobId !== "string") {
+      throw new TypeError(t("rebuildMissingJobId"));
     }
+    const { jobId } = started;
     pollRef.current = setInterval(() => {
       void pollStatus(jobId);
     }, REBUILD_POLL_MS);
@@ -790,22 +734,7 @@ function useRebuild(t: Translate): RebuildView {
     stopPolling();
     setRebuild({ phase: "running", output: t("rebuildStarting") });
     try {
-      let token = access.csrf;
-      if (token === "") {
-        const fresh = await refreshAccess();
-        token = fresh.csrf;
-      }
-      try {
-        await startOnce(token);
-      } catch (error) {
-        // 宿主每次 apply 都会换 token（页面开着就会过期）：带旧 token 被拒 →
-        // 重取一次 token 再试，避免卡片从此「点什么都没反应」。
-        if (access.csrf === "") {
-          throw error;
-        }
-        const renewed = await refreshAccess();
-        await startOnce(renewed.csrf);
-      }
+      await startOnce();
     } catch (error) {
       stopPolling();
       setRebuild({ phase: "error", output: errorText(error) });
@@ -836,7 +765,7 @@ function ZgCard(props: CardSlotProps): ReactNode {
   const [touched, setTouched] = useState<Record<string, unknown>>({});
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const rebuildView = useRebuild(t);
+  const rebuildView = useRebuild(t, props.rebuildRemote);
 
   // 六个字段一律走草稿层（lib/card-logic.draftFields）：任何字段绑回已提交快照，
   // 该字段的受控输入就会吞键击（select 弹回旧值、input 改不动），而旁边的字段却
@@ -945,6 +874,12 @@ export interface ClientCtx {
    */
   effect: Context["effect"];
   /**
+   * 显式读一个**可选**客户端服务（`ctx.get`，不受 cordis 的 inject 门禁约束）。本卡只用它
+   * 取远程面：没装远程面的部署里卡片仍要照常渲染，把 `remote` 写进 inject 会让整条入口
+   * 不激活（见 src/rebuild-reader.ts 的文件头）。
+   */
+  get?: (name: string, strict?: boolean) => unknown;
+  /**
    * 官方 `SlotRegistry`（renderer 把它增强进 cordis `Context`，installed
    * `dsh-client-ui-renderer/lib/types/client/index.d.ts`）的**方法面投影**。取 `Pick`
    * 而不是 `Context["slots"]` 整类型：`SlotRegistry` 是带 private 字段的 cordis
@@ -972,9 +907,9 @@ export interface ClientCtx {
   /**
    * 0.1.7 的配置表单服务（installed
    * `dsh-client-ui-settings/lib/types/client/config-form.d.ts` 交出
-   * `Context.configForms`，`get:142` 按 profile 条目 id 取那张共享表单，实现见
-   * installed `dsh-client-ui-settings/lib/client.js:1309-1315`——它把 entryId 原样当作
-   * settings 命名空间，与本包 host 侧的隐式命名空间同源）：取代已被宿主移除的
+   * `Context.configForms`，`get(entryId)` 按 profile 条目 id 取那张共享表单，实现就是
+   * `new ConfigFormController(this.owner, { namespace: entryId }, …)`——入参原样当作 settings
+   * 命名空间，与本包 host 侧的隐式命名空间同源）：取代已被宿主移除的
    * `settingsScope`（installed 全树零命中）。注入只需 `configForms` 本身——写侧的
    * `remote.settings` 由 provider 自己的 fiber 承担（`config-form.d.ts` 明写
    * 「letting a shared form write through the caller's context would make every caller
@@ -1043,6 +978,8 @@ function apply(ctx: ClientCtx): void {
   // 函数交给卡片。语言切换由宿主驱动 slot 重渲染，无需重载页面。
   ctx.effect(() => ctx.locale.register(NS, UI_MESSAGES), "zvec-grep-card: locale dictionaries");
   const t = ctx.locale.bind(NS);
+  // 远程读面在 apply 期造一次：`$mount` 幂等（随卡片卸载自动撤），反复轮询只挂一次。
+  const rebuildRemote = createRebuildReader(ctx);
   // 写通道受理位**原样透传**给卡片（消费在 save()：false → saveRejected 且整批保留
   // touched；这里只补字段级 console.error 供排查，rejection 照旧上抛给 save 的
   // Promise.all 收口成 saveFailed 文案）。
@@ -1070,15 +1007,13 @@ function apply(ctx: ClientCtx): void {
         // slot-contract.d.ts），故本段仍在——换掉的只是它读写的表单来源。
         // 键值已定案（此处曾留 `⚠ 键值待议`）：owner 派发的是
         // `entryKey: pkg.name`，pkg.name 就是 bundle 的 npm 包名（installed
-        // dsh-client-ui-plugin-manager/lib/client.js:1821 与 :2698
+        // dsh-client-ui-plugin-manager 的 `renderSlot(...)` 与
         // `ledger.bundles.has(openPkg.name)`；slot-contract.d.ts「keyed by the
-        // bundle's package name」；官方占位者
-        // dsh-experimental-client-ui-voice-input/lib/client.js:5659-5661 也用了包名
-        // `@deepseek-ai/dsh-experimental-voice-input-bundle`）。按裸条目 id 注册 =
-        // renderer 匹配不到 entry（client-ui-renderer/lib/client.js:1154 逐字相等）=
+        // bundle's package name」）。按裸条目 id 注册 = renderer 的
+        // `e.options.key === opts?.entryKey` 匹配不到 entry =
         // bundle 页面上这张卡**完全不渲染**，所以这里必须是 BUNDLE_PKG。
         // 表单侧不变：上面 `ctx.configForms.get(NS)` 仍吃裸条目 id（installed
-        // dsh-client-ui-settings/lib/client.js:1309-1315 把入参原样当 settings 命名空间）。
+        // dsh-client-ui-settings 的 `get(entryId)` 把入参原样当 settings 命名空间）。
         name: "plugins.bundle.config",
         key: BUNDLE_PKG,
         inject: () => ({
@@ -1086,6 +1021,7 @@ function apply(ctx: ClientCtx): void {
           hooks: { card: store },
           set: writeField,
           unset: unsetField,
+          rebuildRemote,
         }),
       },
       ZgCard,
@@ -1096,8 +1032,8 @@ function apply(ctx: ClientCtx): void {
     // 一次的共享物。0.1.7 里也无从 dispose：`configForms.get()` 交回的是 provider 持有
     // 的共享表单（installed config-form.d.ts "The entry's form, owned by this
     // provider"），`ConfigForm` 接口（config-form-types.d.ts）没有 dispose，销毁
-    // 由 provider 在自己的 teardown 统一做（installed
-    // dsh-client-ui-settings/lib/client.js:1290-1293）。表单共享且长活，所以工厂重跑后
+    // 由 provider 在自己的 teardown 统一做（installed dsh-client-ui-settings 里的
+    // `Promise.all([...this.forms.values()].map((form) => form.dispose()))`）。表单共享且长活，所以工厂重跑后
     // 写入依然落盘；旧 `settingsScope` 那种「离开插件页一次之后 scope 永久 disposed、
     // 保存看起来成功却一条都没写进去」的坑（0.1.6 的 fiber 级 dispose + enqueue 对
     // disposed 直接 resolve）随该服务一起消失。

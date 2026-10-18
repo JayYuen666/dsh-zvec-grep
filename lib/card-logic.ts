@@ -15,7 +15,6 @@ import type { ConfigForm, ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-
 // 只管「六个字段各显示什么」。
 import { draftOf, numberText } from "./card-draft.ts";
 import { DEFAULT_EMBEDDING } from "./embedding-catalog.ts";
-import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 
 /**
  * 本文件用到的 UI 文案键（字典在 src/ui-messages.ts：漏一个键或名字打错，
@@ -27,11 +26,7 @@ export type CardTextKey =
   | "rebuildRunning"
   | "rebuildKilled"
   | "rebuildFailed"
-  | "rebuildExitCode"
-  | "httpForbidden"
-  | "httpFailed"
-  | "httpNotJson"
-  | "contentTypeMissing";
+  | "rebuildExitCode";
 
 /**
  * 引导端点交回的守护进程就绪态该显示哪一行。
@@ -83,7 +78,7 @@ export type CardText = (
  * ⚠ 消费者面上没有 dispose：`configForms.get(entryId)` 交回的是 provider 自己持有的
  * 那张共享表单（installed `.../client/config-form.d.ts` "The entry's form,
  * owned by this provider"；provider 在自己的 teardown 里统一销毁全部表单，installed
- * `dsh-client-ui-settings/lib/client.js:1290-1293`），`ConfigForm` 面上根本没有
+ * `Promise.all([...this.forms.values()].map((form) => form.dispose()))`），`ConfigForm` 面上根本没有
  * dispose 可消费。slot「折叠 → 再声明」会重跑注册工厂并拿回同一张长活表单，所以
  * disposer 只需注销那次声明（见 src/client-entry.ts 的 disposer 注释）；卡片若试图销毁
  * 共享表单，受害的是同一 provider 名下所有消费者（含本卡重挂后的新 store）。
@@ -298,52 +293,4 @@ export function parseRebuildPoll(body: Record<string, unknown>, t: CardText): Re
     reason = t("rebuildExitCode", { exitCode: String(exitCode) });
   }
   return { phase: "error", output: outputText.length > 0 ? `${reason}\n${outputText}` : reason };
-}
-
-// ── fetch 应答体检 ─────────────────────────────────────────────────────────
-// 端点没注册上（webServer 未起、路径改动、被上游 SPA fallback 兜住）时，
-// fetch 拿到的是 200 + text/html 的 index.html：直接 JSON.parse 只会给用户
-// 一句 `SyntaxError: Unexpected token '<'`。这里先体检再解析。
-
-/**
- * 响应不健康的可行动描述；健康返回 null。
- * @param ok - res.ok
- * @param status - res.status（403 单列：CSRF token 过期时卡片要「重取 token 重试」）
- * @param contentType - res.headers.get('content-type') ?? ''
- * @param t - 文案取值（官方 locale 的 translator）
- */
-export function httpProblem(
-  ok: boolean,
-  status: number,
-  contentType: string,
-  t: CardText,
-): string | null {
-  if (status === 403) {
-    return t("httpForbidden");
-  }
-  if (!ok) {
-    return t("httpFailed", { status });
-  }
-  if (!contentType.toLowerCase().includes("application/json")) {
-    return t("httpNotJson", {
-      contentType: contentType.length > 0 ? contentType : t("contentTypeMissing"),
-    });
-  }
-  return null;
-}
-
-/** JSON 文本 → 对象；非对象/解析失败返回 null（调用方给可读错误）。 */
-export function parseJsonRecord(text: string): Record<string, unknown> | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  return isRecord(parsed) ? parsed : null;
-}
-
-/** 端点统一应答形状：`{ ok: true, … }` 才算成功。 */
-export function isOkBody(body: Record<string, unknown>): boolean {
-  return body["ok"] === true;
 }

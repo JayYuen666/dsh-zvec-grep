@@ -8,13 +8,12 @@
 // 键集一致由 tsc 保证：zh / en 两份都标注同一个 ZvecGrepMessages 类型，少键多键在编译期红。
 // 带变量的文案用 `{name}` 占位符 + fill() 填（与官方 locale 的插值语法同源，两侧一套写法），
 // 字典本身是扁平字符串表。console.* 的日志、注释、索引路径/命令 argv/枚举值不在此列。
-// 这张表就是 host 半的全部文案。曾经在这里另建过一张 EMBEDDING_MODEL_NOTES（11 个候选的
-// 双语说明），但两侧都没有渲染点——卡片的 <select> 只显示「引用（维度）」，于是那行人读
-// 口径回到 lib/embedding-catalog.ts 的注释里：没有消费者的文案不建表。
+// 这张表就是 host 半的全部文案：没有渲染点的文案不建表（卡片的 <select> 只显示「引用（维度）」，
+// 那一行人读口径住在 lib/embedding-catalog.ts 的注释里）。
 
 import type { MessagesCatalog } from "@jayyuen66/dsh-plugin-shared/lib/locale";
 
-/** 本包 host 侧产出的全部人读文案（工具描述、工具回显、guard 理由、端点错误）。 */
+/** 本包 host 侧产出的全部人读文案（工具描述、工具回显、guard 理由、重建读面的拒绝）。 */
 export interface ZvecGrepMessages {
   // ── 工具描述（模型面）──────────────────────────────────────────────────────
   /** zg_search 的 description。 */
@@ -180,7 +179,7 @@ export interface ZvecGrepMessages {
   /** 写进官方注册表 `detail` 的卸载理由（无变量）。 */
   readonly jobReasonUnload: string;
 
-  // ── /_dsh/zvec-grep/* 端点回显给人的错误 ───────────────────────────────────
+  // ── 重建读面（Typert Remote 的三个方法）回显给人的拒绝 ──────────────────────
   /** root 参数不合法：`{reason}`。 */
   readonly endpointRootInvalid: string;
   /** root 不在观测白名单内：`{root}`。 */
@@ -191,11 +190,6 @@ export interface ZvecGrepMessages {
   readonly endpointStartFailed: string;
   /** 宿主没提供 ctx.jobs（官方注册表未装载）⇒ 重建动作端点直接回答不可用，无降级形态。 */
   readonly endpointJobsUnavailable: string;
-  /**
-   * 名册里同 id 的那条作业诞生在**另一枚**注册表实例里（`jobs` 那一行被重载 ⇒ 计数器从头
-   * 分配）。继续起就会把旧面板指向另一棵树，故拒绝并请用户重载插件。`{limit}` 无关。
-   */
-  readonly endpointRegistryReplaced: string;
   /**
    * 官方容量闸拒了这次启动（未拥有作业共用一只桶，实测满员是**拒绝**而不是淘汰在跑的）：
    * `{limit}` 是宿主给的上限。取的是错误里那个数字，不把宿主英文原话贴进卡片。
@@ -251,6 +245,8 @@ export interface ZvecGrepMessages {
   readonly rootIsFsRoot: string;
   /** root 缺失（可省略时的完整出路）。 */
   readonly rootRequiredWithFallback: string;
+  /** limit 给了但不是非负整数（缺失是合法用法，走默认值）。 */
+  readonly limitInvalid: string;
   /** 非字符串数组：`{name}`。 */
   readonly mustBeStringArray: string;
   /** 数组超条数：`{name}`、`{maxItems}`、`{actual}`。 */
@@ -477,9 +473,6 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     endpointStartFailed: "启动重建失败：{reason}",
     endpointJobsUnavailable:
       "后台重建不可用：宿主未提供 ctx.jobs（@deepseek-ai/dsh-jobs-local 未装载），本插件不再自带任务注册表",
-    endpointRegistryReplaced:
-      "后台作业服务已被替换（新注册表重新从同一个 id 开始签发作业），本次重建已放弃并终止：" +
-      "请重载 zvec-grep 插件后再发起，否则旧面板会跟着另一棵树的作业走",
     endpointJobsAtCapacity:
       "后台作业已满（宿主上限 {limit} 条，进行中与正在收尾的都计数），本次重建未启动：" +
       "请先在模型侧用 job_kill 收掉不再需要的作业，再重新发起重建",
@@ -519,6 +512,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     rootMustBeAbsolute: "root 必须是绝对路径（以 / 开头）：{path}",
     rootIsFsRoot: "root 不能是文件系统根目录 /",
     rootRequiredWithFallback: "root 必填，且为工作区绝对路径（可省略：缺省为当前会话工作区）",
+    limitInvalid: "limit 必须是非负整数（省略则用默认值）",
     mustBeStringArray: "{name} 必须是字符串数组",
     tooManyItems: "{name} 最多 {maxItems} 项（实际 {actual}）",
     nonStringItem: "{name} 含非字符串项（{received}）",
@@ -797,10 +791,6 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     endpointJobsUnavailable:
       "background rebuild unavailable: the host provides no ctx.jobs (dsh-jobs-local is not loaded); " +
       "this plugin no longer ships its own job registry",
-    endpointRegistryReplaced:
-      "the background job service was replaced (a fresh registry restarts id numbering), so this " +
-      "rebuild was abandoned and its process terminated: reload the zvec-grep plugin before retrying, " +
-      "otherwise a stale panel would follow a different workspace's job",
     endpointJobsAtCapacity:
       "background jobs are at the host's limit ({limit} slots; running and stopping both count), so this " +
       "rebuild never started: stop what you no longer need with job_kill, then start the rebuild again",
@@ -846,6 +836,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     rootRequiredWithFallback:
       "root is required and must be an absolute workspace path (it may be omitted: defaults to the " +
       "current session workspace)",
+    limitInvalid: "limit must be a non-negative integer (omit it to use the default)",
     mustBeStringArray: "{name} must be an array of strings",
     tooManyItems: "{name} allows at most {maxItems} items (actual {actual})",
     nonStringItem: "{name} contains a non-string item ({received})",

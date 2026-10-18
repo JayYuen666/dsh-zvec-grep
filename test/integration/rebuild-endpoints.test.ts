@@ -1,13 +1,16 @@
-// 设置卡「工作区重建」三条路由的**真实宿主**测试：真 node:http 监听 + 真官方作业注册表 +
-// 真本地 bash 执行器 + 真进程。与 test/host.test.ts 里那套 mock req/res 的分工：那边验
-// 判据（CSRF/同源/白名单/目录存在的每一种组合），这里验**跨件的那几条**：
+// 设置卡「工作区重建」读面的**真实宿主**测试：真官方作业注册表 + 真本地 bash 执行器 +
+// 真进程。与 test/host.test.ts 里那套 mock ctx 的分工：那边验判据（白名单/绝对路径/同根互斥
+// 的每一格），这里验**跨件的那几条**：
 //
-//   - 引导端点交回的 CSRF 与 roots 在真 HTTP 上原样可用；
-//   - 启动端点起来的作业真的进了官方注册表（id/状态/环/泵都由官方件管）；
-//   - 轮询端点读得到环里的真输出（stdout+stderr 两路），落定后交回退出码；
+//   - 引导读面在真实 cordis 上注册得到，交回的候选工作区就是这台 daemon 观测到的那些；
+//   - 启动读面起来的作业真的进了官方注册表（id/状态/环/泵都由官方件管）；
+//   - 轮询读面读得到环里的真输出（stdout+stderr 两路），落定后交回退出码；
 //   - 侧表与注册表的「同一枚实例」判据在真实 cordis 上成立（`ctx.get` 每读一次都是新代理，
 //     实例身份比较恒为假 ⇒ 这条只有真实宿主能抓到，见 host.ts 的 JobIdentity 注释）；
 //   - 卸载时进程与在册作业都被收干净（走官方 kill/remove，不是绕过它直接杀进程）。
+//
+// 三个读面都按**服务方法的原样**调用（不再包一层 `{status, body}` 的 HTTP 形状：那层壳把
+// 成功恒写成 200，于是 `assert.equal(status, 200)` 检的是夹具自己，不是本包）。
 //
 // 生命周期用例（卸载收进程、超时杀进程）用 installFakeZg 的假 zg：真 zg 的时长受模型加载
 // 影响，钉不住「进程真的死了」这种断言；假 zg 仍是真进程、真 spawn、可真杀。
@@ -19,6 +22,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { startHost, installFakeZg, zgAvailable, sleep } from "./host-stack.ts";
 import type { Host } from "./host-stack.ts";
+import type {
+  RebuildRefused,
+  RebuildRoots,
+  RebuildSnapshot,
+  RebuildStarted,
+  RebuildStartRequest,
+  RebuildStartResult,
+  RebuildStatusRequest,
+  RebuildStatusResult,
+} from "../../lib/rebuild-shape.ts";
 
 /** `process.kill(pid, 0)` 的存活判据。 */
 function isAlive(pid: number): boolean {
@@ -84,60 +97,74 @@ async function observe(root: string, host: Host): Promise<void> {
   assert.ok(!outcome.isError, host.textOf(outcome));
 }
 
-interface RootsBody {
-  ok: boolean;
-  csrf: string;
-  roots: string[];
-  /** 守护进程就绪态（卡片那一行的唯一来源）。 */
-  serverReady: boolean;
+/** 宿主上下文里那枚命名空间服务的三个方法（形状直接取发布侧的声明，不在测试里再造一份）。 */
+interface RebuildApi {
+  roots: () => Promise<RebuildRoots>;
+  rebuild: (request: RebuildStartRequest) => Promise<RebuildStartResult>;
+  /** `status` 是**同步**方法（投影全部来自已在手里的侧表与注册表），别 await 一个非 Promise。 */
+  status: (request: RebuildStatusRequest) => RebuildStatusResult;
 }
 
-/** 引导端点：拿 CSRF 与候选工作区。 */
-async function fetchRoots(host: Host): Promise<{ status: number; body: RootsBody }> {
-  const res = await fetch(`http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`);
-  return { status: res.status, body: (await res.json()) as RootsBody };
+/**
+ * 本包注册在宿主上下文里的那枚服务（`TypertRemoteService` 以命名空间为自己provide 的键）。
+ * 这里**不经官方网关**：网关那一层（客户端 `$mount` 的贡献 + strict codec + `remote.<ns>`
+ * 键）由 test/rebuild-remote.test.ts 拿 descriptor 与 `remoteMethods()` 对质钉住，
+ * 端到端挂到真 `remote` 服务上则要有客户端 fiber，不在本文件的台架里。
+ */
+function rebuildApi(host: Host): RebuildApi {
+  const service: unknown = host.ctx.get("zvecGrepRebuild");
+  assert.ok(service !== undefined, "zvecGrepRebuild 没注册到宿主上下文");
+  return service as RebuildApi;
 }
 
-interface StartBody {
-  ok: boolean;
-  jobId?: string;
-  reused?: boolean;
-  error?: string;
+/** 引导读面：候选工作区 + 守护进程就绪态。 */
+async function readRoots(host: Host): Promise<RebuildRoots> {
+  return rebuildApi(host).roots();
 }
 
-/** 启动端点：POST + CSRF + 同源。 */
-async function postRebuild(
-  host: Host,
-  root: string,
-  init: { csrf?: string; sameOrigin?: boolean } = {},
-): Promise<{ status: number; body: StartBody }> {
-  const res = await fetch(
-    `http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild?root=${encodeURIComponent(root)}`,
-    {
-      method: "POST",
-      headers: {
-        ...(init.sameOrigin === false ? { "sec-fetch-site": "cross-site" } : {}),
-        ...(init.csrf === undefined ? {} : { "x-zvec-grep-csrf": init.csrf }),
-      },
-    },
-  );
-  return { status: res.status, body: (await res.json()) as StartBody };
+/** 启动读面：白名单/绝对路径/同根互斥都在服务方法里判。 */
+async function startRebuild(host: Host, root: string): Promise<RebuildStartResult> {
+  return rebuildApi(host).rebuild({ root });
 }
 
-interface StatusBody {
-  ok: boolean;
-  status?: string;
-  exitCode?: number | null;
-  output?: string;
-  error?: string;
+/** 轮询读面。 */
+function readStatus(host: Host, jobId: string): RebuildStatusResult {
+  return rebuildApi(host).status({ jobId });
 }
 
-/** 轮询端点。 */
-async function poll(host: Host, jobId: string): Promise<{ status: number; body: StatusBody }> {
-  const res = await fetch(
-    `http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-status?jobId=${encodeURIComponent(jobId)}`,
-  );
-  return { status: res.status, body: (await res.json()) as StatusBody };
+/**
+ * 落定的那条读数。终态判据与生产同口径：**running 与 stopping 都算仍在跑**
+ * （`stopping` = 取消已发出、进程还没收完，此时退出码与尾部输出都还没定）。
+ * 本文件另一处的 `waitTerminal` 早已排除这两枚；这里原先只排 `running`，
+ * 于是同一次等待在两个helper 手里有两种「落定」——一轮落在 stopping 的读数会让
+ * 后续那几条 `completed` 断言以「没落定」的形态变红（红的是测量）。
+ */
+function settledSnapshot(body: RebuildStatusResult): RebuildSnapshot | undefined {
+  return body.ok && body.status !== "running" && body.status !== "stopping" ? body : undefined;
+}
+
+/** 启动读面的成功臂。`assert.fail` 返回 never，所以判完之后 TS 也认这条窄形。 */
+function startedOf(body: RebuildStartResult): RebuildStarted {
+  if (!body.ok) {
+    assert.fail(`rebuild 应成功，实际 ${body.status} ${body.error}`);
+  }
+  return body;
+}
+
+/** 轮询读面的成功臂。 */
+function snapshotOf(body: RebuildStatusResult): RebuildSnapshot {
+  if (!body.ok) {
+    assert.fail(`status 应读数，实际 ${body.status} ${body.error}`);
+  }
+  return body;
+}
+
+/** 任一读面的拒绝臂（连同它保留下来的语义码——那是"哪条判据拦的"唯一可机判的形态）。 */
+function refusedOf(body: RebuildStartResult | RebuildStatusResult): RebuildRefused {
+  if (body.ok) {
+    assert.fail(`本应被拒，实际放行：${JSON.stringify(body)}`);
+  }
+  return body;
 }
 
 /** 等到落定（递归而非循环：泵式等待是天然串行的）。 */
@@ -146,59 +173,52 @@ async function waitSettled(
   jobId: string,
   deadlineAt: number,
   timeoutMs = 60_000,
-): Promise<StatusBody> {
-  const current = await poll(host, jobId);
-  if (current.body.ok && current.body.status !== "running") {
-    return current.body;
+): Promise<RebuildSnapshot> {
+  const done = settledSnapshot(readStatus(host, jobId));
+  if (done !== undefined) {
+    return done;
   }
   if (Date.now() > deadlineAt) {
-    throw new Error(`rebuild ${jobId} did not settle: ${JSON.stringify(current.body)}`);
+    throw new Error(`rebuild ${jobId} did not settle`);
   }
   await sleep(200);
   return waitSettled(host, jobId, Date.now() + timeoutMs, timeoutMs);
 }
 
-describe.skipIf(!zgAvailable())("真实宿主：重建路由的 HTTP 面", () => {
+describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", () => {
   afterAll(() => {
     for (const cleanup of cleanups.splice(0).toReversed()) {
       cleanup();
     }
   });
 
-  it("引导端点交回 CSRF 与候选工作区，roots 就是这台 daemon 观测到的那些", async () => {
+  it("引导读面交回候选工作区与就绪位，roots 就是这台 daemon 观测到的那些", async () => {
     const host = await startHost();
     const ws = observedWorkspace();
     try {
       await observe(ws, host);
-      const { status, body } = await fetchRoots(host);
-      assert.equal(status, 200);
-      assert.ok(body.ok);
-      expect(body.csrf).toBeTypeOf("string");
-      assert.ok(body.csrf.length >= 32, body.csrf);
+      const roots = await readRoots(host);
       // 观测过的工作区出现在候选里（realpath 兼容 macOS 的 /private 前缀）。
-      expect(body.roots.some((root) => root.endsWith(ws.slice(1)) || root === ws)).toBe(true);
+      expect(roots.roots.some((root) => root.endsWith(ws.slice(1)) || root === ws)).toBe(true);
       // 候选只来自本插件自己的数据（不是文件系统扫描）。
-      expect(body.roots.length).toBeLessThan(64);
-      // 卡片那一行守护进程就绪态走的是真 HTTP：应答里必须有这一位、且是布尔。
+      expect(roots.roots.length).toBeLessThan(64);
+      // 卡片那一行守护进程就绪态由真探测给出：应答里必须有这一位、且是布尔。
       // 具体值由这台机器上 `zg server` 的真实状态决定（断言它可机判，不钉死某一臂）。
-      expect(body.serverReady).toBeTypeOf("boolean");
+      expect(roots.serverReady).toBeTypeOf("boolean");
     } finally {
       await host.dispose();
     }
   }, 60_000);
 
-  it("启动端点：CSRF + 同源 + 白名单都过 ⇒ 真起一条后台作业进官方注册表", async () => {
+  it("启动读面：白名单与绝对路径判据都过 ⇒ 真起一条后台作业进官方注册表", async () => {
     const host = await startHost();
     const ws = observedWorkspace();
     try {
       await observe(ws, host);
-      const { body: roots } = await fetchRoots(host);
-      const started = await postRebuild(host, ws, { csrf: roots.csrf });
-      assert.equal(started.status, 200, JSON.stringify(started.body));
-      assert.ok(started.body.ok);
-      expect(started.body.jobId).toBeTypeOf("string");
+      const started = startedOf(await startRebuild(host, ws));
+      expect(started.jobId).toBeTypeOf("string");
 
-      const jobId = started.body.jobId!;
+      const { jobId } = started;
       // 官方注册表里真的有这条（kind + label + 运行态都由官方件管）。
       const listed = host.ctx.jobs.list().find((row) => row.id === jobId);
       expect(listed?.kind).toBe("zvec-grep-rebuild");
@@ -223,7 +243,7 @@ describe.skipIf(!zgAvailable())("真实宿主：重建路由的 HTTP 面", () =>
     }
   }, 120_000);
 
-  it("轮询端点：同 id 的第二次读也是 200（侧表与官方注册表认得出同一枚实例）", async () => {
+  it("轮询读面：同 id 的第二次读仍是同一条（侧表与官方注册表认得出同一枚实例）", async () => {
     // 回归用例：真实 cordis 的 `ctx.get("jobs")` 每读一次都是新代理，拿「注册表实例引用」做
     // 身份比较会恒为假 ⇒ 每条活着的重建都回 404。身份判据改用 JobView 上的值三段
     // （kind/label/startedAt）之后，同一条作业的连续轮询才读得到读数。
@@ -231,15 +251,12 @@ describe.skipIf(!zgAvailable())("真实宿主：重建路由的 HTTP 面", () =>
     const ws = observedWorkspace();
     try {
       await observe(ws, host);
-      const { body: roots } = await fetchRoots(host);
-      const started = await postRebuild(host, ws, { csrf: roots.csrf });
-      const jobId = started.body.jobId!;
-      const running = await poll(host, jobId);
-      assert.equal(running.status, 200, JSON.stringify(running.body));
-      assert.ok(running.body.ok);
-      // 再读一次仍是同一条（不是 404，也不是另一条）。
-      const again = await poll(host, jobId);
-      assert.equal(again.status, 200, JSON.stringify(again.body));
+      const { jobId } = startedOf(await startRebuild(host, ws));
+      const running = snapshotOf(readStatus(host, jobId));
+      expect(running.status).toBe("running");
+      // 再读一次仍是同一条（不是查无此条，也不是另一条）。
+      const again = snapshotOf(readStatus(host, jobId));
+      expect(again.root).toBe(running.root);
       const settled = await waitSettled(host, jobId, Date.now() + 60_000);
       expect(settled.status).toBe("completed");
     } finally {
@@ -247,24 +264,21 @@ describe.skipIf(!zgAvailable())("真实宿主：重建路由的 HTTP 面", () =>
     }
   }, 120_000);
 
-  it("两条锁各自生效：缺 CSRF、跨源、root 不在白名单都不起进程", async () => {
+  it("白名单仍拦未观测的 root 与相对路径，且不起进程", async () => {
     const host = await startHost();
     const ws = observedWorkspace();
     const stranger = observedWorkspace();
     try {
       await observe(ws, host);
-      const { body: roots } = await fetchRoots(host);
       const before = host.shellCalls.length;
 
-      const noCsrf = await postRebuild(host, ws, { sameOrigin: true });
-      assert.equal(noCsrf.status, 403);
-      const crossSite = await postRebuild(host, ws, { csrf: roots.csrf, sameOrigin: false });
-      assert.equal(crossSite.status, 403);
-      const badToken = await postRebuild(host, ws, { csrf: "not-the-token" });
-      assert.equal(badToken.status, 403);
       // 没被观测过的 root：白名单不放行（不是文件系统上存在就能重建）。
-      const strangerRun = await postRebuild(host, stranger, { csrf: roots.csrf });
-      expect([400, 403, 404]).toContain(strangerRun.status);
+      const strangerRun = refusedOf(await startRebuild(host, stranger));
+      assert.equal(strangerRun.status, 403);
+      assert.match(strangerRun.error, /工作区/u);
+      // 相对路径在服务方法里就被拒，不会落到白名单。
+      const relative = refusedOf(await startRebuild(host, "relative/root"));
+      assert.equal(relative.status, 400);
       expect(host.shellCalls).toHaveLength(before);
       const indexSpawns = host.shellCalls.filter((row) =>
         row.request.command.startsWith("zg index"),
@@ -282,17 +296,14 @@ describe.skipIf(!zgAvailable())("真实宿主：重建路由的 HTTP 面", () =>
     const ws = observedWorkspace();
     try {
       await observe(ws, host);
-      const { body: roots } = await fetchRoots(host);
-      const first = await postRebuild(host, ws, { csrf: roots.csrf });
-      assert.ok(first.body.ok);
-      const second = await postRebuild(host, ws, { csrf: roots.csrf });
-      assert.equal(second.status, 200, JSON.stringify(second.body));
-      expect(second.body.jobId).toBe(first.body.jobId);
-      expect(second.body.reused).toBe(true);
+      const first = startedOf(await startRebuild(host, ws));
+      const second = startedOf(await startRebuild(host, ws));
+      expect(second.jobId).toBe(first.jobId);
+      expect(second.reused).toBe(true);
       expect(
         host.shellCalls.filter((row) => row.request.command.startsWith("zg index")),
       ).toHaveLength(1);
-      await waitSettled(host, first.body.jobId!, Date.now() + 60_000);
+      await waitSettled(host, first.jobId, Date.now() + 60_000);
     } finally {
       restore();
       await host.dispose();
@@ -304,10 +315,9 @@ describe.skipIf(!zgAvailable())("真实宿主：重建路由的 HTTP 面", () =>
     const ws = observedWorkspace();
     try {
       await observe(ws, host);
-      const ghost = await poll(host, "zvec-grep-rebuild-999");
+      const ghost = refusedOf(readStatus(host, "zvec-grep-rebuild-999"));
       assert.equal(ghost.status, 404);
-      assert.ok(!ghost.body.ok);
-      expect(ghost.body.error).toContain("历史窗口");
+      expect(ghost.error).toContain("历史窗口");
     } finally {
       await host.dispose();
     }
@@ -347,19 +357,22 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
     return waitForPid(timeoutAt);
   }
 
-  it("插件被卸载：进程被杀、作业离开 running、路由一并摘掉", async () => {
+  it("插件被卸载：进程被杀、作业离开 running，且本包全程不注册路由", async () => {
     restoreFake?.();
     restoreFake = installFakeZg({ ms: 5000, pidFile });
     const host = await startHost({ indexTimeoutMs: 60_000 });
     const ws = observedWorkspace();
     await observe(ws, host);
-    const { body: roots } = await fetchRoots(host);
-    const started = await postRebuild(host, ws, { csrf: roots.csrf });
-    const jobId = started.body.jobId!;
+    const { jobId } = startedOf(await startRebuild(host, ws));
     // 进程真的起来了（假 zg 把 pid 落地）。
     const pid = await waitForPid();
     assert.ok(Number.isInteger(pid) && pid > 0, pidFile);
     expect(host.ctx.jobs.list().some((row) => row.id === jobId)).toBe(true);
+
+    // 旧 URL 在**装载态**就是 404：读面走的是官方网关，不是本包注册的 webServer 路由。
+    // 只在卸载之后测一次的话，将来谁把路由加回来也不会红。
+    const during = await fetch(`http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`);
+    assert.equal(during.status, 404);
 
     await host.unload();
     // 卸载效应收口：走**官方注册表** kill（不是绕过它直接杀进程）⇒ 名册里那条被推到
@@ -369,20 +382,19 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
 
     const alive = await waitForExit(pid);
     assert.equal(alive, false, `进程 ${pid} 必须被收掉`);
-    // 路由也摘掉了：同一 URL 不再由本插件应答（webServer 回 404）。
-    const after = await fetch(`http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`);
-    assert.equal(after.status, 404);
     await host.dispose();
   }, 120_000);
 
-  it("超过 indexTimeoutMs：kill 定时器收进程，轮询端点说明为什么没跑完", async () => {
+  it("超过 indexTimeoutMs：kill 定时器收进程，轮询读面说明为什么没跑完", async () => {
     const host = await startHost({ indexTimeoutMs: 700 });
     const ws = observedWorkspace();
     try {
       await observe(ws, host);
-      const { body: roots } = await fetchRoots(host);
-      const started = await postRebuild(host, ws, { csrf: roots.csrf });
-      const settled = await waitSettled(host, started.body.jobId!, Date.now() + 30_000);
+      const settled = await waitSettled(
+        host,
+        startedOf(await startRebuild(host, ws)).jobId,
+        Date.now() + 30_000,
+      );
       expect(settled.status).not.toBe("running");
       // 超时说明必须出现在投影里（它由本包合成，不进官方环）。
       expect(settled.output).toContain("超时");
@@ -402,10 +414,15 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
         host.agentOf(ws),
       );
       assert.ok(!started.isError, host.textOf(started));
-      const jobId = /zvec-grep-rebuild-\d+/u.exec(host.textOf(started))?.[0];
-      assert.ok(jobId !== undefined, host.textOf(started));
-      // 同一个官方注册表、同一种投影：卡片与模型看到的是同一条作业。
-      expect(host.ctx.jobs.list().some((row) => row.id === jobId)).toBe(true);
+      // 不从文案里抠号，也不按名册的**位置**取号（`list()[0]` 会在注册表里多出一条不属于
+      // 本包的作业时报错到别条作业身上）。按本包作业的 kind 取，并要求恰好一条——kind 是
+      // 独立写死的字面量，不是从被测代码里读出来的，所以它红了就是真的漂了。
+      const mine = host.ctx.jobs.list().filter((row) => row.kind === "zvec-grep-rebuild");
+      assert.equal(mine.length, 1, `本包侧应有恰好一条作业，实际 ${String(mine.length)} 条`);
+      const [row] = mine;
+      assert.ok(row, "上一条已要求恰好一条，这里只把下标访问的类型收窄");
+      const jobId = String(row.id);
+      assert.ok(host.textOf(started).includes(jobId), host.textOf(started));
       const settled = await waitSettled(host, jobId, Date.now() + 60_000);
       expect(settled.status).toBe("completed");
       assert.equal(settled.exitCode, 0);

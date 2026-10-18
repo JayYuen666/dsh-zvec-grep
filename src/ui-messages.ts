@@ -95,25 +95,14 @@ export interface UiMessages {
   readonly rebuildMissingJobId: string;
   /** 卡片侧 root 预检（绝对路径）。 */
   readonly rebuildRootNotAbsolute: string;
+  /** 宿主没有提供重建远程面（没装远程服务 / 网关没挂上命名空间）。 */
+  readonly rebuildUnavailable: string;
 
   /** embedding 候选项文本模板：`{reference}`、`{dimension}`。 */
   readonly modelOption: string;
   readonly backendLlamaCpp: string;
   readonly backendTransformersJs: string;
   readonly backendModel2Vec: string;
-
-  /** 403（同源/CSRF 失效）的可行动描述。 */
-  readonly httpForbidden: string;
-  /** 其它非 2xx 的描述：`{status}`。 */
-  readonly httpFailed: string;
-  /** 200 但不是 JSON 的描述：`{contentType}`。 */
-  readonly httpNotJson: string;
-  /** content-type 缺失时的占位（填进 httpNotJson）。 */
-  readonly contentTypeMissing: string;
-  /** 应答体不是 JSON 对象：`{url}`。 */
-  readonly notJsonBody: string;
-  /** 服务端 `{ok:false}` 且没带 error 时的兜底描述。 */
-  readonly requestRejected: string;
 }
 
 /**
@@ -208,16 +197,11 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildExitCode: "重建进程退出码 {exitCode}（zg 未安装/权限不足/沙箱拒绝都会走到这里）",
     rebuildMissingJobId: "启动重建失败：应答缺 jobId",
     rebuildRootNotAbsolute: "root 必须是绝对路径（以 / 开头）",
+    rebuildUnavailable: "宿主没有提供工作区重建读面（未装远程服务）",
     modelOption: "{reference}（{dimension}维）",
     backendLlamaCpp: "llama-cpp（原生，需 node-llama-cpp）",
     backendTransformersJs: "transformers-js（纯 JS ONNX）",
     backendModel2Vec: "model2vec（纯 JS worker，最轻）",
-    httpForbidden: "403：请求被拒绝（同源校验或 CSRF token 失效）",
-    httpFailed: "请求失败（HTTP {status}）",
-    httpNotJson: "响应不是 JSON（content-type={contentType}）：重建端点未注册或路径被前端兜住了",
-    contentTypeMissing: "缺省",
-    notJsonBody: "响应不是 JSON 对象：{url}",
-    requestRejected: "请求未被接受",
   },
   en: {
     cardTitle: "zvec-grep (zg)",
@@ -274,16 +258,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "the rebuild process exited with code {exitCode} (missing zg, insufficient permissions and sandbox denials all land here)",
     rebuildMissingJobId: "failed to start the rebuild: the response has no jobId",
     rebuildRootNotAbsolute: "root must be an absolute path (starting with /)",
+    rebuildUnavailable: "the host does not expose the rebuild Remote API",
     modelOption: "{reference} ({dimension} dims)",
     backendLlamaCpp: "llama-cpp (native, requires node-llama-cpp)",
     backendTransformersJs: "transformers-js (pure JS ONNX)",
     backendModel2Vec: "model2vec (pure JS worker, lightest)",
-    httpForbidden: "403: request rejected (same-origin check or expired CSRF token)",
-    httpFailed: "request failed (HTTP {status})",
-    httpNotJson:
-      "response is not JSON (content-type={contentType}): the rebuild endpoint is not registered, or a front-end fallback caught the path",
-    contentTypeMissing: "unset",
-    notJsonBody: "response is not a JSON object: {url}",
-    requestRejected: "the request was not accepted",
   },
 };

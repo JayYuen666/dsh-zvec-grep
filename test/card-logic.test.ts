@@ -1,17 +1,14 @@
 // lib/card-logic.ts 单测（DOM-free，host typecheck 可直接 import）：
 // cardStore 快照投影与 per-scope 缓存 / 草稿取值（touched 优先；读判据在
 // lib/card-draft.ts，用例逐条照旧）/ limit 校验 /
-// 重建轮询应答解析（completed 且 exit 0 才算成功）/ fetch 应答体检。
+// 重建轮询应答解析（completed 且 exit 0 才算成功）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import {
   cardStore,
   daemonNoteKey,
   draftFields,
-  httpProblem,
-  isOkBody,
   limitDraftOf,
-  parseJsonRecord,
   parseRebuildPoll,
   resolveLimitInput,
 } from "../lib/card-logic.ts";
@@ -52,7 +49,7 @@ const ZH_LIMIT_INVALID_HINT = "请输入 1-50 的整数";
 // provider 持有的共享表单（同包 config-form.d.ts），卡片自 dispose 会连坐同
 // provider 的其它消费者。
 
-/** 官方 `ConfigFormSnapshot` 的合法形状（7 位全必选）；首个快照受理前 value/revision
+/** 官方 `ConfigFormSnapshot` 的合法形状（6 位全必选）；首个快照受理前 value/revision
  *  为 undefined，正是卡片要渲染「还没数据」的那一态。 */
 function snap(over: Partial<FormSnapshot> = {}): FormSnapshot {
   return {
@@ -62,7 +59,6 @@ function snap(over: Partial<FormSnapshot> = {}): FormSnapshot {
     user: {},
     revision: 3,
     writable: true,
-    mode: "host",
     ...over,
   };
 }
@@ -130,7 +126,7 @@ describe("cardStore 快照投影", () => {
       assert.equal(cardStore(oneScope).getSnapshot().status, status);
     }
     // memory 模式：writable 是独立于 status 的只读位，官方契约下它永假。
-    const memoryScope = fakeScope(snap({ status: "unavailable", writable: false, mode: "memory" }));
+    const memoryScope = fakeScope(snap({ status: "unavailable", writable: false }));
     assert.equal(cardStore(memoryScope).getSnapshot().writable, false);
   });
 
@@ -158,9 +154,7 @@ describe("cardStore 快照投影", () => {
 
   it("各自 scope 更新各自生效", () => {
     const scopeA = fakeScope(snap({ writable: true, value: { defaultLimit: 10 } }));
-    const scopeB = fakeScope(
-      snap({ writable: false, mode: "memory", value: { defaultLimit: 20 } }),
-    );
+    const scopeB = fakeScope(snap({ writable: false, value: { defaultLimit: 20 } }));
     const storeA = cardStore(scopeA);
     const storeB = cardStore(scopeB);
     storeA.getSnapshot();
@@ -402,43 +396,6 @@ describe("parseRebuildPoll（completed 且 exit 0 才算成功）", () => {
   });
 });
 
-describe("httpProblem / parseJsonRecord / isOkBody（应答体检）", () => {
-  it("403 单列（CSRF 过期要能认出）", () => {
-    assert.match(httpProblem(false, 403, "text/html", tZh) ?? "", /403/u);
-  });
-
-  it("非 2xx → 请求失败", () => {
-    assert.match(httpProblem(false, 500, "application/json", tZh) ?? "", /HTTP 500/u);
-  });
-
-  it("200 但 content-type 不是 JSON → 指出端点未注册", () => {
-    const html = httpProblem(true, 200, "text/html; charset=utf-8", tZh);
-    // 可选链 + 与 true 显式比较（strict-boolean-expressions 不吃 `boolean | undefined`），
-    // 判据与旧的 `html !== null && html.includes(...)` 逐字等价：html 为 null 时同样不成立。
-    assert.equal(html?.includes("响应不是 JSON"), true);
-    // content-type 缺省时文案里给「缺省」而非空
-    assert.match(httpProblem(true, 200, "", tZh) ?? "", /content-type=缺省/u);
-  });
-
-  it("健康应答 → null（大小写不敏感）", () => {
-    assert.equal(httpProblem(true, 200, "application/JSON", tZh), null);
-  });
-
-  it("parseJsonRecord：只认对象", () => {
-    assert.deepEqual(parseJsonRecord('{"ok":true}'), { ok: true });
-    assert.equal(parseJsonRecord("{oops"), null);
-    assert.equal(parseJsonRecord("[1,2]"), null);
-    assert.equal(parseJsonRecord("null"), null);
-    assert.equal(parseJsonRecord("42"), null);
-  });
-
-  it("isOkBody：只认 ok===true", () => {
-    assert.equal(isOkBody({ ok: true }), true);
-    assert.equal(isOkBody({ ok: "true" }), false);
-    assert.equal(isOkBody({}), false);
-  });
-});
-
 describe("保存动作走 set/unset 两条路（草稿模型）", () => {
   it("清空字段用 unset，有值字段用 set", async () => {
     const scope = fakeScope(snap({ value: {} }));
@@ -465,7 +422,7 @@ describe("保存动作走 set/unset 两条路（草稿模型）", () => {
 
 // ── i18n：卡片文本取自注入的 translator（切语言 = 换字典那份）───────────────
 describe("卡片逻辑文案双语", () => {
-  it("en translator 下 limit 提示、轮询终态与应答体检都是英文", () => {
+  it("en translator 下 limit 提示与轮询终态都是英文", () => {
     assert.deepEqual(resolveLimitInput("abc", tEn), {
       kind: "invalid",
       hint: "enter an integer between 1 and 50",
@@ -489,8 +446,6 @@ describe("卡片逻辑文案双语", () => {
       parseRebuildPoll({ status: "completed", exitCode: 127 }, tEn).output,
       /exited with code 127/u,
     );
-    assert.match(httpProblem(false, 403, "text/html", tEn) ?? "", /CSRF token/u);
-    assert.match(httpProblem(true, 200, "", tEn) ?? "", /content-type=unset/u);
   });
 
   it("英文那份整段不残留中文（同一渲染路径只换字典）", () => {
@@ -502,8 +457,6 @@ describe("卡片逻辑文案双语", () => {
       parseRebuildPoll({ status: "stopping" }, tEn),
       parseRebuildPoll({ status: "failed", exitCode: null }, tEn),
       parseRebuildPoll({ status: "completed", exitCode: 1 }, tEn),
-      httpProblem(false, 500, "", tEn),
-      httpProblem(true, 200, "text/html", tEn),
     ]);
     assert.doesNotMatch(rendered, /[\u4E00-\u9FFF]/u);
   });

@@ -17,9 +17,9 @@ import { describe, it } from "vitest";
 
 const pkgDir = path.join(import.meta.dirname, "..");
 
-/** host 半产物体积预算（实测 190,502 B）。宿主按包名载入它，这些字节是真实的装载成本。 */
+/** host 半产物体积预算（取实测值上浮后的整数档）。宿主按包名载入它，这些字节是真实的装载成本。 */
 const HOST_BUDGET_BYTES = 240_000;
-/** client 半产物体积预算（实测 43,134 B）。浏览器侧加载，按平台单独计账。 */
+/** client 半产物体积预算（取实测值上浮后的整数档）。浏览器侧加载，按平台单独计账。 */
 const CLIENT_BUDGET_BYTES = 54_000;
 
 /** 产物文件名与预算的对照。 */

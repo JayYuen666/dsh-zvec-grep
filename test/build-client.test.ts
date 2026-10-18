@@ -107,7 +107,7 @@ interface FakeForm extends ConfigForm<Record<string, unknown>> {
   dispose: () => Promise<void>;
 }
 
-/** 官方 `ConfigFormSnapshot` 的合法形状（7 位全必选）。 */
+/** 官方 `ConfigFormSnapshot` 的合法形状（6 位全必选）。 */
 function snap(over: Partial<FormSnapshot> = {}): FormSnapshot {
   return {
     status: "ready",
@@ -116,7 +116,6 @@ function snap(over: Partial<FormSnapshot> = {}): FormSnapshot {
     user: {},
     revision: 3,
     writable: true,
-    mode: "host",
     ...over,
   };
 }
@@ -362,10 +361,10 @@ describe("buildClient()", () => {
     );
   });
 
-  it("ZgCard 快照契约防回归：配置值从 snap.value 解构（2026-09-18 修复）", async () => {
+  it("ZgCard 的配置值取自 snap.value 那一层，不是整枚快照", async () => {
     const out = await buildClient();
-    // 修复前 value = snap 整体（顶层含 status/writable，配置读不到）→ 恒显示默认值。
-    // 修复后 value = snap.value ?? {}。断言产物含 .value 解构、不含把 snap 当 value。
+    // 快照契约是 {status, writable, value: {...}}：把 snap 整个当 value 用时配置读不到，
+    // 卡片只会恒显示默认值，而且一声不响。
     assert.ok(
       out.includes("snap.value") || out.includes(".value ?? {}") || out.includes("[snap.value"),
       "产物应含 snap.value 解构（快照契约 {status, writable, value:{...}}）",

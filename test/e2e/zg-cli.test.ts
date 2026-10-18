@@ -74,6 +74,18 @@ async function run(
 /** 文案表：本包双语资源里的中文那份（下游校验均用它）。 */
 const messages: ZvecGrepMessages = MESSAGES.zh;
 
+/** 在同一棵树上按字面量搜一次（索引通道，refresh=off 免得被别的进程刷新干扰）。 */
+async function searchLiteral(dir: string, marker: string): Promise<string> {
+  const built = buildSearchCommand(
+    { root: dir, query: marker, refresh: "off", preview: "none" },
+    messages,
+    clientModeOf(undefined, messages),
+  );
+  const result = await run(built.command, dir);
+  assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
+  return result.stdout;
+}
+
 /** 本包给 zg 索引命令的 embedding（本地模型，本机已缓存）。 */
 const LOCAL_EMBEDDING = "local/potion-code-16m-v2";
 /** 样本文件名与统一检索字面量（断言里多次引用）。 */
@@ -437,6 +449,72 @@ describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的�
       "warning: embedding model fell back to lexical",
     );
   }, 120_000);
+
+  it("密钥排除真的在挡东西（`.pem` 会被索引，默认那条规则不是死规则）", async () => {
+    // lib/cli.ts 的 pushIndexGlobs 有一句被改过的断言：`.pem`「不在可索引类型里」。真 zg 0.2.2 上是**假的**
+    // ——单独造一棵只放密钥文件的树，它照样 `added`，照样能被检索回来。这条用例同时钉两半：
+    // 关着排除时确实进了索引（规则是有对象的），开着排除时确实取不回来（规则是活的）。
+    const secretName = "secret.pem";
+    const secretMarker = "ZZSECRETP EMLINE";
+    const mixedName = "secret.P12";
+    const mixedMarker = "ZZSECRETP12LINE";
+
+    /** 一棵只有「密钥文件 + 一份正常源码」的工作区（正常源码保证索引不是空的）。 */
+    function secretWorkspace(): string {
+      const dir = mkdtempSync(path.join(tmpdir(), "zg-p2p-secret-"));
+      writeFileSync(path.join(dir, GITIGNORE_NAME), GITIGNORE_BODY);
+      writeFileSync(path.join(dir, AUTH_TS_NAME), SINGLE_LINE_AUTH_BODY);
+      writeFileSync(path.join(dir, secretName), `${secretMarker} body\n`);
+      writeFileSync(path.join(dir, mixedName), `${mixedMarker} body\n`);
+      cleanupsIndexed.push(() => {
+        rmSync(dir, { recursive: true, force: true });
+      });
+      return dir;
+    }
+
+    /** 按给定排除开关建一次索引。 */
+    async function indexSecrets(excludeSecrets: boolean): Promise<string> {
+      const dir = secretWorkspace();
+      const built = buildIndexCommand(
+        { root: dir, excludeSecrets },
+        LOCAL_EMBEDDING,
+        messages,
+        clientModeOf(undefined, messages),
+      );
+      const result = await run(built.command, dir);
+      assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
+      return dir;
+    }
+
+    const bare = await indexSecrets(false);
+    // 排除关着：两类密钥文件都进得了索引 —— 这是「规则有对象」那一半，也是那句错注释的反证。
+    await expect(searchLiteral(bare, secretMarker)).resolves.toContain(secretName);
+    await expect(searchLiteral(bare, mixedMarker)).resolves.toContain(mixedName);
+
+    const guarded = await indexSecrets(true);
+    // 排除开着（本包默认）：同两条字面量都取不回来，而正常源码仍在 —— 规则不是装饰。
+    await expect(searchLiteral(guarded, secretMarker)).resolves.not.toContain(secretName);
+    await expect(searchLiteral(guarded, mixedMarker)).resolves.not.toContain(mixedName);
+    await expect(searchLiteral(guarded, AUTH_QUERY)).resolves.toContain(AUTH_TS_NAME);
+  }, 180_000);
+
+  it("守护进程就绪探测的旗标在真 zg 上存在（非零码就是未就绪）", async () => {
+    // host.ts 的 SERVER_READY_COMMAND 是 BackgroundSupport 的唯一证据源：上游改名或取消
+    // `--check-ready` 时，本机所有 mock 用例照绿（它们比的是字符串），症状却是
+    // refresh=background 这一档永久被拒。这里问一次**真** zg。
+    const dir = mkdtempSync(path.join(tmpdir(), "zg-p2p-ready-"));
+    cleanupsIndexed.push(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const result = await run("zg server status --check-ready", dir);
+    // 就绪与否由这台机器的事实决定，两种都合法；不合法的是「旗标不认识」。
+    const rejected = /unknown|unexpected|invalid|unrecognized|unexpected argument/iu;
+    assert.ok(!rejected.test(result.stderr + result.stdout), `${result.stderr}\n${result.stdout}`);
+    if (result.status !== 0) {
+      // 未就绪那一臂必须用退出码 + 那句原文表达（判据读的是退出码，文本只是给人的）。
+      assert.match(result.stderr, /server is not ready/u);
+    }
+  }, 60_000);
 
   it("并发重建的真实报错被 classifyConcurrentFailure 认出（含占锁方字段）", async () => {
     // 真 zg 在另一条写路径持锁时会给出结构化失败；这里连起两条真索引来撞它。
