@@ -19,6 +19,11 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
   - shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`，所以那枚宿主包也得在提供面上：本包按 `schemastery` 同一口径处理（非 optional `peerDependencies` + `devDependencies` 同枚精确版本，**不进 `dependencies`**）。这条只能靠门禁钉：漏它时本包的类型检查、构建与测试全绿，故障只在装出去之后以 ERR_MODULE_NOT_FOUND 出现。
   - 只有 shared 那枚在 `dependencies` 里。`@deepseek-ai/schemastery` 是宿主包：声明为**非 optional 的 `peerDependencies`**，并在 `devDependencies` 里以同一枚精确版本再写一份给本包的编译与测试用——它**不进 `dependencies`**。这条不是风格偏好：消费侧 profile 的安装布局是 `nodeLinker: hoisted` 且 `autoInstallPeers: false`，宿主包一旦进了 `dependencies` 就会被落成真实目录，与宿主进程已加载的那份并存；而 `@deepseek-ai/dsh-tools` 的 `TOOL_RUNTIME_SCHEDULER` 是普通 `Symbol`（不是 `Symbol.for`），符号身份按模块实例计算，宿主 `dsh-agent-loop` 于是读到 `undefined`，每一次原生工具调用都抛 `Cannot read properties of undefined (reading 'prepare')`，整个 profile 的工具一起失效——本包的构建、类型检查与测试在这之前全部照绿。判据钉在 `test/publish-manifest.test.ts`。
 
+
+### shared 的版本下限
+
+如果你的 profile 用 pnpm `overrides` 把 `@jayyuen66/dsh-plugin-shared` 钉在某个版本，那个钉住的值必须不低于本包声明的 `@jayyuen66/dsh-plugin-shared` 版本。钉得更低就会装到一份缺少本包运行期所导入的名字的产物，宿主起来时报 `N entries did not activate` 加 `does not provide an export named ...`——包装得上、永远不生效，而各仓单仓 CI 看不见这一类。
+
 ### 在 dsh 里启用
 
 - add/remove 按包内 cordis.patch.yml 维护注册行 `- id: zvec-grep`（name 指向本包）；该文件由 `package.json` 的 `dsh.bundle.patch` 指向。
@@ -174,7 +179,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 - 测试分三层。`test/*.test.ts`（单测 + mock 宿主上下文）钉本包自己的纯逻辑；`test/integration/*` 起**真**宿主服务（`dsh-tools` 的 ToolRuntime、`dsh-subprocess-local` + `dsh-bash-local`、`dsh-jobs-local`、真 HTTP 的 `dsh-host-webserver`、timer 与 approval），把插件挂进官方调用管线（`ctx.tools.execute()` / 真 `fetch`）驱动；`test/e2e/zg-cli.test.ts` 既没有插件也没有替身，只把 `lib/cli.ts` 造出的命令行喂给**真 zg CLI**，钉它的输出形状、错误码与旗标面。宿主契约的缺陷都出在中间那层：mock 上下文只会同意本包已经相信的事（例如 `ctx.get("jobs") === ctx.get("jobs")` 在替身里恒真，而真实 cordis 每次读服务都新建一枚 traceable 代理，该等式恒假）。
 - `npm run check` 是发布前的一条门：typecheck（两侧 tsconfig）+ `oxlint` + 重建两个 bundle + `vitest run --coverage` + `oxfmt --check`。
-- 覆盖率按**全局 100% 阈值**跑（stmts/branches/funcs/lines）：任何一行或分支没被用例钉住，套件当场红——这是本仓的既定质量门，不是巧合。
+- 覆盖率按 **100% 阈值**跑（stmts/branches/funcs/lines），分母是 `vitest.config.ts` 里 `coverageInclude` 选定的那一面（`host.ts` + `lib/**`）——那一面里任何一行或分支没被用例钉住就当场红，这是本仓的既定质量门，不是巧合。客户端半（`src/**`）**刻意在分母外**：它经 bundle 与 `test/ui-messages.test.ts` 覆盖，不按单元测。
 - `npm run build` / `npm run build:client` 产出 `host.js` / `client.js`，两者**都不入库**：`prepare` 与 `prepack` 现产，而 `test/build-host.test.ts` / `test/build-client.test.ts` 拿磁盘产物与内存构建逐字节比，产物过期即变红。发布物不手改——发布入口本就是构建产物，因为 Node 对躺在 `node_modules` 里的 `.ts` 直接拒绝类型剥离。
 - 行为之外还有一族 manifest 门守着发布面（`test/publish-manifest.test.ts`）：每个入口目标都要被 `files` 覆盖、宿主包一律不进 `dependencies`、`dsh-*` 精确钉且与 peer 同版本、随包产物里不许出现本机路径与 store 布局、shared 出货产物值导入的宿主包必须由本包提供。`test/dist-size.test.ts` 给产物体积设预算，`test/readme-parity.test.ts` 钉中英两份的结构对等。
 

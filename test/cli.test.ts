@@ -951,18 +951,30 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
     );
   });
 
-  it("整数字段接受数字字符串形态（模型常把数字写成字符串）", () => {
+  it("整数字段的类型只认 number：数字字符串不再是数字", () => {
+    // 旧断言（名字叫「接受数字字符串形态」）认可的其实是**类型强转**：参数面声明着
+    // type: "integer"，而 `Number("3")` 与 `Number(true)` / `Number([])` 一样能折成整数，
+    // 于是模型给一个类型错的值得到的不是报错、而是一个它没指定过的数字。数字字符串这一档
+    // 尤其误导：报错文案说「必须是整数」，可真正错的是**类型**（收到的是 string）。
+    assert.throws(
+      () => buildIndexCommand({ root: "/ws", maxDepth: "3" }, fallback, zhMessages),
+      /maxDepth 必须是 >= 0 的整数（收到 string）/u,
+    );
+    assert.throws(
+      () => buildIndexCommand({ root: "/ws", maxFileSizeBytes: "1024" }, fallback, zhMessages),
+      /maxFileSizeBytes 必须是 >= 0 的整数（收到 string）/u,
+    );
+    assert.throws(
+      () => buildIndexCommand({ root: "/ws", embeddingConcurrency: "2" }, fallback, zhMessages),
+      /embeddingConcurrency 必须是 >= 1 的整数（收到 string）/u,
+    );
     const { command } = buildIndexCommand(
-      { root: "/ws", maxDepth: "3", maxFileSizeBytes: "1024", embeddingConcurrency: "2" },
+      { root: "/ws", maxDepth: 3, maxFileSizeBytes: 1024, embeddingConcurrency: 2 },
       fallback,
       zhMessages,
     );
     assert.ok(command.includes("--max-depth 3"));
     assert.ok(command.includes("--max-filesize 1024"));
     assert.ok(command.includes("--embedding-concurrency 2"));
-    assert.throws(
-      () => buildIndexCommand({ root: "/ws", maxDepth: "abc" }, fallback, zhMessages),
-      /maxDepth 必须是 >= 0 的整数/u,
-    );
   });
 });

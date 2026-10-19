@@ -329,7 +329,12 @@ export function resolveRoot(
   throw new Error(messages.rootRequiredWithFallback);
 }
 
-/** limit 钳制：省略（undefined/null）回默认；给了但不是非负整数即抛；越界钳到 [LIMIT_MIN, LIMIT_MAX]。 */
+/**
+ * limit 钳制：省略（undefined/null）回默认；给了但不是非负整数即抛；越界钳到 [LIMIT_MIN, LIMIT_MAX]。
+ *
+ * 类型只认 number：`Number()` 会把 `true` 折成 1、把 `[]` 折成 0——模型给一个类型错的 limit
+ * 就会静默只回一条结果，而它会把「只有一处命中」当成这次检索的事实。
+ */
 export function clampLimit(
   value: unknown,
   messages: ZvecGrepMessages,
@@ -338,11 +343,13 @@ export function clampLimit(
   if (value === undefined || value === null) {
     return fallback;
   }
-  const num = typeof value === "number" ? value : Number(value);
-  if (!Number.isSafeInteger(num) || num < 0) {
+  if (typeof value !== "number") {
+    throw new TypeError(messages.limitInvalid);
+  }
+  if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(messages.limitInvalid);
   }
-  return Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, num));
+  return Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, value));
 }
 
 /** 检索类数组（queries/fts/vector）取值：条数与单条长度都放宽到 query 档。 */
@@ -373,6 +380,12 @@ export interface SearchArgs {
   fts?: unknown;
   vector?: unknown;
   fuse?: unknown;
+  /**
+   * 检索通道选择（true = 穷举词法、false = 只走索引检索）。判据在宿主侧（`pickExhaustive`，
+   * 它才握有索引探测能力），**本文件不读这一位**；列在这里是为了让入参形状与工具参数面一致，
+   * 免得下一个人以为「参数面声明了、可这一位没有消费者」。
+   */
+  rg?: unknown;
   limit?: unknown;
   preview?: unknown;
   refresh?: unknown;
@@ -657,16 +670,15 @@ export interface IndexArgs {
   resetPaths?: unknown;
 }
 
-/** 非负/正整数字符串化；非数值类型或非整数报错（`true` 不算 1）。 */
+/** 非负/正整数字符串化；非 number 或非整数报错（`true` 与数字字符串都不算数字）。 */
 function intFlag(value: unknown, name: string, messages: ZvecGrepMessages, min: number): string {
-  if (typeof value !== "number" && typeof value !== "string") {
+  if (typeof value !== "number") {
     throw new TypeError(fill(messages.intWithReceived, { name, min, received: typeof value }));
   }
-  const num = typeof value === "number" ? value : Number(value);
-  if (!Number.isSafeInteger(num) || num < min) {
+  if (!Number.isSafeInteger(value) || value < min) {
     throw new Error(fill(messages.intRequired, { name, min }));
   }
-  return String(num);
+  return String(value);
 }
 
 /** 索引布尔旗标（一次性严格取值，见 readIndexFlags）。 */

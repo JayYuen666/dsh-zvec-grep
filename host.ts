@@ -1750,9 +1750,12 @@ function searchToolParameters(registered: ZvecGrepMessages): ToolParameters {
  * 而报错会把模型推向 `zg_index`——那意味着先下载 embedding 权重。对「先看看这个仓库里
  * 有什么」这类问题，逐行字面匹配就是够的，兜底不是妥协。自动改道的代价由 runSearchTool
  * 里的前置声明来偿。
+ *
+ * `value` 只可能是「已过 `boolOf` 的布尔」或「没给」（undefined）——类型错的入参在到达
+ * 这里之前就已经报错，故这里不再有「非布尔也不缺省」这一档。
  */
-function pickExhaustive(value: unknown, hasIndex: boolean): boolean {
-  if (typeof value === "boolean") {
+function pickExhaustive(value: boolean | undefined, hasIndex: boolean): boolean {
+  if (value !== undefined) {
     return value;
   }
   return !hasIndex;
@@ -1807,7 +1810,13 @@ async function runSearchTool(
   // 判据用 findIndexRoot（向上找祖先）与 zg 自己的行为一致：实测 zg 在索引根的子目录里
   // 同样能检索到，所以「根自身没索引」不能当判据。
   const indexRoot = findIndexRoot(resolvedRoot, indexProbe);
-  const explicit = args["rg"];
+  // 这一位决定走哪条通道，故按严格取值读：`rg:"true"` 这类类型错若被当成「没给」，
+  // 模型要的逐行字面匹配就会静默变成语义检索（或反过来）——答案形态与请求不符而退出码为 0，
+  // 正是上面那条自动改道注脚要避免的静默错误答案。缺失（undefined/null）才是「没给」。
+  const explicit =
+    args["rg"] === undefined || args["rg"] === null
+      ? undefined
+      : boolOf(args["rg"], "rg", messages);
   const exhaustive = pickExhaustive(explicit, indexRoot !== undefined);
   // 自动改道时**显式声明**：模型要的是语义检索，给它的是逐行字面匹配，这两件事的答案形态
   // 完全不同。不声明就成了 S1 认定的那类「静默错误答案」——退出码 0、命中数为零、模型
@@ -1983,6 +1992,11 @@ async function runIndexTool(
   // `rebuild: 1` 静默走成增量，正是本文件头注释点名要避免的那类失败。
   const background = boolOf(args["background"], "background", messages);
   const rewriting = boolOf(args["rebuild"], "rebuild", messages) || background;
+  // confirm 的**值**语义（必须 === true）由 tools.guard 强制，这里只收它的**类型**：
+  // `confirm: "true"` 这类形状错不该由 guard 那句「必须由用户明确要求」的文案承担——
+  // 那句话说的是值，而模型给的是一处类型错，两件事得分开说。required 的存在性由 define()
+  // 兜（缺这一位根本到不了这里）。
+  boolOf(args["confirm"], "confirm", messages);
   // 版本门槛**先于占位**：占位一旦抢下就必须在每条失败出口上释放，而门槛失败发生在
   // 那几条 finally 之外——放在占位之后，zg 过老时这棵树会被永久标成「重建中」，
   // 之后的检索一直排队等一条永远不会落定的重建。后台那条由 spawnIndexWrite 自己的
@@ -2084,12 +2098,16 @@ async function runStatusTool(
     // 与检索同一套等待：重建恰在这次查询前落定时，不必让模型看到一次无意义的失败。
     rebuildWait: { root, rebuilds, maxWaitMs: config.rebuildWaitMs },
     // `--check-ready` 的非零退出码**就是**答案：就绪报告仍在 stdout 上，走普通失败路径会
-    // 把它丢掉、只留一句 stderr。吸收条件收紧到「退出码非零且 stdout 确有内容」——
-    // 超时、中止、沙箱拒绝、锁忙都不满足（它们要么不带就绪报告，要么压根不是未就绪），
-    // 仍各走原分支。
+    // 把它丢掉、只留一句 stderr。吸收条件因此必须是「非零退出**且** stdout 上有报告**且**
+    // 这次失败不是超时/中止/沙箱拒绝」：后三种各有各的归因（`timeoutFailure` 等），它们的
+    // stdout 只是被打断前的半截输出，拿来当「索引未就绪」这个确定结论等于把一次执行失败
+    // 说成一条可行动的事实。锁忙也不吸收——它要走下面的重建等待重试，不是终局。
     ...(checkReady
       ? {
           resolveFailure: (failure: string, result: ShellRunResult): string | null => {
+            if (result.timedOut || result.aborted || result.sandbox?.denied === true) {
+              return null;
+            }
             const report = result.stdout.text.trim();
             return report.length > 0
               ? `${report}\n${fill(messages.statusNotReady, { root, detail: failure })}`

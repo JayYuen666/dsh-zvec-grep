@@ -46,6 +46,12 @@ import type {
   RebuildStatusResult,
 } from "../lib/rebuild-shape.ts";
 
+/** 「索引未就绪」那份 stdout 报告：多档用例共用，且不捕获任何外层变量。 */
+const freshReport = (): { text: string; truncated: boolean } => ({
+  text: "? Workspace index is not configured",
+  truncated: false,
+});
+
 // 默认密钥排除的命令行形态（由 lib/argv-guard.ts 单一来源派生，避免两处硬编码漂移）。
 // 旗标是 --iglob 而非 --glob：大小写不敏感、且排在用户 iglob 之后，理由见 lib/cli.ts 的 pushIndexGlobs。
 const SECRET_ARGS = SECRET_EXCLUDE_GLOBS.map((globStr) => `--iglob '${globStr}'`).join(" ");
@@ -1232,6 +1238,30 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
         );
       }
     }
+  });
+
+  it("confirm 的类型也在工具侧收口：值语义归 guard，类型错不该借它那句文案", async () => {
+    // guard 的文案说的是「必须由用户明确要求且 confirm 为 true」——那是值语义；模型给
+    // `confirm: "true"` 时它犯的是类型错，两件事得分开说，且类型错必须在工具自己这一层
+    // 就被点名，不能靠 guard 兜（guard 是后一道，不是唯一一道）。
+    const root = ws("confirmtype");
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const tool = toolOf(ctx, "zg_index");
+    await Promise.all(
+      [1, "true", "yes", {}, []].map(async (bad) => {
+        const thrown = await reasonOf(tool.execute({ root, confirm: bad }, execOf(root)));
+        assert.match(
+          thrown,
+          /confirm 必须是布尔值/u,
+          `${JSON.stringify(bad)} 应被拒且点名 confirm`,
+        );
+      }),
+    );
+    // 真值那一档照常走到命令构造：这道收口只拦类型，不拦正常调用。
+    ctx.shell.runResults.push(okRun("OK"));
+    await tool.execute({ root, confirm: true }, execOf(root));
+    assert.equal(ctx.shell.resolveCalls.length, 1);
   });
 
   it("命令**构造**失败也不泄漏重建占位（构造期 allowlist 拒非本地 embedding 是模型够得着的）", async () => {
@@ -2651,6 +2681,47 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
     await assert.rejects(
       () => toolOf(ctx, "zg_status").execute({ root }, execOf(root)),
       /is not ready/u,
+    );
+  });
+
+  it("超时/中止/沙箱拒绝不被吸收：stdout 上有半截报告也不行", async () => {
+    // 这三档各有各的归因，stdout 上那点内容只是被打断前的半截输出。吸收它们等于把一次
+    // 执行失败讲成「索引未就绪」这个确定结论——而那句文案还会自相矛盾地写「这不是执行失败」。
+    const blank = { text: "", truncated: false };
+    const cases: [string, ShellRunResult, RegExp][] = [
+      [
+        "超时",
+        { exitCode: null, timedOut: true, stdout: freshReport(), stderr: blank },
+        /zg 执行超时/u,
+      ],
+      [
+        "中止",
+        { exitCode: null, aborted: true, stdout: freshReport(), stderr: blank },
+        /zg 执行被中止/u,
+      ],
+      [
+        "沙箱策略拒绝",
+        {
+          exitCode: 1,
+          stdout: freshReport(),
+          stderr: blank,
+          sandbox: { mode: SANDBOX_WORKSPACE_WRITE, denied: true },
+        },
+        /沙箱策略拒绝/u,
+      ],
+    ];
+    await Promise.all(
+      cases.map(async ([label, result, expected]) => {
+        const ctx = makeCtx();
+        applyTo(ctx);
+        const root = ws("ready");
+        ctx.shell.runResults.push(result);
+        await assert.rejects(
+          () => toolOf(ctx, "zg_status").execute({ root, checkReady: true }, execOf(root)),
+          expected,
+          label,
+        );
+      }),
     );
   });
 
@@ -4992,6 +5063,27 @@ describe.skipIf(realRootUnavailable)("穷举词法检索通道", () => {
     ctx.shell.runResults.push(okRun("RESULT"));
     await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
     assert.ok(!(ctx.shell.resolveCalls[0]?.command ?? "").includes("--rg"));
+  });
+
+  it("rg 给了非法类型即报错，绝不静默当成「没给」而换掉通道", async () => {
+    // 静默当「没给」的后果不是报错而是**换通道**：已建索引的工作区会把模型要的逐行字面
+    // 匹配换成语义检索，无索引时反过来——退出码 0、答案形态与请求不符，正是上面那条
+    // 自动改道声明要避免的静默错误答案。两个方向都钉一遍。
+    await Promise.all(
+      [
+        ["true", ws("rgstr-idx")],
+        ["false", bareWs("rgstr-bare")],
+      ].map(async ([given, root]) => {
+        const ctx = makeCtx();
+        applyTo(ctx);
+        ctx.shell.runResults.push(okRun("RESULT"));
+        await assert.rejects(
+          () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: given }, execOf(root)),
+          /rg 必须是布尔值/u,
+        );
+        assert.equal(ctx.shell.resolveCalls.length, 0, "类型错必须在构造命令之前停住");
+      }),
+    );
   });
 
   it("穷举模式不发放 grep/rg 配额：不读索引就不构成「先用过语义检索」", async () => {

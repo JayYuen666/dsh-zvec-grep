@@ -99,34 +99,6 @@ export interface RebuildRegistry {
 /** 上限容器的条目数：超过按插入序淘汰最早的（常驻进程内存有界）。 */
 export const MAX_TRACKED_REBUILDS = 32;
 
-/** 等到信号被取消为止。 */
-async function abortOf(signal: AbortSignal): Promise<undefined> {
-  const { promise, resolve } = Promise.withResolvers<undefined>();
-  signal.addEventListener(
-    "abort",
-    () => {
-      resolve(undefined);
-    },
-    { once: true },
-  );
-  return promise;
-}
-
-/** 等到信号被取消为止，并归一成等待的一种结局。 */
-async function abortedOutcome(signal: AbortSignal): Promise<WaitOutcome> {
-  await abortOf(signal);
-  return "aborted";
-}
-
-/** 延时；用不可撤销的定时器换来收尾路径里没有「撤销自己」那种分支。 */
-async function delay(ms: number): Promise<undefined> {
-  const { promise, resolve } = Promise.withResolvers<undefined>();
-  setTimeout(() => {
-    resolve(undefined);
-  }, ms);
-  return promise;
-}
-
 /**
  * 容量上限：超过就淘汰若干条目，但**绝不淘汰已经交出作业号的那条**。
  *
@@ -263,25 +235,32 @@ export function createRebuildRegistry(
       if (signal?.aborted === true) {
         return "aborted";
       }
-      // 三条出口各占一个承诺，取最先兑现的那个。没有「撤销自己那条」的动作：
-      // 定时器到点自然兑现、取消监听是 once 的，等待者最多兑现一次，多余的那次
-      // 只是让一个已经落定的定时器空转到点而已——换来的是不必在收尾里维护定时器与
-      // 监听器的成对撤销，也就没有「撤销时它们已经是 undefined」那种分支。
-      const settleOutcome = async (): Promise<WaitOutcome> => {
+      // 两条**需要清理**的出口（等待上限、取消）同抢一枚兑现器，取最先兑现的那个；
+      // 条目落定那条另起一条承诺一起 race。收尾在 finally 里成对撤销——不撤销的话，一次再
+      // 普通不过的等待都会在 caller 的 signal 上留一个永不触发的 abort 监听，并在事件循环里
+      // 留一枚到点才响的定时器；宿主进程常驻，两者都随调用次数累积（重建窗口内每次
+      // zg_search / zg_status 都走这里一次）。
+      const { promise, resolve } = Promise.withResolvers<WaitOutcome>();
+      const timer = setTimeout(
+        () => {
+          resolve("timeout");
+        },
+        Math.max(0, timeoutMs),
+      );
+      const onAbort = (): void => {
+        resolve("aborted");
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const settledOutcome = async (): Promise<WaitOutcome> => {
         await entry.settled;
         return "settled";
       };
-      const expireOutcome = async (): Promise<WaitOutcome> => {
-        await delay(Math.max(0, timeoutMs));
-        return "timeout";
-      };
-      const settled = settleOutcome();
-      const expired = expireOutcome();
-      // 没有取消信号就只竞两条：与其塞一条永不兑现的承诺占位（那还会在它身上留一段
-      // 永远走不到的回执代码），不如根本不把它放进 race。
-      const raced =
-        signal === undefined ? [settled, expired] : [settled, expired, abortedOutcome(signal)];
-      return Promise.race(raced);
+      try {
+        return await Promise.race([settledOutcome(), promise]);
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      }
     },
 
     keys(): string[] {

@@ -2,6 +2,13 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.6
+
+### Fixed
+
+- **`install-probe` 那一格从加进来那天起就不可能绿**：它用 `npm pack` 打的包去 `npm install`，而 `npm pack` 不解析 `catalog:`——tarball 的 `package.json` 里 12 处协议原样留着，安装当场 `EUNSUPPORTEDPROTOCOL Unsupported URL Type "catalog:"`。真实发布走的是 `pnpm publish`（`publish.yml`），所以**用户拿到的包从来不是 npm 打的那个**；这条步骤一直在验一件不存在的东西。现在只留 `pnpm pack`，`npm install` 那一步照旧不带任何 flag（peer 面能不能被默认语义吃下去，仍是它要判的东西），只是改装 pnpm 打的同一个包。本地复跑：pnpm 产物经 `npm install` 退 0，随后 `import` 入口拿到 `apply`/`Config`/`inject` 三件齐备。
+- 重建等待的 `abort` 监听与超时定时器改成 `finally` 里成对撤销。旧写法不成对撤销：一次普通等待就会在 caller 的 signal 上留一个永不触发的监听、在事件循环里留一枚到点才响的定时器，宿主常驻进程里两者都随调用次数累积。
+
 ## 0.1.5-rc
 
 把 **Windows 的支持范围说清楚，并让 CI 按这个范围分工**。直接起因是 `b121e91`（0.1.4）推上去之后 `gate (windows-latest, 22)` 交了 184 条失败：唯一成因是 root 判据只认以 `/` 开头的绝对路径，而 win32 上 `os.tmpdir()` 交回盘符形态（`C:\Users\RUNNER~1\AppData\Local\Temp\…`），凡是要在盘上造真实工作区的用例都在 `rootOf` 先被拒、根本走不到被测行为。**这不是 0.1.4 改出来的**（184 条里 173 条的用例在 0.1.3 就存在，两版对 win32 也只保护了「造不出属主不可读文件」那一档），而是这一格的结果第一次被端上来。

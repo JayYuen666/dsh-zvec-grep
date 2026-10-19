@@ -1,7 +1,8 @@
 // lib/rebuild-state.ts 的单元测试：占位的互斥、作业 id 的补写时机、释放的幂等、
 // 等待者的四种出口，以及容量上限。纯逻辑，不触宿主面。
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 // 官方作业品牌串的**值**形式（JobId("x") 只是给同一个字符串贴牌，不做校验）。
 // 测试不是产物，值导入不破坏 host.js 的自包含；生产侧一律 type-only。
 import { JobId as jobIdOf } from "@deepseek-ai/dsh-jobs";
@@ -14,6 +15,11 @@ const PKG = "/repo/pkg";
 
 /** 覆盖判据只为判路径归属，文案表在这一层是摆设（异常文本被丢弃，出界才是结论）。 */
 const { zh } = MESSAGES;
+
+/** 挂在某枚 signal 上的 abort 监听数：用来钉「收尾真的把监听撤销了」。 */
+function liveAbortListeners(signal: AbortSignal): number {
+  return getEventListeners(signal, "abort").length;
+}
 
 /** 可控时钟：让 startedAt 的断言不依赖真实时间。 */
 function fixedClock(start = 1000): () => number {
@@ -143,6 +149,67 @@ describe("等待者", () => {
     ];
     rebuilds.release("/ws");
     assert.deepEqual(await Promise.all(waits), ["settled", "settled", "settled"]);
+  });
+});
+
+describe("等待者的收尾（不留监听与悬挂定时器）", () => {
+  // 早先的实现让三条出口各占一条承诺、谁赢了都不撤销另外两条：一次再普通不过的等待都会在
+  // caller 的 signal 上留一个永不触发的 abort 监听，并在事件循环里留一枚到点才响的定时器。
+  // 宿主进程常驻，重建窗口内每次检索都走这里一次 ⇒ 两者都随调用次数累积。
+  it("等到落定：abort 监听被撤销", async () => {
+    const rebuilds = createRebuildRegistry();
+    rebuilds.claim("/ws", "card");
+    const controller = new AbortController();
+    const waiting = rebuilds.wait("/ws", zh, 60_000, controller.signal);
+    rebuilds.release("/ws");
+    assert.equal(await waiting, "settled");
+    assert.equal(
+      liveAbortListeners(controller.signal),
+      0,
+      "落定后不得把监听留在 caller 的 signal 上",
+    );
+  });
+
+  it("超时：abort 监听被撤销", async () => {
+    const rebuilds = createRebuildRegistry();
+    rebuilds.claim("/ws", "card");
+    const controller = new AbortController();
+    assert.equal(await rebuilds.wait("/ws", zh, 0, controller.signal), "timeout");
+    assert.equal(liveAbortListeners(controller.signal), 0);
+  });
+
+  it("取消胜出：不留悬挂的等待上限定时器", async () => {
+    // 「取消胜出」那一档的监听本来就靠 `once` 语义被摘掉，断言它撤销监听区分不出实现；
+    // 能区分的是**定时器**：旧实现让等待上限那枚 setTimeout 留在事件循环里到点才响。
+    const rebuilds = createRebuildRegistry();
+    rebuilds.claim("/ws", "card");
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const waiting = rebuilds.wait("/ws", zh, 60_000, controller.signal);
+      controller.abort();
+      assert.equal(await waiting, "aborted");
+      assert.equal(liveAbortListeners(controller.signal), 0);
+      assert.equal(vi.getTimerCount(), 0, "取消出口也要 clearTimeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("落定后不留悬挂的等待上限定时器", async () => {
+    // 假定时器让「那枚 60s 的等待上限还在不在」变成可断言的事实：真实定时器只会让
+    // 调用方（与常驻宿主）多在事件循环里背一段到点才响的等待。
+    vi.useFakeTimers();
+    try {
+      const rebuilds = createRebuildRegistry();
+      rebuilds.claim("/ws", "card");
+      const waiting = rebuilds.wait("/ws", zh, 60_000);
+      rebuilds.release("/ws");
+      assert.equal(await waiting, "settled");
+      assert.equal(vi.getTimerCount(), 0, "收尾必须 clearTimeout");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

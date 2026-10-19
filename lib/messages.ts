@@ -352,7 +352,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     ignoreFilesDescription:
       "额外的 ignore 文件路径（如 .gitignore 之外的排除清单），透传 zg --ignore-file",
     excludeSecretsDescription:
-      "是否默认排除私钥/密钥库格式（*.pem/*.key/*.p12/*.pfx/*.keystore/id_rsa*），默认 true；仅在明确需要索引此类文件时置 false",
+      "是否排除私钥/密钥库格式（*.pem/*.key/*.p12/*.pfx/*.keystore/id_rsa*），默认 true。本插件的排除规则排在用户正向 glob 之后，用户规则覆盖不掉它——所以这一位是「要不要索引私钥」的唯一开关：置 false 会把这批文件灌进向量库，此后检索可以把它们回显到上下文。只有用户明确要求索引密钥夹具时才给 false",
     hiddenDescription: "包含隐藏文件（默认不含，隐藏密钥文件因此已被排除）",
     noIgnoreDescription: "不读 ignore 文件",
     maxDepthDescription: "最大目录深度",
@@ -619,8 +619,12 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "Extra ignore-file paths (exclusion lists beyond .gitignore), passed through as " +
       "zg --ignore-file",
     excludeSecretsDescription:
-      "Whether to exclude private-key/keystore formats by default (*.pem/*.key/*.p12/*.pfx/" +
-      "*.keystore/id_rsa*), default true; set false only when such files genuinely must be indexed",
+      "Whether to exclude private-key/keystore formats (*.pem/*.key/*.p12/*.pfx/" +
+      "*.keystore/id_rsa*), default true. These exclusion rules are evaluated after user " +
+      "include globs, so no user glob can bring the files back: this flag is the only switch " +
+      "for indexing private keys, and false feeds them into the vector store, from where " +
+      "search can echo them back into context. Set false only when the user explicitly asks " +
+      "to index key fixtures",
     hiddenDescription:
       "Include hidden files (excluded by default, which also drops hidden key files)",
     noIgnoreDescription: "Do not read ignore files",

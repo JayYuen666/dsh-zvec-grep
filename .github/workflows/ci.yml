@@ -65,20 +65,25 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: 两个发布器各打一次包
+      - name: 打包（发布器与 CI 都用 pnpm）
         run: |
           set -euo pipefail
-          mkdir -p /tmp/pkg/npm /tmp/pkg/pnpm
-          npm pack --pack-destination /tmp/pkg/npm --ignore-scripts
+          mkdir -p /tmp/pkg/pnpm
+          # 只用 pnpm pack。`npm pack` 不解析 `catalog:`，会把 12 处未解析的协议原样
+          # 写进 tarball 的 package.json，随后任何 `npm install` 都在
+          # `EUNSUPPORTEDPROTOCOL Unsupported URL Type "catalog:"` 上失败——那不是产物
+          # 缺陷，是打包器选错了：publish.yml 走的是 `pnpm publish`，用户拿到的从来不是
+          # npm 打的那个包。旧写法其实在验一件不存在的东西，且它从加进来那天起就不可能绿。
           pnpm pack --pack-destination /tmp/pkg/pnpm
-      - name: 干净目录安装 npm tarball（不带任何 flag）
+      - name: 干净目录安装 tarball（不带任何 flag）
         run: |
           set -euo pipefail
-          tarball="$(ls /tmp/pkg/npm/*.tgz | head -1)"
+          tarball="$(ls /tmp/pkg/pnpm/*.tgz | head -1)"
           mkdir -p /tmp/probe && cd /tmp/probe
           npm init -y >/dev/null
           # 不传 --legacy-peer-deps：那正是本包 peer 面（宿主包一律 peer + dev，不进
-          # dependencies）能不能被默认安装语义吃下去的判据。
+          # dependencies）能不能被默认安装语义吃下去的判据。发布器是 pnpm，但装的人是
+          # npm，所以这一档必须是 npm 真的装一次 pnpm 打的那个包。
           npm install "$tarball" --no-audit --no-fund
       - name: 装载 host 半（入口可解析、运行期值导入齐备）
         run: |
