@@ -35,6 +35,44 @@ const SEARCH_PREFIX_WORDS = new Set([
   "nice",
   "parallel",
 ]);
+/**
+ * 包装命令里「带一个取值」的选项：其后那一个 token 是它的值，不是被执行的命令
+ * （`sudo -u root grep`、`nice -n 10 rg`、`timeout -s 9 5 rg`）。
+ *
+ * 跨包装命令共用一张表：这些短选项在 git/xargs/env/sudo/time/nice/timeout 里
+ * 语义一致，逐个包装登记一份只会让「加了新包装却忘了登记」多一处可能。
+ */
+const VALUE_TAKING_FLAGS = new Set([
+  "-a",
+  "-c",
+  "-C",
+  "-d",
+  "-E",
+  "-f",
+  "-g",
+  "-I",
+  "-k",
+  "-L",
+  "-n",
+  "-o",
+  "-p",
+  "-P",
+  "-r",
+  "-s",
+  "-t",
+  "-T",
+  "-u",
+  "-U",
+  "--adjustment",
+  "--group",
+  "--kill-after",
+  "--signal",
+  "--user",
+]);
+/** 命令前的壳层赋值（`VAR=1 grep x` 里的 `VAR=1`）：它自己不是命令，其后仍是命令位。 */
+const SHELL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/u;
+/** 包装命令的裸数值参数（`timeout 5 rg` 的 `5`）：也不是被执行的命令。 */
+const BARE_NUMBER = /^\d+$/u;
 /** 结束一个 token、但**不**开启新命令位的字符（空白、右括号、重定向）。 */
 const TOKEN_BREAK_CHARS = new Set([" ", "\t", "\v", "\f", ")", "<", ">"]);
 /** 结束一个 token 并让紧随其后的 token 处于命令位（控制符 / 换行 / 反引号 / 组）。 */
@@ -113,8 +151,12 @@ function tokenizeShell(command: string): ShellToken[] {
     } else if (COMMAND_BREAK_CHARS.has(char)) {
       flush();
       state.atCommand = true;
-      // 只有管道把上一段的 stdout 接进下一段的 stdin；`;`、`&&` 之后的命令不是。
-      state.pipedNext = char === "|";
+      // 只有单个 `|` 把上一段的 stdout 接进下一段的 stdin；`;`、`&&`、`||` 之后的
+      // 命令不是（`||` 的后半段恰恰是「前半段没产出时才跑」的那条，输入不是 stdout）。
+      // `||` 由两个竖线字符分别进来，前一枚与后一枚都必须判成「不是管道」。
+      const neighbourIsPipe =
+        command.slice(index + 1, index + 2) === "|" || command.slice(index - 1, index) === "|";
+      state.pipedNext = char === "|" && !neighbourIsPipe;
     } else if (TOKEN_BREAK_CHARS.has(char)) {
       flush();
     } else {
@@ -126,27 +168,50 @@ function tokenizeShell(command: string): ShellToken[] {
   return tokens;
 }
 
-/** token 的命令名（basename，小写）；`-*` 选项一律不算命令名（返回空串）。 */
+/**
+ * token 的命令名（basename，小写）。
+ * 两个调用点都只喂命令位 token，而命令位判据已经把 `-` 开头的选项排除了
+ * （见 `commandPositionIndexes`），所以这里不再重复判一次前缀：那会是一条
+ * 永远走不到的分支。
+ */
 function baseName(text: string): string {
-  if (text.startsWith("-")) {
-    return "";
-  }
   return text.slice(text.lastIndexOf("/") + 1).toLowerCase();
 }
 
 /**
  * 挑出处在「被执行位置」的 token：串首 / 控制符之后 / 包装命令（git、xargs、
- * env…）之后的第一个实参。
+ * env…）之后那个真正的实参。
+ *
+ * 「包装命令之后」不是「紧邻的下一个 token」：包装命令自己的选项（`git --no-pager`、
+ * `xargs -0`）、选项取值（`sudo -u root`）、裸数值（`timeout 5`）、壳层赋值（`VAR=1`）
+ * 都还站在命令位之前。只认「紧邻下一个」时命令位链在这些形态上直接断掉，检索调用
+ * 漏判 —— 而漏判的方向是门禁放行。这几类一律「跳过但不断链」。
  */
 function commandPositionIndexes(tokens: ShellToken[]): number[] {
   const out: number[] = [];
   let afterPrefix = false;
+  let pendingValue = false;
   for (const [index, token] of tokens.entries()) {
+    const { text } = token;
     const isCommand: boolean = token.atCommand || afterPrefix;
-    if (isCommand) {
-      out.push(index);
+    if (pendingValue) {
+      // 上一枚是取值旗标，这一枚是它的值：不是命令，命令位链继续
+      pendingValue = false;
+      afterPrefix = true;
+    } else if (isCommand && VALUE_TAKING_FLAGS.has(text)) {
+      pendingValue = true;
+    } else if (
+      isCommand &&
+      (text.startsWith("-") || BARE_NUMBER.test(text) || SHELL_ASSIGNMENT.test(text))
+    ) {
+      // 包装命令的旗标、裸数值、壳层赋值：都不是被执行的命令，也不结束命令位链
+      afterPrefix = true;
+    } else {
+      if (isCommand) {
+        out.push(index);
+      }
+      afterPrefix = isCommand && SEARCH_PREFIX_WORDS.has(baseName(text));
     }
-    afterPrefix = isCommand && SEARCH_PREFIX_WORDS.has(baseName(token.text));
   }
   return out;
 }
@@ -211,9 +276,16 @@ export function isGrepRgCommand(command: string): boolean {
   });
 }
 
-/** 去掉尾部斜杠的 root 归一化（'/' 自身保持 '/'）。 */
-export function normalizeRoot(path: string): string {
-  const trimmed = path.replace(/\/+$/u, "");
+/**
+ * 去掉尾部斜杠的 root 归一化（'/' 自身保持 '/'）。
+ *
+ * 只认 `/`：本包的根判据（`assertAbsoluteRoot` 只收 `/` 开头的串）、命令 tokenizer 与
+ * `rootPaths` 覆盖判据都按 POSIX 形切分，root 归一化再多认一种分隔符只会让上游认得出、
+ * 下游判不回——README 的 Support surface 一节写明 Windows 主机不在支持面内，
+ * 失败形态是 fail-fast 而不是静默漂移。要真正支持 Windows，得连上面那三处判据一起改。
+ */
+export function normalizeRoot(root: string): string {
+  const trimmed = root.replace(/\/+$/u, "");
   return trimmed.length > 0 ? trimmed : "/";
 }
 
@@ -243,7 +315,10 @@ export function pathInsideRoot(
   } catch {
     return false;
   }
-  return absolute === base || absolute.startsWith(`${base}/`);
+  // 段前缀要能认出根目录自身：`${"/"} + "/"` 是 `//`，任何归一化后的绝对路径都不会
+  // 以它开头，于是 root="/" 时所有目标都被判「根之外」——门禁恒放行、授权恒误拒。
+  const prefix = base.endsWith("/") ? base : `${base}/`;
+  return absolute === base || absolute.startsWith(prefix);
 }
 
 /**

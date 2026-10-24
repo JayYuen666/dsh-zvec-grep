@@ -1,5 +1,17 @@
 node_modules/
-client.js
 .toolchain/
-host.js
 coverage/
+# 构建产物只在包根（build-*.mjs 的落盘位置）：不锚定会把任意子目录的同名源码/夹具一并忽略。
+/client.js
+/host.js
+# 误提交高发项：本机凭据/日志与本地构建目录，一律不进库。
+.env
+.env.*
+*.pem
+*.key
+*.log
+dist/
+build/
+
+# 统一构建件的原子落盘草稿目录（shared/lib/build-artifacts 的 writeArtifact）。
+/.tmp/

@@ -40,18 +40,31 @@ export interface DaemonLeaseFailure {
 
 export type ConcurrentZgFailure = LockBusyFailure | DaemonLeaseFailure;
 
-/** zg 明细块的键值行。键与值都命名捕获，避免按下标取。 */
-const DETAIL_LINE = /^\s*(?<key>[A-Za-z][A-Za-z0-9]*):\s*(?<value>.+?)\s*$/u;
+/**
+ * zg 明细块的键值行。三个细节都来自「明细行是缩进的」这一实测形状：
+ *   - 缩进**必填**（`\s+`）：明细块之后任何含冒号的非空行（第二个错误块的 `Error:` /
+ *     `Code:`、尾注 `Hint:`）都不该被当成明细键收进表，与已知键同名时会污染判断；
+ *   - 键字符集放宽到字母开头 + `[\w-]`：上游若改用 `owner_operation` 这类拼写，行至少
+ *     还能被认出来（值是否被消费由查表侧决定），不至于整块收集在此中断；
+ *   - 值必须以非空白开头：把只含空白的行当成有效值没有意义。
+ */
+const DETAIL_LINE = /^(?:\s+)(?<key>[A-Za-z][\w-]*):\s*(?<value>\S.*?)\s*$/u;
 
-/** 输出里的错误码行。 */
-const CODE_LINE = /^\s*Code:\s*(?<code>\S+)\s*$/mu;
+/** 错误码行的**定位**形状（只认行首，不核内容）。 */
+const CODE_LINE_PREFIX = /^\s*Code:/u;
+
+/** 错误码行的**取值**形状：`Code:` 之后是单一 token。 */
+const CODE_LINE = /^\s*Code:\s*(?<code>\S+)\s*$/u;
 
 /**
  * 抽错误码。没有该行就不是 zg 的结构化失败（旁路返回 null，交给通用失败文案）。
- * 只取第一处：一次失败只应有一个码，取多个说明输出形状已变，宁可不判。
+ * 先定位第一条 `Code:` 行、再核它的内容是否为单一 token：一次失败只应有一个码，
+ * 首处写成 `Code: XXX (detail)` 说明输出形状已变——宁可不判，也不许顺延到后文
+ * 捞一个可能属于别的错误块的码回来。
  */
 export function zgErrorCode(stderr: string): string | undefined {
-  return CODE_LINE.exec(stderr)?.groups?.["code"];
+  const firstCodeLine = stderr.split("\n").find((line) => CODE_LINE_PREFIX.test(line));
+  return firstCodeLine === undefined ? undefined : CODE_LINE.exec(firstCodeLine)?.groups?.["code"];
 }
 
 /**

@@ -2,6 +2,42 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.7
+
+### Added
+
+- **`lib/limits.ts`**：设置卡六个字段里三个数值字段的区间与默认值收成单一来源，宿主 schema、命令钳制、卡片显示与输入提示引同一份常量；新增 `dropWithIndexArgs` 与 `rebuildExitUnknown` 两条文案。
+- `tsconfig.build-scripts.json` 加进 typecheck 链条：`// @ts-check` 只在编辑器和显式跑 `tsc` 时生效，构建脚本没进任何 tsc program 时 CI 上没有门。变异实测过——往 `build-client.mjs` 里加一行类型错误，这条会红。
+- `build-utils.mjs`：两个构建脚本原先各自持有 `isRecord` / `asRecord` / `isEntryChunk` / `singleEntryChunk` / `writeArtifact` / `invokedDirectly` 六份逐字副本。这些恰好都是「只在一侧修就会静默保留旧缺陷」的语义，现在只有一份，且进了 tsc 与 lint 的面。
+- 回归测试覆盖 `react` 家族未登记说明符：构建期直接失败，而不是等到加载期。
+
+### Fixed
+
+- **命令规模改按 UTF-8 字节计**：多字节内容按 `String.length` 比会在中文/emoji 面上放过内核单参数上限；超长命令在构造期拒绝。密钥排除补上 `.jks` / `.ppk`。
+- **`drop=true` 携带任何索引侧参数时点名拒绝**：过滤、rebuild、embedding、深度等不再被静默忽略，避免用户以为清除/过滤生效而实际只删了索引。`resetPaths` 仍单独点名互斥。
+- **`ignoreFiles` 预检改用 `path.resolve`**：相对条目按 root 解析、绝对条目原样；`ENOENT` / `EACCES` / `EISDIR` / `ENOTDIR` 判「文件不合适」，其余环境故障（fd 耗尽、链接环等）原样上抛。上游遇到读不成的忽略文件会让整次索引失败并把坏路径写进索引状态，因此必须在命令构造前拦下。
+- **非字符串 `root` 立即报错**：`{root: 123}` 不再静默落回会话工作区，类型错不会再执行到别的目录。
+- **卡片数值字段的钳制与清空语义收口**：越界整数钳到区间并在保存条提示；用户清空的配额/时效显示空串而不是默认值；非法原文留在控件里，不会被下一次渲染换成宿主值。
+- **重建与轮询的收尾**：`done` reject 也释放占位与定时器；卸载时逐条收口；活跃表超限只告警不淘汰；未知 status 且没有可读退出码时报通用失败，不再拼「退出码 undefined」。
+- **search-first 改按索引根判界**：`||` 与包装命令的选项取值不再漏判；空 enforcement 不再拼出残缺的沙箱后缀。
+- **zg 版本与配置校验**：版本号接受 `v` 前缀、分量最多 9 位；HF 端点与凭据变量名做形状校验。
+- **轮询加在途与卸载守卫**：慢响应不会覆写终态；remote 现取、挂载失败可重试；保存中禁用正文输入。
+- **`external` 的 `react/` 前缀放行会把未登记的子路径静默内联**：宿主模块表里 react 家族只有四条，前缀放行意味着 `react-dom/server` 这类说明符会走 `return false` 被 rolldown 就地打进 `client.js`，产物里于是同时存在外部的 `react` 与内联的一份副本，hooks 静默失效。现在外置按精确集合查表，命中之外若是 react 家族说明符则构建期报错，要求显式登记。
+- **同源守卫判据从「产物里出现包名」换成「产物里的 `BUNDLE_PKG` 声明值」**：包名在产物里不止一处，子串匹配只拦得住两个常量一起漂移的情形；只有 `BUNDLE_PKG` 漂移时断言照样通过，卡片静默不渲染。
+- `writeArtifact` 的临时文件名只用 pid：同一进程内并行构建两次会撞名。改成带 `randomUUID()`；清理临时文件的 `rm` 失败也不再把原始错误盖掉。
+- `invokedDirectly()` 改用异步 `realpath`：全仓唯一的同步 fs 调用，而共享 lint 基线的同步调用豁免表是手工清单，收录与否没有门保证。
+- 构建脚本里 `package.json` 的 `name` 从「缺失时退化成字符串 `unknown`」改成 fail loud：`client.js` 的 id 就是宿主模块表的键，退化兜底会让构建与新鲜度门禁一起绿、缺陷直达运行时。
+
+### Changed
+
+- **宿主线抬到 `0.2.1-rc.3`**：`engines.dsh`、peer/dev 依赖、overrides 与 README 徽标/正文同值。
+- **构建编排统一进 shared 的 `lib/build-*`**：host/client 构建脚本只剩薄配置层，产物仍落 `dist/`；CI/CodeQL/Scorecard/Dependabot 与 Windows 分工同步。
+- `normalizeRoot` 的注释写清为什么只认 `/`：根判据、命令 tokenizer 与 `rootPaths` 覆盖判据都按 POSIX 形切分，单独在归一化这一层多认一种分隔符会让上游认得出、下游判不回。README 的支持面一节写明 Windows 主机不在支持面内、失败形态是 fail-fast。
+
+### Not changed, deliberately
+
+- 探测侧不上溯 Windows 盘符。曾短暂引入过双分隔符上溯，它会让门禁在 Windows 上先拦住 grep/rg，而 `zg_search` 的根判据（只收 `/` 开头）必然拒绝同一路径——两条路一起堵死。要么整体支持 Windows，要么一处都别开；现在选后者。
+
 ## 0.1.6
 
 ### Fixed

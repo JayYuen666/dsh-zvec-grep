@@ -28,10 +28,11 @@ import {
 } from "./argv-guard.ts";
 // 本地 embedding 候选清单：构造期 allowlist 的唯一来源，与设置卡的 <select> 共用同一份。
 import { LOCAL_EMBEDDINGS, isLocalEmbedding } from "./embedding-catalog.ts";
+// 数值区间单源：limit 的钳制区间与默认值从这里取（host schema 与设置卡同源，见该文件头）。
+// DEFAULT_LIMIT 同时转出（host.ts 从这里取），两侧引同一份常量。
+import { DEFAULT_LIMIT, LIMIT_MAX, LIMIT_MIN } from "./limits.ts";
 
-const LIMIT_MIN = 1;
-const LIMIT_MAX = 50;
-export const DEFAULT_LIMIT = 10;
+export { DEFAULT_LIMIT } from "./limits.ts";
 
 /**
  * zg 客户端传输模式，三档与 zg 命令行 `--mode` 的字面量同域。取值域由下表的键推导，
@@ -314,12 +315,17 @@ export function assertAbsoluteRoot(root: unknown, messages: ZvecGrepMessages): s
  * root 解析：显式绝对路径优先；缺失/空串回退到 fallback（当前会话工作区，
  * 调用方从 exec.agent.session.header.cwd 取——官方 dsh-tool-fs-search 同模式）。
  * ROC 原则：fallback 也走 assertAbsoluteRoot 校验，绝不无条件接受。
+ * 显式的**非字符串**值不进 fallback 分支：模型写 `{root: 123}` 时若静默滑到会话工作区，
+ * 搜索就在模型没指定的目录上执行并交回一份「合法」结果——类型错必须当场报。
  */
 export function resolveRoot(
   value: unknown,
   fallback: string | undefined,
   messages: ZvecGrepMessages,
 ): string {
+  if (value !== undefined && value !== null && typeof value !== "string") {
+    throw new TypeError(fill(messages.rootMustBeString, { received: typeof value }));
+  }
   if (typeof value === "string" && value.trim().length > 0) {
     return assertAbsoluteRoot(value.trim(), messages);
   }
@@ -363,12 +369,14 @@ export interface BuiltCommand {
   readonly workdir: string;
 }
 
-/** 整条命令的规模闸门：超 MAX_COMMAND_BYTES 即拒（防 E2BIG 与无界内存）。 */
+/** 整条命令的规模闸门：按 UTF-8 字节比 MAX_COMMAND_BYTES（防 E2BIG 与无界内存）。
+ *  多字节内容一个码元可占 3~4 字节，按 `String.length`（码元数）比会在中文/emoji 面上
+ *  放过 Linux MAX_ARG_STRLEN 的单参数上限——判据必须落在内核真正收到的字节数上。 */
 function assembled(parts: string[], workdir: string, messages: ZvecGrepMessages): BuiltCommand {
   const command = parts.join(" ");
-  const { length } = command;
+  const length = Buffer.byteLength(command, "utf8");
   if (length > MAX_COMMAND_BYTES) {
-    throw new Error(fill(messages.commandTooLong, { length, maxChars: MAX_COMMAND_BYTES }));
+    throw new Error(fill(messages.commandTooLong, { length, maxBytes: MAX_COMMAND_BYTES }));
   }
   return { command, workdir };
 }
@@ -853,8 +861,33 @@ function indexEmbedding(
 }
 
 /**
+ * drop 那一臂用不上的索引侧参数（--drop 的命令只有 `index <root> --drop --yes`）。
+ * 只在这里点名：出现任何一个，drop 臂整体拒绝而不是静默丢弃——布尔旗标在那之前已按
+ * 类型校验过、丢弃无声，其余参数连类型都没校验，两种待遇并存会让
+ * `{drop:true, hidden:"yes"}` 报错而 `{drop:true, maxDepth:"3"}` 静默通过。
+ */
+const INDEX_ONLY_PARAMS: readonly (keyof IndexArgs)[] = [
+  "rebuild",
+  "embedding",
+  "globs",
+  "insensitiveGlobs",
+  "fileTypes",
+  "excludedFileTypes",
+  "ignoreFiles",
+  "hidden",
+  "noIgnore",
+  "excludeSecrets",
+  "maxDepth",
+  "maxFileSizeBytes",
+  "follow",
+  "embeddingConcurrency",
+  "device",
+];
+
+/**
  * 构造 zg index 命令。root 是位置参数（转义）。
- * - drop=true：`zg index <root> --drop --yes --mode <mode>`（非交互 shell 必须 --yes）。
+ * - drop=true：`zg index <root> --drop --yes --mode <mode>`（非交互 shell 必须 --yes）；
+ *   索引侧参数与 drop 互斥（resetPaths 另有单独互斥文案），出现即点名拒绝。
  * - 否则：`zg index <root> --embedding <m> [--rebuild] ... --mode <mode>`。
  * embedding 缺省时由调用方传入 defaultEmbedding（设置里的默认值）；显式值过构造期
  * allowlist（见 indexEmbedding）。
@@ -876,11 +909,17 @@ export function buildIndexCommand(
   const flags = readIndexFlags(args, messages);
 
   if (boolOf(args.drop, "drop", messages)) {
-    // drop 那一臂整条命令只有 `index <root> --drop --yes`，任何别的旗标都会在这一臂被
-    // 静默丢掉。resetPaths 是唯一真与它互斥的（上游 args.ts 也拒这一对），故明确报错
-    // 而不是当作没看见——用户以为清了继承设置，其实那条 zg 只会把索引删掉。
+    // drop 那一臂整条命令只有 `index <root> --drop --yes`，任何别的旗标都不进命令。
+    // resetPaths 是唯一真与它互斥的（上游 args.ts 也拒这一对），单独点名；其余索引侧
+    // 参数一次列全后拒绝——用户以为清了继承设置/带了过滤，其实那条 zg 只会把索引删掉。
     if (boolOf(args.resetPaths, "resetPaths", messages)) {
       throw new Error(messages.dropWithResetPaths);
+    }
+    const ignored = INDEX_ONLY_PARAMS.filter(
+      (name) => args[name] !== undefined && args[name] !== null,
+    );
+    if (ignored.length > 0) {
+      throw new Error(fill(messages.dropWithIndexArgs, { names: ignored.join(" | ") }));
     }
     parts.push("--drop", "--yes", modeFlag(mode));
     return assembled(parts, root, messages);

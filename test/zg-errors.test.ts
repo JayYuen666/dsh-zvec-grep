@@ -11,6 +11,8 @@ import {
 import type { ConcurrentZgFailure, DaemonLeaseFailure, LockBusyFailure } from "../lib/zg-errors.ts";
 
 const CODE_LINE = "Code: ZVEC_GREP.ENGINE.LOCK.BUSY";
+/** 普通索引持锁那条实测形状里的锁路径（多组用例共用）。 */
+const INDEX_LOCK_PATH = "/ws/.zvec-grep/locks/home.write";
 const TITLE = "Error: Index unavailable";
 const DETAILS = "Details:";
 
@@ -32,7 +34,7 @@ const LOCK_BUSY_INDEX = [
   TITLE,
   CODE_LINE,
   DETAILS,
-  "  lock: /ws/.zvec-grep/locks/home.write",
+  `  lock: ${INDEX_LOCK_PATH}`,
   "  operation: info",
   "  ownerOperation: index",
   "  ownerPid: 4242",
@@ -56,6 +58,19 @@ describe("错误码抽取", () => {
   it("没有 Code 行就是非结构化失败", () => {
     assert.equal(zgErrorCode("bash: zg: command not found"), undefined);
     assert.equal(zgErrorCode(""), undefined);
+  });
+
+  it("首处 Code: 行不是单一 token 时宁可不判：不顺延到后文捞别的码", () => {
+    // 第一块的 Code: 带尾巴说明输出形状已变；正则若跳过它继续找，捞回来的可能是
+    // 属于第二个错误块的码——归因到完全不相干的失败上。
+    const shifted = [
+      "Error: first failure",
+      "Code: SOMETHING.ELSE (with detail)",
+      "",
+      "Error: second failure",
+      `Code: ${LOCK_BUSY_CODE}`,
+    ].join("\n");
+    assert.equal(zgErrorCode(shifted), undefined);
   });
 });
 
@@ -93,9 +108,7 @@ describe("并发类失败识别", () => {
   });
 
   it("明细缺 ownerOperation 时不当作重建（宁可少等也不无界挂起）", () => {
-    const noOwner = [TITLE, CODE_LINE, DETAILS, "  lock: /ws/.zvec-grep/locks/home.write"].join(
-      "\n",
-    );
+    const noOwner = [TITLE, CODE_LINE, DETAILS, `  lock: ${INDEX_LOCK_PATH}`].join("\n");
     const failure = classifyConcurrentFailure(noOwner);
     assert.equal(asLockBusy(failure).rebuild, false);
     assert.equal(asLockBusy(failure).ownerOperation, undefined);
@@ -146,5 +159,35 @@ describe("并发类失败识别", () => {
     const failure = asLockBusy(classifyConcurrentFailure(truncated));
     assert.equal(failure.rebuild, true);
     assert.equal(failure.ownerPid, undefined);
+  });
+
+  it("无缩进的冒号行不是明细：第二个错误块的 Error:/Code: 收不进键值表", () => {
+    // 缩进是明细行的实测形状；零缩进的行若被当成键值，第二个错误块的键会污染判断。
+    const twoBlocks = [
+      CODE_LINE,
+      DETAILS,
+      `  lock: ${INDEX_LOCK_PATH}`,
+      "",
+      "Error: another failure",
+      "Code: SOMETHING.ELSE",
+    ].join("\n");
+    const failure = asLockBusy(classifyConcurrentFailure(twoBlocks));
+    assert.equal(failure.lockPath, INDEX_LOCK_PATH);
+    assert.equal(zgErrorCode(twoBlocks), LOCK_BUSY_CODE, "错误码仍取第一处");
+  });
+
+  it("非驼峰拼写（owner_operation）的明细行不再中断整块收集", () => {
+    // 键字符集放宽到 [\w-]：上游若改拼写，行仍被认出、后续键照常收集（值是否被
+    // 消费由查表侧决定——这里 ownerOperation 查不到，宁可少等也不无界挂起）。
+    const underscore = [
+      CODE_LINE,
+      DETAILS,
+      `  lock: ${INDEX_LOCK_PATH}`,
+      "  owner_operation: index.rebuild",
+      "  ownerPid: 4321",
+    ].join("\n");
+    const failure = asLockBusy(classifyConcurrentFailure(underscore));
+    assert.equal(failure.ownerPid, "4321", "块没有在 owner_operation 行中断掉");
+    assert.equal(failure.rebuild, false);
   });
 });

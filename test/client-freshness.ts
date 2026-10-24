@@ -18,7 +18,7 @@ import { it } from "vitest";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // package.json 与磁盘 client.js 都走 fs/promises：门禁本身因此是 async，调用方在
 // 用例文件顶层 `await declareClientFreshness()`——登记时机仍在收集期，用例名与顺序不变。
@@ -34,7 +34,7 @@ export async function declareClientFreshness(testFileUrl: string): Promise<void>
   it(`${pkgName}: client.js 与最新构建逐字节一致（改 src 后必须 node build-client.mjs）`, async () => {
     // 动态 import 的 .mjs 模块为 any：用类型断言收窄 buildClient 签名（测试
     // 豁免 no-unsafe-type-assertion），避免对 any 的 unsafe 调用/赋值。
-    const mod = (await import(path.resolve(pkgDir, "build-client.mjs"))) as {
+    const mod = (await import(pathToFileURL(path.resolve(pkgDir, "build-client.mjs")).href)) as {
       buildClient: () => Promise<string>;
     };
     const expected = await mod.buildClient();

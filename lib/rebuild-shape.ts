@@ -35,11 +35,17 @@ export interface RebuildStarted {
   readonly reused?: true;
 }
 
+/**
+ * 旧 HTTP 面留给拒绝应答的语义码，逐字取自构造点的实发值（lib/rebuild-remote.ts 的
+ * 400/403/404/409/500/503）。收敛成字面量联合而不是裸 `number`：构造点误填别的数字
+ * 在编译期就红，而不是带着一个没人认识的码上线。客户端只读 error，测试用它保语义。
+ */
+export type RebuildRefusedStatus = 400 | 403 | 404 | 409 | 500 | 503;
+
 export interface RebuildRefused {
   readonly ok: false;
   readonly error: string;
-  /** 旧 HTTP 面的语义码（200/400/403/404/409/500/503）；客户端只读 error，测试用它保语义。 */
-  readonly status: number;
+  readonly status: RebuildRefusedStatus;
 }
 
 export type RebuildStartResult = RebuildStarted | RebuildRefused;

@@ -5,7 +5,7 @@
 // 插件对两类读者的同一份说明，骨架应当一一对应。
 //
 // 判面取结构而不是逐句对译：两份文档的句子本来就不是字面互译（中英术语与详略不同），按文本
-// 比会天天误报；标题层级序列、首行包名与顶部互链这三件事才是可机判的最小信号。
+// 比会天天误报；标题层级序列与头部骨架（logo 打头 + HTML h1 + 语言徽章互链）才是可机判的最小信号。
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -17,8 +17,15 @@ const pkgDir = path.join(import.meta.dirname, "..");
 const DOC_EN = "README.md";
 const DOC_ZH = "README.zh-CN.md";
 
-/** 顶部互链：两份都要同时指向中英，读者在任何一侧都能跳过去。 */
-const LINKS: readonly string[] = ["[English](./README.md)", "[简体中文](./README.zh-CN.md)"];
+/** 视觉头的固定骨架：居中 logo 块打头；包名落在 HTML h1 上——头部没有 ATX 标题可判。 */
+const HEAD_FIRST_LINE = '<p align="center">';
+const HEAD_H1 = '<h1 align="center">dsh-zvec-grep</h1>';
+
+/** 顶部互链：语言徽章各指向另一语言，读者在任何一侧都能跳过去。 */
+const CROSS_LINKS: readonly (readonly [string, string])[] = [
+  [DOC_EN, "./README.zh-CN.md"],
+  [DOC_ZH, "./README.md"],
+];
 
 /**
  * 取一份 Markdown 的标题层级序列（只取 `#` 的个数，不取标题文本）。
@@ -34,7 +41,7 @@ function headingLevels(text: string): string[] {
 }
 
 describe("中英 README 结构对等", () => {
-  it("骨架、开场标题与互链三处都对得上", async () => {
+  it("骨架、头部与互链三处都对得上", async () => {
     const [english, chinese] = await Promise.all([
       readFile(path.join(pkgDir, DOC_EN), "utf8"),
       readFile(path.join(pkgDir, DOC_ZH), "utf8"),
@@ -45,11 +52,14 @@ describe("中英 README 结构对等", () => {
     ];
     for (const [name, text] of docs) {
       const lines = text.split("\n");
-      expect(lines[0], `${name} 的首行该是包名一级标题`).toBe("# @jayyuen66/dsh-zvec-grep");
-      const head = lines.slice(0, 6).join("\n");
-      for (const link of LINKS) {
-        expect(head, `${name} 顶部缺互链 ${link}`).toContain(link);
-      }
+      expect(lines[0], `${name} 的首行该是居中 logo 块，与兄弟仓的视觉头一致`).toBe(
+        HEAD_FIRST_LINE,
+      );
+      const head = lines.slice(0, 40).join("\n");
+      expect(head, `${name} 头部缺包名 h1`).toContain(HEAD_H1);
+      const cross = CROSS_LINKS.find(([doc]) => doc === name)?.[1];
+      expect(cross, `${name} 该有一条互链判据`).toBeDefined();
+      expect(head, `${name} 顶部缺指向 ${cross} 的语言徽章`).toContain(`href="${cross}"`);
     }
     expect(
       headingLevels(chinese),

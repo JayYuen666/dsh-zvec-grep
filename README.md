@@ -1,190 +1,279 @@
-# @jayyuen66/dsh-zvec-grep
+<p align="center">
+  <img src="https://cdn.jsdelivr.net/gh/JayYuen666/dsh-zvec-grep@main/icon.svg" width="96" height="96" alt="dsh-zvec-grep logo" />
+</p>
 
-[English](./README.md) · [简体中文](./README.zh-CN.md)
+<h1 align="center">dsh-zvec-grep</h1>
 
-### What it does
+<p align="center"><em>Semantic workspace search for dsh agents: hybrid BM25 + vector + RRF over a local zg index, with a search-first gate on grep and rg.</em></p>
 
-- Adds semantic workspace search to dsh sessions: registers three model tools, zg_search / zg_index / zg_status, which drive the zg CLI (BM25 + vector + RRF hybrid) through the host shell. The transport mode defaults to `--mode auto`: server when the daemon is ready, and zg **silently falls back to direct** when it is not (upstream only probes readiness and never starts a daemon; neither does this package — see "Daemon (server mode)").
-- Injects one systemPrompt rule section (`zvec-grep-routing`, order 1550) plus two tools.guard layers: safety backstop for zg_* and the search-first gate (in an indexed workspace, grep/rg requires a prior successful zg_search).
-- Ships a web settings card: default embedding, limit, search-first quota/window, daemon readiness, and a "rebuild workspace" button.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/v/@jayyuen66/dsh-zvec-grep?style=flat-square&logo=npm&logoColor=white" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/dm/@jayyuen66/dsh-zvec-grep?style=flat-square" alt="npm downloads" /></a>
+  <a href="https://github.com/JayYuen666/dsh-zvec-grep/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-zvec-grep/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
+  <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
+  <img src="https://img.shields.io/badge/node-%3E%3D22.12-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.3-658EFF?style=flat-square" alt="dsh" />
+  <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
+</p>
 
-### Installation
+<p align="center">
+  <img src="https://skillicons.dev/icons?i=typescript,nodejs,react,vitest,githubactions" alt="tech stack" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/JayYuen666"><img src="https://img.shields.io/badge/GitHub-JayYuen666-181717?style=flat-square&logo=github&logoColor=white" alt="GitHub" /></a>
+  <a href="mailto:cqwkkj@gmail.com"><img src="https://img.shields.io/badge/Email-cqwkkj@gmail.com-EA4335?style=flat-square&logo=gmail&logoColor=white" alt="Email" /></a>
+  <a href="https://twitter.com/JayYuen666"><img src="https://img.shields.io/badge/Twitter-X%2FJayYuen666-000000?style=flat-square&logo=x&logoColor=white" alt="Twitter/X" /></a>
+  <a href="./README.zh-CN.md"><img src="https://img.shields.io/badge/lang-简体中文-658EFF?style=flat-square" alt="简体中文" /></a>
+</p>
+
+---
+
+**A [dsh](https://github.com/deepseek-ai/deepseek-harness) plugin that gives the model semantic workspace search: three `zg_*` tools driving the local `zg` CLI (BM25 + vector + RRF), a search-first gate on grep/rg, and a settings card with daemon readiness and a rebuild button. The `zg` binary and the index stay on your machine.**
+
+## <img src="https://api.iconify.design/lucide/file-text.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Contents
+
+- [What it does](#what-it-does)
+- [Install](#install)
+  - [Shared version floor](#shared-version-floor)
+- [Verify it is live](#verify-it-is-live)
+- [What it does not provide](#what-it-does-not-provide)
+- [Enabling it in dsh](#enabling-it-in-dsh)
+- [Tools exposed to the model](#tools-exposed-to-the-model)
+  - [zg_search](#zg_search)
+  - [zg_index](#zg_index)
+  - [zg_status](#zg_status)
+  - [The rg switch](#the-rg-switch)
+  - [Root rules](#root-rules)
+- [The search-first gate](#the-search-first-gate)
+- [Settings](#settings)
+  - [Remote embedding](#remote-embedding)
+  - [Asking before an explicit root](#asking-before-an-explicit-root)
+- [Support surface](#support-surface)
+- [External dependency](#external-dependency)
+- [Daemon (server mode)](#daemon-server-mode)
+- [Public interface](#public-interface)
+- [The background job surface](#the-background-job-surface)
+- [Data and privacy](#data-and-privacy)
+- [Known boundaries](#known-boundaries)
+- [FAQ](#faq)
+- [Development](#development)
+- [License](#license)
+
+## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does
+
+- **Three model tools, one CLI underneath.** `zg_search` / `zg_index` / `zg_status` drive the `zg` CLI through the host shell. Transport defaults to `--mode auto`: server when the daemon is ready, silent fallback to direct otherwise - nothing starts a daemon for you.
+- **A search-first gate.** In an indexed workspace, grep/rg (shell command or native tool) is refused until a successful `zg_search` has run; each search re-arms a quota for a time window.
+- **A systemPrompt routing section** (`zvec-grep-routing`, order 1550) plus a `tools.guard` backstop: `zg_index` requires an explicit confirm, and every root passes one shared predicate in both guard and execute.
+- **A web settings card** ("zvec-grep (zg)"): default embedding, limit, gate values, a daemon-readiness line, and a "rebuild workspace" button whose jobs live in the official host job registry.
+- **No index required to start.** `zg_search` can fall back to zg's exhaustive lexical channel (the `rg` switch); a never-indexed root fails loudly instead of being indexed silently.
+
+## <img src="https://api.iconify.design/lucide/package.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Install
 
 ```sh
 dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 ```
 
-- The packages are on the public npm registry, so no credentials are needed; the published artifact only carries host.js, client.js and cordis.patch.yml (the files field in package.json).
-- Runtime value imports are `@jayyuen66/dsh-plugin-shared` (`lib/locale`, `lib/text`, `lib/record`, `lib/errors`, `lib/job-outcome`, `lib/card-diff`), `@deepseek-ai/schemastery` (the host's fork — the only one whose resolve wraps `.volatile()` fields into `Volatile` references) and `@deepseek-ai/dsh-typert-protocol` (the Remote base class — `TypertRemoteService` is a **class** to `extends`, so there is no type-only way to take it; it is a required peer plus the same exact pin in devDependencies).
-  - shared's own `lib/text` value-imports `@deepseek-ai/dsh-output-retention`, so that host package has to be supplied too, on the same terms as `schemastery`: a required `peerDependency` plus the same exact pin in `devDependencies`, **never** in `dependencies`. Only a gate can hold this line - with the entry missing, typecheck, build and tests are all green and the failure shows up after installation as ERR_MODULE_NOT_FOUND.
-  - Missing either one is `ERR_MODULE_NOT_FOUND` at load, not a graceful downgrade — that is also why the fork cannot be swapped for public `schemastery`.
-  - Only the shared package sits in `dependencies`. `@deepseek-ai/schemastery` is a host package, so it is declared as a **required `peerDependency`** and repeated at the same exact pin in `devDependencies` for this repository's own typecheck/build/tests — never in `dependencies`. That is not a style preference: consumer profiles install with `nodeLinker: hoisted` and `autoInstallPeers: false`, so a host package listed under `dependencies` is written into the profile as a **real directory**, coexisting with the copy the host process already loaded. `@deepseek-ai/dsh-tools` keys its `TOOL_RUNTIME_SCHEDULER` with a plain `Symbol` (not `Symbol.for`), so symbol identity is per module instance: the host's `dsh-agent-loop` gets `undefined` and **every native tool call throws** `Cannot read properties of undefined (reading 'prepare')` — the whole profile loses its tools. Build, typecheck and tests all stay green right up to that point, which is why the invariant is pinned in `test/publish-manifest.test.ts`.
+Remove with `dsh plugin --profile web remove @jayyuen66/dsh-zvec-grep`. The package is on the public npm registry; no credentials, no scoped-registry line.
 
+- **Node.js `>= 22.12`** (ESM-only; that floor is what makes `require()` of an ESM entry work, hence `engines.node`).
+- **Host `dsh` on the `0.2.1-rc.3` line.** The host reads `engines.dsh` (`^0.2.1-rc.3`) and it **decides alone** - with that field present, compatibility is judged before `peerDependencies` is ever consulted, prereleases included. Any `0.2.x` at or above `0.2.1-rc.3` passes; `0.3.0` and later need the risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`.
+- **No `@deepseek-ai/*` under `dependencies`, by contract** (`test/publish-manifest.test.ts`). Profiles install with `nodeLinker: hoisted` and `autoInstallPeers: false`, so a host package there becomes a real second copy; `@deepseek-ai/dsh-tools` keys its scheduler with a plain `Symbol`, so **every native tool call throws** in that profile while build, typecheck and coverage stay green. The `dsh-*` peers are pinned exactly at the `@deepseek-ai/dsh` peer's version - a compile-time discipline against a second host type surface, not a claim the host consults.
+- **Value imports are required peers.** `@deepseek-ai/schemastery` is the host fork (only its `resolve` wraps `.volatile()` fields); `@deepseek-ai/dsh-typert-protocol` provides `TypertRemoteService`, a class to `extends`; shared's `lib/text` value-imports `@deepseek-ai/dsh-output-retention`. Each sits in `peerDependencies` plus the same exact pin in `devDependencies` - missing one is `ERR_MODULE_NOT_FOUND` at load, not a graceful downgrade. The only `dependencies` entry is `@jayyuen66/dsh-plugin-shared`.
+- **What ships**: `host.js`, `client.js`, `cordis.patch.yml`, `icon.svg`, both READMEs, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`. Artifacts are rebuilt by `prepack`, never committed.
 
-### Shared version floor
+### <img src="https://api.iconify.design/lucide/arrow-down-to-line.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Shared version floor
 
-If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entry, that pin must be at least the `@jayyuen66/dsh-plugin-shared` version this package declares. A lower pin installs a copy without the names this package imports at runtime, and the host then reports `N entries did not activate` with `does not provide an export named ...` when it boots -- the package installs fine and never loads, and no per-repo CI run can see it.
+If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entry, that pin must be at least the version this package declares. A lower pin installs a copy without the names imported at runtime, and the host reports `N entries did not activate` with `does not provide an export named ...` at boot - installs fine, never loads, invisible to per-repository CI.
 
-### Enabling it in dsh
+## <img src="https://api.iconify.design/lucide/circle-check.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Verify it is live
 
-- add/remove maintain the registration line `- id: zvec-grep` (name points at this package) from the in-package cordis.patch.yml, which `dsh.bundle.patch` in `package.json` points at.
-- Host compatibility is judged on the **peer declarations**, not on `engines.dsh`: before composition the host compares `@deepseek-ai/dsh` and every `@deepseek-ai/dsh-*` range against the current runtime version, prereleases included (the rule is owned by the dsh-app-boot README). A mismatch denies that entry; a bundle without an exemption is skipped whole and listed under `skippedBundles`.
-  - This package pins every `dsh-*` **exactly** (a requirement of `test/publish-manifest.test.ts`, because "a second copy of the host type surface" is worse than a version conflict), so a host **newer than `0.2.1-rc.2` also needs approval**. The escape hatch is the one the host prints: `dsh plugin --profile web allow-version @jayyuen66/dsh-zvec-grep@<version> --dsh-version <exact version> --accept-risk`.
-  - `engines.dsh` is a declaration that nothing reads; keeping it at `>= 0.2.1-rc.2` only avoids leaving two contradictory numbers behind.
-- `dsh.client.platform` is web with immediately set, so the card's client half is delivered by the host; bundle installation goes through pnpm (>= 12.3.0).
-- apply needs the settings/shell/tools/systemPrompt/timer surfaces: all five sit in `inject`, so a missing one keeps cordis from activating the entry (the startup diagnostic prints `pending (waiting for service: …)`).
-  - The guard inside apply is the second layer: a malformed ctx throws `required services … missing`.
-  - The rebuild read surface is an official Typert Remote namespace installed on the apply fiber (`installRebuildRemote`, `lib/rebuild-remote.ts`), so it needs no `webServer` and no child fiber: on a TUI host with no web layer the service still registers, and the card simply has no place to render.
-  - The status poll is the client's own timer (`REBUILD_POLL_MS = 2000` in `src/client-entry.ts`), not a server push, and every read is answered by a result object rather than by a thrown error — see Public interface.
+1. **The layer is mounted.** `dsh --profile web --dump-config` ends with `# == @jayyuen66/dsh-zvec-grep` plus `- id: zvec-grep`. That command is the only accepted signal and is **not read-only** - read layer lines from stdout **and** check stderr separately; accept both `# == <layer>` and `# == <layer>, patched by <path>`.
+2. **The tools answer.** Ask the model to run `zg_status` on the current workspace: it executes and passes zg's own output through. "Unknown tool" means the bundle layer is not mounted.
+3. **The gate refuses - in an indexed workspace.** With `enforceSearchFirst` on and a manifest under `<root>/.zvec-grep/`, grep/rg is refused with the "no zg_search has run yet" message until one successful search. Without an index there is nothing to gate.
+4. **The card renders.** The settings page lists "zvec-grep (zg)" with the six editable values, the readiness line (empty when the probe cannot answer) and the rebuild button; a toggle plus **Save** round-trips with a 200.
+5. **No host copy in the profile.** A scratch profile's `node_modules/` holds `@jayyuen66/` and no `@deepseek-ai/` directory.
 
-### Support surface
+## <img src="https://api.iconify.design/lucide/circle-slash.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does not provide
 
-- **POSIX hosts (Linux / macOS).** The root predicate accepts only absolute paths starting with `/` (`assertAbsoluteRoot` in `lib/cli.ts`), the command line is POSIX-shaped (`shq()` single-quote escaping plus the whole string handed to `bash -c`), and index probing plus the `rootPaths` comparison inside the manifest split on `/` as well.
-- **Windows hosts are out of scope**, and the failure mode is **fail-fast, not drift**: when the session workspace looks like `C:\Users\…`, all three zg tools refuse right in `rootOf` and say why ("root must be an absolute path starting with /"). The plugin never builds a `zg` command from a mismatched path and never hands a wrong-path result back to the model as if it were a real search. The card's "rebuild workspace" runs into the same root gate.
-- Real Windows support would mean changing the predicate itself rather than translating paths in front of it: root normalization (drive letters and UNC), a second command form (pwsh/cmd quoting is not `bash -c`), the `/`-based grep tokenizer and path-shape rules in the gate, and the `rootPaths` coverage check against `<root>/.zvec-grep/manifest.json`. That is a design change; this package does not do it and does not pretend to.
-- The CI matrix therefore splits in two: **the ubuntu job is the full gate** (including the four 100% coverage thresholds); **other platforms run only the parts that do not need a workspace on disk** — the "same source, two byte shapes" product / line-ending / `path.sep` drift — and **do not judge coverage**, because suites needing a real root skip wholesale on win32 (`realRootUnavailable` in `test/host.test.ts`) and `host.ts` could not reach 100% afterwards. The reasoning is written into `.github/workflows/ci.yml`.
+- **No HTTP route of its own.** The card's data plane is the official Typert Remote namespace `zvecGrepRebuild` through the host `/api` gateway; auth, Host/DNS-rebinding/Origin checks and body limits are all the gateway's.
+- **No CLI subcommand.** `dsh zvec-grep …` does not exist.
+- **No daemon lifecycle.** `zg server on` is the user's action; this package only reads readiness.
+- **No ripgrep dependency.** rg appears only inside the gate predicate.
+- **Nothing written to the host data directory.** The only on-disk shape is zg's own `.zvec-grep/` under the indexed root.
+- Required surfaces: `settings` / `shell` / `tools` / `systemPrompt` / `timer` (all in `inject`). The host `jobs` service is optional - without it the rebuild paths refuse and spawn nothing; the three tools keep working.
 
-### Tools exposed to the model
+## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
-- zg_search: at least one of query / queries / fts / vector (32 routes max, 4000 chars per query).
-  - Plus globs / insensitiveGlobs / fileTypes / excludedFileTypes / symbolTypes / preferSymbol / modifiedAfter / modifiedBefore / fuse / limit / preview / refresh / device.
-  - `globs` / `insensitiveGlobs` / `fileTypes` / `excludedFileTypes` accept a **single string** as well as an array of strings, matching zg's own contract for those fields (128 items max, 1024 chars per item).
-  - `symbolTypes` is bound to zg's real closed set and accepts **lowercase only**: `module` / `class` / `interface` / `function` / `value` / `alias`. zg itself exits non-zero on `--symbol-type Class` (`Unsupported symbol type: Class`); the plugin refuses before assembling the command and lists the allowed values. It does not fold case — silently lowercasing would rewrite a constraint the model did not write.
-  - `preview` has three levels: `none` anchor line only / `short` anchor plus a bounded context window / `full` the whole chunk. **Default short**, so every hit carries a bounded source snippet.
-  - `refresh` has three levels: `wait` refreshes to the latest before searching (**default**) / `off` does not refresh / `background` hands it to the daemon. `background` requires a **ready daemon**: when that is not the case it is refused **before the command is built**, with the way out named, instead of letting zg switch refreshing entirely off and leave only `warning: --refresh background requires Server mode; Direct mode uses --refresh off` on stderr — that path exits 0 with normal hits while the one thing it claims ("refreshing in the background") is false. The two kinds of unavailability get separate wording: without a daemon the way out is `zg server on`; when the deployment pins `clientMode` to `direct`, saying that would point the wrong way, and the fix is setting the mode back to auto/server in the row config.
-  - A **hit summary** is appended at the end of the output with two separately reported counts: `grouped` (the sum of each query group's `hits:`) and `N distinct location(s) after dedup` (keyed by relative path + line range). They are split because one location is hit by several groups at once (rank and `matchedBy` differ per group), so a plain sum counts the same location repeatedly and passes itself off as the hit total.
-  - When some group's hit count equals `--limit`, that is reported as an **observation only**, with an explicit note that zg provides no truncation signal and the summary does not assert one. When the host truncates stdout at its cap, a "covers only the kept part" note is added.
-- zg_index: confirm is required and must be true (rejected twice, by the required check and by the guard).
-  - `background=true` runs a **model-side background index**: one call spawns the zg process, registers it in the host job registry, attaches the timeout reaper, hands back a pollable job id and **returns immediately**. Building an index may download embedding weights and take a long time, so background execution keeps the tool call from hanging.
-    - It does not depend on a host job tool: that tool is disabled in the web plane, so the model-side route is simply unavailable. The plugin reuses the **same** spawn/register/claim steps as the settings card (one shared function, not a copy), so jobs started from either side are identical in the registry, the status projection and the `status` read — the card sees model-started indexing and vice versa.
-    - The claim is mutually exclusive with the card's rebuild, across both entry points: while an index write is running for a root, the model side and the card side both follow that one instead of each starting a second zg against the same index.
-    - When the host job registry is absent it **does not spawn at all** and fails immediately: a zg with no ring, no capacity and nobody to reap it is worse than not starting — it would hold the root's write lock forever and block every later index operation on that tree.
-    - Until it settles, semantic search on that root waits for it and retries automatically, and grep/rg are not subject to the gate during that window.
-  - Also embedding / rebuild / drop / resetPaths / globs / insensitiveGlobs / fileTypes / excludedFileTypes / ignoreFiles / excludeSecrets / hidden / noIgnore / maxDepth / maxFileSizeBytes / follow / embeddingConcurrency / device; its five path filters likewise take a single value or an array.
-  - Switching embedding only takes effect with rebuild=true.
-  - **An explicit embedding goes through an assembly-time allowlist**: only models in the local catalog (the same list the settings card's dropdown renders) are accepted; anything else is refused before the command is assembled, with actionable wording. The reason is the nature of the capability — remote embedding sends workspace content to an external endpoint, and the model can invent an arbitrary prefixed reference. Whether workspace content may leave the machine is a gate only the user opens in the deployment config (see the deployment values below).
-  - `resetPaths=true` passes through `--reset-paths`, clearing the file-selection settings this root **inherited** (globs/fileTypes/hidden/…). It is **not** mutually exclusive with globs/fileTypes (upstream clears first, then applies this call's rules on top); it is mutually exclusive with `drop`, which is refused at assembly time rather than silently dropped.
-- zg_status: root + checkReady, for diagnosing a missing/failed/cancelled index or watching progress explicitly.
-  - `checkReady=true` passes through `--check-ready`. Its real contract: **the readiness report still goes to stdout, and only the exit code expresses readiness**. So not-ready is not an execution failure — the plugin returns the report verbatim and appends one line saying the index is not ready and that this is the conclusion `checkReady=true` asked for, together with zg's own wording. The ordinary failure path would keep only the stderr line and throw away exactly the report the user needed.
-  - A non-zero exit with an empty report still throws; without `checkReady` a non-zero exit throws as before.
-  - Integrated with the background rebuild state: while a rebuild of the same root is running (job registered) the tool returns the rebuild projection and **starts no subprocess** — the answer to "is the index ready" is negative by definition at that moment, so reporting `not ready` is worse than saying "rebuilding, job X, ask again once it settles".
-- **First-choice path when there is no index**: `zg_search` takes an `rg` switch that routes through zg's exhaustive lexical channel (`zg query --rg`), which needs no index.
-  - `rg` unset (default): when the workspace **and every directory above it** has no index, the search falls back to exhaustive matching; when an index exists, the indexed search runs as usual. An automatic fallback prepends a note saying the results are literal line matches rather than semantic relevance ranking, and that `zg_index` is needed for semantic search — without that note a mismatched answer is handed over as if it were a semantic conclusion.
-  - `rg=true` forces exhaustive search; `rg=false` refuses the fallback and uses indexed search only (with no index, zg reports `WORKSPACE_INDEX_NOT_FOUND` and points at building one).
-  - Exhaustive search grants **no** grep/rg quota: it reads no index, so it is not evidence that semantic search has been used. In an indexed workspace, still run one indexed search before reaching for grep/rg.
-  - The legal flag set differs from the indexed channel. zg rejects `preview` / `refresh` / `symbol-type` / `prefer-symbol` / `fuse` / `fts` / `vector` (observed: `--preview is not supported with --rg; use -A/-B/-C for rg context`); the plugin refuses at command-assembly time and lists the conflicts rather than dropping them silently. `limit` / `glob` / `iglob` / `type` / `type-not` / `modified-after` / `modified-before` / `device` / `mode` all still work.
-  - Exhaustive output has no `hits:` count lines, so the hit summary is automatically omitted under the "if it is not counted, do not claim it" rule.
-  - `trace` passes through `--trace` (troubleshooting): every hit carries a search trace saying which routes recalled it, its rank in each group, and its score. Output gets noticeably longer; exhaustive mode rejects the parameter at assembly time.
-  - With `trace` on, the hit header gains a `score=` field and a selection marker; the hit summary's **dedup key strips both**. Observed: the same location can score differently across groups (`src/beta.ts:1-2` is 0.0164 in the fts group and 0.0161 in the vector group), so putting the score in the key makes every hit a "new location", dedup stops working, and the location count is overstated twofold.
-- root may be omitted in all three (defaults to the current session workspace); output is plain text; timeouts are 5 minutes / 10 minutes / 60 seconds, stdout capped at 400000 bytes (truncated to the tail with a note).
+- `dsh.bundle.patch` points at `cordis.patch.yml`, whose single line is `- id: zvec-grep` with `name: "@jayyuen66/dsh-zvec-grep"` - the **bare package name** is what makes the host scan the client half. Bundle installation goes through pnpm (>= 12.3.0).
+- A missing injected surface keeps cordis from activating the entry (startup diagnostic: `pending (waiting for service: …)`); a malformed ctx throws `required services … missing` from apply.
+- The card is registered in the `plugins.bundle.config` slot keyed by the **bundle package name**; the settings namespace and `configForms` reads stay the bare entry id `zvec-grep` (implicit registration by entry id).
+- The rebuild read surface is installed on the apply fiber - no `webServer` dependency, no child fiber. On a TUI host the service still registers; the card simply has nowhere to render.
+- The status poll is the client's own timer (2000 ms), not a server push; every read answers a result object, never a thrown error.
+- Deployment defaults go on the registration line's `config:`; precedence is card runtime value > row config > schema `.default()`.
 
-### Settings and search roots
+## <img src="https://api.iconify.design/lucide/search.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Tools exposed to the model
 
-- Namespace `zvec-grep`, 16 fields with built-in defaults, 6 of them volatile and on the card.
-  - defaultEmbedding=local/qwen3-embedding-0.6b, defaultLimit=10 (1-50), hfEndpoint=a China-reachable HF-compatible mirror base (set another mirror or leave empty for the official HF).
-  - enforceSearchFirst=true, grepBudgetPerSearch=3 (1-20), unlockWindowMin=10 (1-240).
-- Additional **non-volatile deployment values**, 10 of them, are not on the settings card: change them only via the line config in cordis.yml. The "5 minutes / 10 minutes / 60 seconds / 400000 bytes" in the tools section are their defaults.
-  - searchTimeoutMs=300000, statusTimeoutMs=60000, indexTimeoutMs=600000 (also the background rebuild kill-timer duration), stdoutMaxBytes=400000 (each with a minimum of 1), clientMode=auto, rebuildWaitMs=120000.
-  - Remote embedding, three values, all **off by default**: `allowRemoteEmbedding=false`, `remoteEmbeddingEndpoint=""`, `remoteEmbeddingApiKeyFrom=""`.
-    - While it is off, an explicit embedding reference must be in the local catalog at **command-assembly time**.
-    - Once open, the endpoint and the credential reach the zg child process **only through environment variables** (`ZVEC_GREP_ENDPOINT` / `ZVEC_GREP_API_KEY`) and **never through argv** — this plugin reuses the whole command string as a background-job label that is echoed on the card, so a key in argv would land in the UI, in logs, and in the process table.
-    - The credential value holds the **name** of the environment variable in the host process that holds the credential (e.g. `ZVEC_GREP_API_KEY`), not the credential itself: the host's subprocess layer scrubs inherited names matching KEY/SECRET/TOKEN, so only an explicit forward from this plugin reaches zg — and recording just the name also keeps the secret out of the plugin's own config file.
-    - This plugin does **not** pass `--allow-remote` for you: zg still requires the user to run `zg auth grant <root> --capability embedding --scope workspace` once, and that per-root authorization is not something a plugin should do on the user's behalf.
-  - `requireApprovalForExplicitRoot=false`: when on, an explicit `root` triggers one user confirmation through the official `tools/pre-execute → {kind:'ask'} → ctx.approval` seam **only for calls that `rootOf` would let through via its "ancestor or descendant of the session workspace" branch**. The ask and `rootOf` share one predicate (`judgeRoot`), so two kinds of calls are no longer bothered: ones that will be refused anyway (out of scope, missing directory, unparseable, no session workspace to compare against) — where an approval can never buy a pass — and ones that need no authorization at all (the session workspace itself, or a root this daemon already observed). It defaults to off, and three boundaries are known in advance: the `danger-full-access` preset sets `approval/policy` to `never` (the ask is deterministically rejected), delegated subagents are pinned to `approvalPolicy: 'never'` (**the switch has no effect inside a subagent**), and with no approval service installed the ask fails closed to a denial. This confirmation **only ever adds** a step: `rootOf`'s authorization predicate is unchanged, so an out-of-scope root is still refused even after the user approves.
-- Precedence: runtime settings values > the line config of the bundle/user layer > built-in base; explicitly absent fields in the line config do not override the base.
-  - Volatile fields are read via `config.<field>.get()`; the non-volatile deployment values are plain values and skip `.get()`.
-- Root validation: must be an absolute path starting with `/`, lexically normalised (empty and `.` segments folded).
-  - Rejects empty strings, non-strings, NUL bytes, relative paths and `..` segments escaping the filesystem root, and `/` itself after normalisation.
-  - A missing directory is reported as "root does not exist" instead of a bare spawn ENOENT.
-- The guard and execute share exactly this root predicate, so nothing is refused twice with different wording.
-- Unlocks are counted per "session x index root": each successful zg_search resets to grepBudgetPerSearch calls valid for unlockWindowMin minutes; the index root is the root itself or its nearest indexed ancestor (up to 8 levels up).
-  - The session used for partitioning is the **root session**: the chain is walked up `header.parentSession` to the topmost hop. So the main agent and its subagents under one delegation tree **share one quota** — once the main agent has searched, its subagents can immediately spend those grep/rg calls instead of each searching again (they are usually searching the same tree).
-  - Degradation along the chain is three-level and never throws: a top-level session uses itself; when a hop's parent cannot be found (the session has settled, or the host has no session store) the walk stops at the **last known hop**; a cycle stops before the first repeat. The hop count is bounded.
-- "Indexed" means `<root>/.zvec-grep/manifest.json` is on disk; **the directory name alone is not enough**: the same `.zvec-grep` name is also zg's own global home (`ZVEC_GREP_HOME ?? ~/.zvec-grep`, holding config.json / locks / models), so a plain workspace that never built an index but merely collides on an ancestor's name would get gated too.
-- enforceSearchFirst=false disables only the gate; the zg_* backstop (confirm, root rules) is unaffected.
+Output is plain text; timeouts 5 min (search) / 10 min (index) / 60 s (status); stdout capped at 400000 bytes, truncated to the tail with a note. Sandbox runner failure, policy denial and a genuine zg failure are told apart; incomplete results are flagged. A `root` must be a string, and the constructed command is capped in UTF-8 bytes (not code units): a non-string root or an over-long command is refused instead of falling back to the session workspace or hitting the OS argument limit.
 
-### External dependency (rg)
+### zg_search
 
-- The real binary dependency is zg (installed via `npm install -g @zvec/zvec-grep`): when it is not on PATH the shell reports exit 127 and the tool answers "zg is not installed or not on PATH", kept separate from "the sandbox runner never started".
-- Upstream is `@zvec/zvec-grep` (it provides the `zg` bin), repository https://github.com/zvec-ai/zvec-grep, licensed **Apache-2.0**. This package is a dsh adaptation layer on top of it: it shells out to the CLI, and contains no upstream source, nor does it redistribute it on anyone's behalf.
-  - Version floor `0.2.2` (`MINIMUM_ZG_VERSION` in lib/zg-version.ts). Below that the plugin stops before dispatching a command and names the actual version, because the command shapes and flag names are written against that release - an older zg can parse the same argv as something else entirely and return results that look fine but searched nothing.
-- Local embeddings are loaded by zg's backends: qwen3/embeddinggemma need llama-cpp (device=auto tries Metal and falls back to CPU), potion-* use model2vec, the rest use transformers-js in plain JS.
-  - Weights are downloaded with HF_ENDPOINT injected from hfEndpoint.
-- This package neither depends on nor calls ripgrep: rg appears only in the gate predicate.
-  - After quote/comment-aware tokenising of a bash/pwsh command string, grep/egrep/fgrep/rg at a command position and the native grep tool count as searching.
-  - `--help`/`--version`/`-V`, `echo "grep x"` and `git commit -m "use rg"` do not.
-- With a sandboxed executor, runner failure, policy denial and a genuine zg failure are told apart, and incomplete results are flagged explicitly.
+- At least one of query / queries / fts / vector (32 routes max, 4000 chars each); the four filter fields (`globs` / `insensitiveGlobs` / `fileTypes` / `excludedFileTypes`) take a single string or an array (128 items, 1024 chars each).
+- `symbolTypes` is zg's closed set, **lowercase only** (`module` / `class` / `interface` / `function` / `value` / `alias`); invalid values are refused before the command is built, without case folding.
+- `preview`: `none` / `short` (default) / `full`. `refresh`: `wait` (default) / `off` / `background` - `background` needs a **ready daemon** and is refused before the command is built when there is none (the way out is `zg server on`, or unpinning `clientMode` from `direct`).
+- A **hit summary** at the tail reports two counts separately: the sum of per-group `hits:` and distinct locations after dedup (relative path + line range) - one location hit by several groups must not pass as the hit total. A group at exactly `--limit` is an observation only; zg gives no truncation signal.
+- `trace` passes through `--trace` (per-hit recall routes, ranks, scores); the dedup key strips the score, which differs per group.
 
-### Daemon (server mode)
+### zg_index
 
-- This is not a "somewhat faster" distinction. The two sides of `--mode auto` are two capability surfaces: direct builds and closes the engine on every `zg query` and **cold-loads the embedding model each time**, while watcher-driven incremental index refresh, `refresh=background` and a resident model pool **only exist in server mode**. Upstream only probes readiness for `auto`; it never starts a daemon for you.
-- This package **does not start a long-lived process on the user's behalf**: `zg server on` leaves a detached process and a token file on the machine, which is an action the user should own, not a decision a plugin makes for a deployment. What the package does instead is make the difference **explicit**, rather than leaving it hidden behind usage limits like "the search timeout is 5 minutes" and "recent edits are not findable":
-  - It caches the **exit code** of `zg server status --check-ready` for a 60-second TTL (0 = ready, non-zero = not ready; reading the stdout table would not do — it is formatted for humans and is not part of this package's dependency contract). A failed probe is recorded as "not ready" and never surfaces as an infrastructure error.
-  - That judgment gates `refresh=background` (see the tools section) and is echoed once at the tail of `zg_status` output and once on the settings card. Only `roots()` issues the probe: `rebuild` and `status` never start one, and neither does the rebuild-time synthetic projection, whose contract is to start no subprocess at all.
-  - The card's `serverReady` is only ever `true` / `false`. An older host response simply has no such field, and the card renders **nothing** for that arm instead of claiming "not ready".
-- To actually get the benefits: run `zg server on` in a terminal (`zg server off` / `zg server status` cover stop and state). This package reads that readiness; it does not own the daemon's lifecycle.
+- `confirm` is required and must be true (rejected twice, by the required check and by the guard). Building never happens implicitly.
+- `background=true` spawns the zg process, registers it in the host job registry, attaches the timeout reaper and **returns a job id immediately**. It reuses the **same** spawn/register/claim steps as the card (one shared function), the per-root claim is mutually exclusive across both entry points, and without a job registry it **does not spawn at all**. Until it settles, search on that root waits and retries, and the gate is suspended.
+- An explicit embedding goes through an **assembly-time allowlist** (the local catalog - the card's dropdown list); anything else is refused. Switching embedding only takes effect with `rebuild=true`.
+- `resetPaths=true` clears the inherited file-selection settings and composes with this call's filters; it is refused together with `drop`.
+- `drop=true` refuses every index-side parameter (filters, rebuild, embedding, depth, …) instead of silently ignoring it; the command then contains only the deletion.
+- `ignoreFiles` entries must name an existing, readable file. A missing or unreadable path is rejected before zg runs; upstream would otherwise fail the whole index and leave that tree's index state broken.
 
-### Public interface
+### zg_status
 
-- The rebuild surface is one **official Typert Remote namespace**, `zvecGrepRebuild` (`REBUILD_REMOTE_NAMESPACE` in `lib/rebuild-shape.ts`); its three methods are marked programmatically (`markRemote` in `lib/rebuild-remote.ts`) and installed on the apply fiber. There are no `/_dsh/*` routes, no CSRF token and no package-owned body cap any more: authentication, the Host / DNS-rebinding / Origin checks and the request-size limit belong to the host's `/api` gateway, and this package no longer declares a `webServer` dependency at all.
-  - `roots()` → `{ roots, serverReady }`: the whitelisted workspaces this daemon actually observed, plus the daemon-readiness line for the card. The `zg server status --check-ready` probe is issued **here and nowhere else**, off the same 60-second TTL cache the tools use. `serverReady` is `undefined` when the probe cannot answer, and the card renders nothing for that arm rather than "not ready".
-  - `rebuild({ root })` → `{ ok: true, jobId, reused? }` or `{ ok: false, error, status }`. What is enforced is unchanged from the HTTP version, because those rules guard the action, not the transport: a non-`/`-rooted path is refused (`assertAbsoluteRoot`), a root outside the observed whitelist is refused, a root whose directory disappeared is refused, and with no host `jobs` service **nothing is spawned** (the 503 arm). The per-root claim is taken before the first `await` and is the only mutex, so a second click follows the running rebuild (`reused: true`) or, when nothing can be followed, is refused instead of starting a second `zg` against the same index. The version gate and the ignore-file preflight run before the command is built; a failed start returns its code and releases the claim, so the tree is never left permanently "rebuilding".
-  - `status({ jobId })` → `{ status, exitCode, root, output }` (plus `sandbox` when present) or `{ ok: false, error, status: 404 | 503 }`. It resolves only ids present in this package's side table — the last 10 settled records (`REBUILD_HISTORY_MAX`), running records are never displaced — so somebody else's job (the host's `bash-1`, say) cannot be read through it. The three 404 arms are "the window moved on", "the registry row no longer holds it" and "the identity triple (kind / label / startedAt) does not match this record"; the 503 arm is the registry disappearing between starts. The card polls it every 2 seconds (`REBUILD_POLL_MS = 2000`).
-  - The `status` inside a refusal is a **retained semantic code, not an HTTP status**: the gateway frames the reply, so a refusal arrives as an ordinary result object, the client renders `error`, and the number exists so the tests can pin which rule fired. None of these three methods throws through the gateway — a rejected Remote call would look to the card like one generic failure, stop the polling and hide a rebuild that is still running.
-- Also a systemPrompt section `zvec-grep-routing` (order 1550) and the settings namespace `zvec-grep`.
-  - The client half (`src/rebuild-reader.ts`) `$mount`s three hand-written descriptors (`kind: "direct"`, `result: { mode: "src-json" }`, strict codecs on the two request bodies), memoised so the mount happens once, then reads the derived key `remote.zvecGrepRebuild`. With no host `remote` service there is no reader at all; with the service present but the namespace unmounted the read throws `… 未提供`, and the card renders the `rebuildUnavailable` line instead of going blank.
-  - How many rebuilds run at once is decided by the **host registry** (measured default: the unowned bucket holds 10); this package no longer carries its own concurrency cap.
-    When it is full, `rebuild` returns a refusal carrying the official message that names the limit - it never kills a rebuild that is already running.
+- root + checkReady, for diagnosing a missing/failed/cancelled index or watching progress.
+- `checkReady=true`: the report still goes to stdout and only the exit code expresses readiness - not-ready is a conclusion, not a failure. The report is returned verbatim with one appended line; an empty report with a non-zero exit still throws.
+- While a rebuild of the same root is running, the tool returns the rebuild projection and starts no subprocess.
 
-### The background job surface (official `ctx.jobs`)
+### The rg switch
 
-This package no longer ships a job registry: a "rebuild workspace" run is one **unowned** job in the host's `ctx.jobs` (`kind: "zvec-grep-rebuild"`, so the id reads `zvec-grep-rebuild-N`). Three visible consequences:
+- `rg` unset: with no index in the workspace **or any ancestor**, the search falls back to exhaustive matching with a prepended note ("literal line matches, not semantic ranking"). `rg=true` forces it; `rg=false` refuses the fallback (zg then reports `WORKSPACE_INDEX_NOT_FOUND`).
+- Exhaustive search grants **no** grep/rg quota: it reads no index. Flag conflicts (`preview` / `refresh` / `symbol-type` / `prefer-symbol` / `fuse` / `fts` / `vector`, `trace`) are refused at assembly time with the conflicts listed; there is no hit summary (no `hits:` lines to count).
 
-| Aspect                                 | Fact                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The model can see it                   | The official `job_list` / `job_output` / `job_kill` tools now list the rebuild, with the exit code / signal name carried in the job's `detail` (same shape the host's own bash tool uses). Output rides the official **pull source** (`proc.observed[*].readFrom`), so the ring advances on the registry's own cadence - **even with the settings panel closed** - and the observer never steals bytes from `readOutput()` (the d.ts says so verbatim). The controller is attached only for the instant of `start` and detached right after (see the cross-package rule) |
-| Unowned means visible to every session | The registry isolates by owner, and an unowned job can be `list`ed / `read` / `kill`ed by any caller. This is a known, accepted exposure of this wave - the card reaches the registry through the Remote service, outside any session, and owned jobs would need the `dsh-agent` registry (measured unavailable). Rolling this adoption back is the only way to close it. Note the `status` read still only answers for ids in this package's side table, so somebody else's job (the host's `bash-1`, say) cannot be read through it                                                                                                           |
-| Two more status words                  | `stopping` (cancellation issued, process not finished settling - the card shows it as still running) and `failed` (the registry's own verdict - it gets its own message instead of rendering as "exit code null")                                                                                                                                                                                                                                                                                                                                                                                                                     |
+### Root rules
 
-What is not retained, stated plainly: the output ring keeps **UTF-8 bytes** (measured host default 262144), while the card's 4000-character tail window and its `shown/total` count **UTF-16 code units** - two unit systems, each doing its own job. `total` therefore counts code units **inside the retention window** (the official byte total lives in `view.output.total`, different unit, never mixed), and for CJK output that window is about **1/3 smaller** than what this package kept before the adoption - the price of using the official ring. The two loss marks say different things: "truncated" = the ring evicted its head (`view.output.earliest > 0`, simply not visible any more), "buffer overflow" = the executor's reader reported lossy or threw outright (bytes really are gone; a spill file may exist). The timeout notice and the sandbox facts are deliberately **not** written into the ring: the ring belongs to the registry's pump, and the registry drops every write after settlement (measured), so the `status` read synthesises both at projection time and they can never be lost by arriving late. **Polling never throws through**: when the `jobs` service is reloaded (or somebody else reclaimed the record), `readRebuildOutput` folds the official `unknown job` error into `null` and the read answers a refusal (`status: 404`) rather than letting the exception reach the gateway — a rejected invocation is just one generic failure to the card, which would stop the polling and hide a rebuild that is still running.
+- `root` is optional in all three tools (defaults to the session workspace). Validation: absolute path starting with `/`, lexically normalised; empty/non-string/NUL/relative/escaping `..` and `/` itself are refused; a missing directory is reported as such, not as a spawn ENOENT.
+- A root outside the session workspace passes only via the "ancestor or descendant" branch of the shared predicate (`judgeRoot`), and every accepted root is registered in the observed-workspace whitelist the card's rebuild draws on. Guard and execute share the predicate - nothing is refused twice with different wording.
 
-### Data and privacy
+## <img src="https://api.iconify.design/lucide/ban.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> The search-first gate
 
-- The only on-disk shape of the index is the `.zvec-grep/` directory under the searched root, written by zg (a read-only sandbox cannot write it, and the result says the index may be incomplete).
-- Two rebuild paths: the model-side `zg_index` (rebuild=true, confirm=true), or the card's "rebuild workspace" button, which calls the `rebuild` method above; deleting is `zg_index` with drop=true (assembled as `zg index <root> --drop --yes`).
-- The package itself writes no files (its only fs calls are the index probe: existsSync plus one manifest read) and puts nothing in the host data directory `$DSH_HOME` (`<dsh data dir>`).
-  - The probe does not merely check that `.zvec-grep/manifest.json` exists: it **parses** the manifest and confirms its `rootPaths` really covers this directory. Two real situations are misread as "indexed" by an existence-only check while search would necessarily fail — the file is there but is not a manifest (a truncated write, or something else occupying the name), and the manifest is there but its root path points elsewhere. If the gate still blocked grep/rg on that basis, both search and the gate would be deadlocked.
-  - Only two fields are checked: `manifestVersion` (**strictly equal to 1**) and `rootPaths` (a non-empty array whose entries each carry a non-empty `absolutePath`). A version mismatch makes upstream throw `MANIFEST.INVALID` on read, meaning not a single search can succeed in that directory — a lenient check would only trap the user in a corner where the gate blocks grep/rg while every search is bound to fail. Embedding / policy fields are deliberately **not** checked — when those change the index still works, so calling it "no index" would be wrong.
-  - Coverage is decided by normalised equality. On macOS the manifest records the **unresolved** path (`/tmp/x`) while its `path` field is the resolved one (`/private/tmp/x`), so the `/private` prefix is stripped from both sides before comparing; either spelling matches.
-  - The whitelist and unlock table live in bounded memory, and their eviction matches their meaning: a **hit touches** the entry (moving it to the tail), and eviction first drops **expired** entries, then drops the coldest one by **least-recently-used** until back under the cap — not by insertion order. Plain insertion order is no eviction at all for a table where every successful search resets the same keys: the genuinely cold entries stay forever while a long-untouched key keeps its slot. Whitelist entries additionally carry a one-day validity, so a directory opened casually a month ago should not still hold a slot today. The capacity caps (64 whitelist roots / 256 session partitions) are unchanged, so resident memory stays bounded.
-  - The rebuild **jobs themselves** live in the host registry (section above) - on unload this package's side table is reclaimed with the effect and running jobs are killed through the registry.
-- Excluded from indexing by default: `*.pem` / `*.key` / `*.p12` / `*.pfx` / `*.keystore` / `id_rsa*` / `id_ed25519*` (set excludeSecrets=false to allow). These rules match **case-insensitively**, so `Server.PEM` is excluded too, and they are applied after the caller's own path rules, so a broad positive rule of yours cannot re-include them.
-  - Residual gap: extension rules cannot cover **extensionless** key files (e.g. `myprivatekey`, `rsa_private`); `id_rsa*` / `id_ed25519*` only cover the OpenSSH default names. Declare such files through ignoreFiles (`--ignore-file`).
-- Hidden files are skipped and ignore files honoured unless noIgnore is set.
-- Nothing is uploaded: the package only assembles zg commands on the local machine and passes output through.
-  - The only outbound traffic is the embedding weight download driven by hfEndpoint.
-  - Echoes are bounded — stdout over the cap keeps the tail (with the spill path when present), and the last 400 characters of stderr are appended so a "degraded to pure lexical" notice is not mistaken for a full semantic result.
-  - stderr is **classified** before it is echoed: only recognised indexing progress is dropped (`Scanning files…` / `Indexing files…` / `Indexing complete` / `Preparing <model>` / `Downloading <model> · …` / `Model ready: <model>` — written line by line when stderr is not a TTY, present on every index build), while degradation notices, lock conflicts, sandbox facts and any **unrecognised** new warning are all kept. When the whole stream is noise no note is added at all. The test is "drop only what is recognised", never "keep only what is recognised" — the latter would silently swallow anything new zg starts emitting, which is the worst possible failure mode.
-  - `Indexing complete` matches on **whole-line equality**, not a prefix: `Indexing completed with 3 failed files` (the partial-failure signal) literally starts with it, so a prefix match would drop exactly the information that matters.
+- **What counts as searching**: after quote/comment-aware tokenising of a bash/pwsh command string, grep/egrep/fgrep/rg at a command position, plus the native grep tool. `--help` / `--version`, `echo "grep x"` and commit messages do not.
+- **Quota per "session x index root"**: each successful `zg_search` re-arms `grepBudgetPerSearch` calls valid for `unlockWindowMin` minutes; the index root is the root itself or its nearest indexed ancestor (up to 8 levels up).
+- **Partitioning uses the root session** (walked up `header.parentSession`): the main agent and its subagents **share one quota**. Degradation never throws - a missing parent stops at the last known hop, a cycle stops before the first repeat.
+- **"Indexed" means `<root>/.zvec-grep/manifest.json` exists *and* parses** with `manifestVersion` strictly 1 and `rootPaths` covering this directory (normalized equality, `/private` prefix stripped on macOS). The directory name alone is not enough - it is also zg's global home (`~/.zvec-grep`), and an existence-only check misreads a truncated or foreign manifest as "indexed", deadlocking both search and the gate.
+- The whitelist and unlock tables live in bounded memory (64 roots / 256 partitions) with touch-on-hit, expiry-then-LRU eviction; whitelist entries carry a one-day validity.
+- `enforceSearchFirst=false` disables only the gate; the confirm and root backstops stay.
 
-### FAQ
+## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Settings
 
-- grep/rg refused with "no zg_search has run yet": that is the search-first gate; run zg_search. The same applies once the quota is spent or expired — re-search with a sharper query/fts to refresh it, no need to disable the plugin.
-- Search times out: the default `--refresh wait` refreshes the existing index synchronously; narrow the range with globs/fileTypes or lower the limit, or fall back to a hand-written literal search. To make the timeout itself smaller, start the daemon (see "Daemon (server mode)") — direct mode cold-loads the embedding model on every call, which is exactly why that budget sits at 5 minutes.
-- The rebuild button refuses with "root is not in the workspace whitelist this daemon observed": that directory never had a session in this daemon; start one there first, or let the model call zg_index with confirm=true.
-- The card reports a failed rebuild although zg looks finished: success is "completed with exit 0" — exit 127 (zg not installed) also lands in completed, so read the tail of the output.
-- A root that was never indexed: zg_search fails loudly instead of silently building the index; building happens only via zg_index on an explicit user request.
-- Changed the embedding but semantic hits are missing: switching embedding only takes effect after a rebuild with rebuild=true.
-- A zg failure comes back as one line with no `Code:` field: without `--debug` upstream collapses two failure kinds (weight download, indexing files) into a bare sentence, which is exactly where this package's attribution-by-code stops working. Such replies therefore append one line pointing at `--debug`. The package does **not** pass `--debug` by default: it visibly lengthens output, and these three tools share a bounded echo (stdout 400000 bytes) meant for a model. Failures that do carry a `Code:` line get no such note.
+Namespace `zvec-grep` equals the settings entry id; the schema has 16 fields with built-in defaults, 6 of them volatile and on the card.
 
-### Development
+| Field | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `defaultEmbedding` | string | `local/qwen3-embedding-0.6b` | Embedding for **new** indexes; switching an existing one needs a rebuild |
+| `defaultLimit` | natural, 1-50 | `10` | Default hit limit for `zg_search` |
+| `hfEndpoint` | string | China-reachable HF-compatible mirror | Another mirror, or empty for the official HF |
+| `enforceSearchFirst` | boolean | `true` | The search-first gate |
+| `grepBudgetPerSearch` | natural, 1-20 | `3` | grep/rg calls each successful search re-arms |
+| `unlockWindowMin` | natural, 1-240 | `10` | Minutes that quota stays valid |
 
-- Tests come in three tiers. `test/*.test.ts` (unit + a mocked host context) pins this package's own pure logic; `test/integration/*` boots **real** host services (`dsh-tools` ToolRuntime, `dsh-subprocess-local` + `dsh-bash-local`, `dsh-jobs-local`, `dsh-host-webserver` over real HTTP, the timer and approval services) and drives the plugin through `ctx.tools.execute()` / actual `fetch`; `test/e2e/zg-cli.test.ts` has no plugin and no mock at all - it feeds the commands `lib/cli.ts` builds to the **real zg CLI** and pins its output shapes, error codes and flag surface. The middle tier is where host-contract bugs surface: a mocked context can only agree with what this package already believes (e.g. `ctx.get("jobs") === ctx.get("jobs")` holds for a mock but is false in real cordis, which reads a service through a fresh traceable proxy per call).
-- `npm run check` is the single gate to run before publishing: typecheck (both tsconfigs) + `oxlint` + rebuild both bundles + `vitest run --coverage` + `oxfmt --check`.
-- Coverage runs under a **100% threshold** (statements/branches/functions/lines) over the surface `vitest.config.ts` opts into (`coverageInclude`: `host.ts` + `lib/**`): anything in that surface that no test pins turns the suite red by design. The client half (`src/**`) sits outside the denominator on purpose - it is exercised through the bundle and `test/ui-messages.test.ts`, not as units.
-- `npm run build` / `npm run build:client` produce `host.js` / `client.js`, and neither is committed - `prepare` and `prepack` rebuild them, while `test/build-host.test.ts` / `test/build-client.test.ts` compare the on-disk bundle against an in-memory build byte for byte, so a stale bundle fails the suite. Never hand-edit the bundles: the published entry *is* the built artifact, because Node refuses to strip types for a `.ts` sitting inside `node_modules`.
-- Beyond behaviour, a family of manifest gates guards the published surface (`test/publish-manifest.test.ts`): every entry target covered by `files`, host packages kept out of `dependencies`, `dsh-*` pinned exactly and at the peer version, no local paths or store layout inside the shipped artifacts, and every host package that shared's own shipped code value-imports supplied by this package. `test/dist-size.test.ts` budgets bundle bytes; `test/readme-parity.test.ts` keeps the English and Chinese halves structurally in sync.
+There are also **non-volatile deployment values**, 10 of them off the card; the row `config:` in `cordis.yml` is the only way to change them: `searchTimeoutMs=300000`, `statusTimeoutMs=60000`, `indexTimeoutMs=600000` (also the rebuild kill timer), `stdoutMaxBytes=400000`, `clientMode=auto`, `rebuildWaitMs=120000`, the remote-embedding trio and `requireApprovalForExplicitRoot` (below). Precedence: card value > row config > `.default()`; an explicitly absent row field does not override.
 
-### License
+### Remote embedding
 
-MIT - see [LICENSE](LICENSE). The `zg` CLI this plugin drives is upstream `@zvec/zvec-grep`, licensed **Apache-2.0**. This package contains no upstream source, so no upstream license text is bundled with it; if you redistribute the two together, keep each project's notices separate and intact.
+Off by default: `allowRemoteEmbedding=false`, `remoteEmbeddingEndpoint=""`, `remoteEmbeddingApiKeyFrom=""`. While off, an explicit embedding must be in the local catalog at assembly time. Once open:
+
+- Endpoint and credential reach zg **only via environment variables** (`ZVEC_GREP_ENDPOINT` / `ZVEC_GREP_API_KEY`), never argv - the command string is echoed as a job label on the card.
+- The credential field holds the **name** of the host env var carrying the secret, not the secret; the host scrubs inherited KEY/SECRET/TOKEN names, so only an explicit forward reaches zg.
+- The plugin does **not** pass `--allow-remote`: zg still requires a one-time `zg auth grant <root> --capability embedding --scope workspace`.
+
+### Asking before an explicit root
+
+`requireApprovalForExplicitRoot=false` by default. When on, an explicit `root` that would pass via the "ancestor or descendant" branch triggers one user confirmation (`tools/pre-execute` → `{kind:'ask'}` → `ctx.approval`). The ask shares the root predicate (`judgeRoot`), so calls that would be refused anyway - or need no authorization - are not bothered. Three dead ends are known: `never`-approval presets reject the ask deterministically, delegated subagents are pinned to `never` (the switch has no effect there), and a missing approval service fails closed. The confirmation **only ever adds** a step: an out-of-scope root stays refused even after approval.
+
+## <img src="https://api.iconify.design/lucide/monitor.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Support surface
+
+- **POSIX hosts (Linux / macOS).** The root predicate accepts only `/`-rooted absolute paths, the command line is POSIX-shaped (`shq()` escaping into `bash -c`), and the manifest comparison splits on `/`.
+- **Windows is out of scope, fail-fast.** A `C:\Users\…` workspace makes all three tools refuse at the root check with the reason - no wrong-path zg command is ever built. Real support means changing the predicate itself (drive letters/UNC, a second command form, `/`-based tokenising); that is a design change this package does not pretend to make.
+- **CI splits accordingly**: the ubuntu job is the full gate (including the four 100% coverage thresholds); other platforms run only the checks that need no on-disk workspace and do not judge coverage. The reasoning lives in `.github/workflows/ci.yml`.
+
+## <img src="https://api.iconify.design/lucide/cpu.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> External dependency
+
+- The binary dependency is **zg** (`npm install -g @zvec/zvec-grep`). Not on PATH → exit 127 → "zg is not installed or not on PATH", kept separate from "the sandbox runner never started".
+- Upstream is `@zvec/zvec-grep` (provides the `zg` bin), repository https://github.com/zvec-ai/zvec-grep, **Apache-2.0**. This package shells out to the CLI; it contains and redistributes no upstream source.
+- Version floor `0.2.2` (`MINIMUM_ZG_VERSION` in `lib/zg-version.ts`): below it the plugin stops before dispatch and names the actual version - older releases can parse the same argv as something else entirely.
+- Local embeddings load through zg's backends (qwen3/embeddinggemma via llama-cpp, potion-* via model2vec, the rest via transformers-js); weights download with `HF_ENDPOINT` injected from `hfEndpoint`.
+
+## <img src="https://api.iconify.design/lucide/server.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Daemon (server mode)
+
+- Direct and server are **two capability surfaces**, not a speed knob: direct cold-loads the embedding model on every query; watcher-driven incremental refresh, `refresh=background` and a resident model pool exist only in server mode. Upstream probes readiness for `auto` but never starts a daemon.
+- This package does not start one either - `zg server on` leaves a detached process and a token file, which is the user's decision. It makes the difference **explicit** instead: the exit code of `zg server status --check-ready` is cached for 60 s (a failed probe counts as "not ready", never an infrastructure error), gates `refresh=background`, and is echoed once in `zg_status` output and once on the card. Only the `roots()` read issues the probe.
+- The card's `serverReady` is only ever `true` / `false`; when the probe cannot answer, that arm renders nothing rather than "not ready". To get the benefits, run `zg server on` in a terminal.
+
+## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Public interface
+
+One official Typert Remote namespace, `zvecGrepRebuild`, installed on the apply fiber. No `/_dsh/*` routes, no CSRF token, no package-owned body cap - the host `/api` gateway owns all of that.
+
+| Method | Input | Reply |
+| --- | --- | --- |
+| `roots()` | - | `{ roots, serverReady }` - observed whitelist plus the readiness line; `serverReady` is `undefined` when the probe cannot answer |
+| `rebuild({ root })` | an absolute root | `{ ok: true, jobId, reused? }` or `{ ok: false, error, status }` |
+| `status({ jobId })` | a job id from this package | `{ status, exitCode, root, output }` (plus `sandbox` when present) or `{ ok: false, error, status: 404 \| 503 }` |
+
+- `rebuild` refuses non-`/`-rooted paths, roots outside the observed whitelist and vanished directories; with no `jobs` service nothing is spawned (503 arm). The per-root claim is taken before the first `await` - a second click follows the running rebuild (`reused: true`) instead of starting a second `zg` on the same index; a failed start releases the claim, so no tree stays "rebuilding".
+- `status` answers only for ids in this package's side table (the last 10 settled records; running ones are never displaced) - somebody else's job cannot be read through it. The card polls every 2 s. A refusal's `status` is a **retained semantic code, not an HTTP status**, and no method throws through the gateway - a rejected call would read as one generic failure and stop the polling on a rebuild that is still running.
+- Concurrency is decided by the **host registry** (measured default: the unowned bucket holds 10); when full, `rebuild` returns the official refusal naming the limit and never kills a running rebuild.
+
+## <img src="https://api.iconify.design/lucide/boxes.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> The background job surface
+
+A "rebuild workspace" run is one **unowned** job in the host's `ctx.jobs` (`kind: "zvec-grep-rebuild"`, id `zvec-grep-rebuild-<hex>`). Consequences:
+
+- **The model can see it.** The official `job_list` / `job_output` / `job_kill` tools list the rebuild (exit code / signal in `detail`, same shape as the host's bash tool); output rides the official pull source, so the ring advances even with the panel closed.
+- **Unowned means visible to every session** - a known, accepted exposure of adopting the official registry; rolling the adoption back is the only way to close it. The `status` read still answers only this package's side table.
+- **Two more status words**: `stopping` (cancellation issued, not settled - shown as still running) and `failed` (the registry's own verdict, with its own message).
+- The output ring keeps **UTF-8 bytes** (measured host default 262144) while the card's tail window counts **UTF-16 code units** - for CJK output the window is about 1/3 smaller than before the adoption. "Truncated" means the ring evicted its head; "buffer overflow" means bytes are really gone. The timeout notice and sandbox facts are synthesized at projection time, never written into the ring, and polling folds a reloaded registry's "unknown job" into a refusal instead of throwing through.
+
+## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Data and privacy
+
+| Aspect | Content |
+| --- | --- |
+| Written to disk | Nothing by this package. The only on-disk shape is the `.zvec-grep/` index directory under the searched root, written by zg; nothing lands in the host data directory |
+| What it reads | The index probe: one existence check plus one manifest read |
+| Network | Only the embedding-weight download driven by `hfEndpoint`, performed by zg. Remote embedding is off by default and is a deployment decision |
+| Secret exclusion | Excluded by default, case-insensitively and after your own path rules: `*.pem` / `*.key` / `*.p12` / `*.pfx` / `*.keystore` / `*.jks` / `*.ppk` / `id_rsa*` / `id_ed25519*` (excludeSecrets=false to allow). Extensionless key files are not covered - declare them via ignoreFiles |
+| Hidden files | Skipped; ignore files honoured, unless noIgnore is set |
+| Echoes | Bounded: stdout over the cap keeps the tail; the last 400 chars of stderr are appended. Only recognised indexing progress is dropped from stderr - degradation notices, lock conflicts and any unrecognised warning are kept; `Indexing complete` matches on whole-line equality so the partial-failure variant is never swallowed |
+| Rebuild paths | Model-side `zg_index` (rebuild=true, confirm=true) or the card button; deleting is `zg_index` with drop=true. On unload the side table is reclaimed and running jobs are killed through the registry |
+
+## <img src="https://api.iconify.design/lucide/triangle-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Known boundaries
+
+- **Windows hosts are not supported** - the failure is an explicit refusal, not a wrong answer.
+- **Extensionless key files** are outside the secret-exclusion rules; `id_rsa*` / `id_ed25519*` cover only the OpenSSH default names.
+- **An unowned rebuild job is visible to every session** - accepted exposure of the official job registry.
+- **The CJK output window shrank about a third** with the official ring (UTF-8 bytes vs UTF-16 code units).
+- **zg failures without a `Code:` line cannot be attributed by code**; such replies carry a pointer to `--debug` (not passed by default - it would bloat the bounded echo these tools share).
+- **Exhaustive search grants no quota and no semantic conclusion**; every automatic fallback says so up front.
+- **The ask switch has three dead ends** (never-ask presets, delegated subagents, no approval service) - spelled out under Settings, not hidden.
+
+## <img src="https://api.iconify.design/lucide/circle-help.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> FAQ
+
+| Question | Answer |
+| --- | --- |
+| grep/rg refused with "no zg_search has run yet" | The search-first gate; run zg_search. Quota spent or expired - re-search with a sharper query to refresh it, no need to disable the plugin. |
+| Search times out | Default `--refresh wait` refreshes synchronously; narrow with globs/fileTypes, lower the limit, or start the daemon - direct mode cold-loads the embedding model on every call, which is why that budget is 5 minutes. |
+| Rebuild refused with "not in the workspace whitelist" | That directory never had a session in this daemon; start one there first, or let the model call zg_index with confirm=true. |
+| Card reports a failed rebuild although zg looks finished | Success is "completed with exit 0" - exit 127 (zg missing) also lands in completed; read the output tail. |
+| A root that was never indexed | zg_search fails loudly; building happens only via zg_index on an explicit request. |
+| Changed the embedding but semantic hits are missing | Switching embedding takes effect only after a rebuild with rebuild=true. |
+
+## <img src="https://api.iconify.design/lucide/wrench.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Development
+
+```sh
+pnpm install
+pnpm run check   # typecheck (three tsconfig programs) → lint → both bundle builds → vitest with coverage → format check
+```
+
+- Tests come in three tiers: `test/*.test.ts` (unit + mocked host context), `test/integration/*` (real host services driven through `ctx.tools.execute()` / actual `fetch`), and `test/e2e/zg-cli.test.ts` (no plugin, no mock - the built command lines against the **real zg CLI**). Host-contract bugs surface in the middle tier: a mocked context can only agree with what this package already believes.
+- Coverage is **100%** across four metrics over the opted-in surface (`host.ts` + `lib/**`); the client half (`src/**`) is deliberately outside the denominator and is exercised through the bundle.
+- `host.js` / `client.js` are not committed; `prepare` / `prepack` rebuild them and two tests compare the on-disk bundle against an in-memory build byte for byte. Never hand-edit the bundles.
+- Manifest gates (`test/publish-manifest.test.ts`) guard the published surface: entry targets covered by `files`, host packages out of `dependencies`, `dsh-*` pinned exactly, no local paths in artifacts. `test/dist-size.test.ts` budgets bundle bytes; `test/readme-parity.test.ts` keeps both READMEs structurally in sync.
+
+## <img src="https://api.iconify.design/lucide/scale.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> License
+
+MIT - see [LICENSE](LICENSE). Source at [github.com/JayYuen666/dsh-zvec-grep](https://github.com/JayYuen666/dsh-zvec-grep). Issues go to that repository's tracker.
+
+The `zg` CLI is upstream `@zvec/zvec-grep`, licensed **Apache-2.0**. This package contains no upstream source and bundles no upstream license text; if you redistribute the two together, keep each project's notices intact. [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) records that boundary.

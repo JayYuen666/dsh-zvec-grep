@@ -148,7 +148,7 @@ import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 import { attachIndexWrite, installRebuildRemote, spawnIndexWrite } from "./lib/rebuild-remote.ts";
 import type { IndexWriteRoutes, JobsService, RebuildRecord } from "./lib/rebuild-remote.ts";
 import { assertIgnoreFilesExist } from "./lib/index-preflight.ts";
-import { deniedNote, sandboxFacts } from "./lib/sandbox-note.ts";
+import { deniedNote, noteWithFacts } from "./lib/sandbox-note.ts";
 import {
   allowRemoteEmbedding,
   readClientMode,
@@ -474,7 +474,7 @@ function sandboxFailure(result: ShellRunResult, messages: ZvecGrepMessages): str
   if (info?.runnerFailed !== true) {
     return null;
   }
-  return fill(messages.runnerFailed, { facts: sandboxFacts(info, messages) });
+  return noteWithFacts(messages.runnerFailed, info, messages);
 }
 
 /** 错误详情：首尾各留一段（zg/cargo 等错误的最终原因常在尾部）。

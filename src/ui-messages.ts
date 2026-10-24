@@ -91,11 +91,14 @@ export interface UiMessages {
   readonly rebuildFailed: string;
   /** 重建进程非零退出：`{exitCode}`。 */
   readonly rebuildExitCode: string;
+  /** 轮询应答的 status 无法识别、且没有可读的退出码（旧 host / 畸形应答）。 */
+  readonly rebuildExitUnknown: string;
   /** 启动端点应答缺 jobId。 */
   readonly rebuildMissingJobId: string;
   /** 卡片侧 root 预检（绝对路径）。 */
   readonly rebuildRootNotAbsolute: string;
-  /** 宿主没有提供重建远程面（没装远程服务 / 网关没挂上命名空间）。 */
+  /** 宿主没有提供重建远程面（连 ctx.get 都不在，读取器无从构造；网关侧的两种缺席
+   *  ——remote 服务缺失 / 命名空间未挂——由读取器自己的错误文案点名）。 */
   readonly rebuildUnavailable: string;
 
   /** embedding 候选项文本模板：`{reference}`、`{dimension}`。 */
@@ -165,7 +168,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     saveRejected: "保存被宿主拒绝（配置校验未通过或写入被跳过），修改未生效",
     embeddingLabel: "默认本地 embedding",
     embeddingHint: "只影响「新建」索引；切换并保存后，已有索引需点下方「重建」重新 embedding",
-    limitLabel: "默认每组结果数（1-50）",
+    limitLabel: "默认每组结果数（{min}-{max}）",
     limitInvalid: "请输入 {min}-{max} 的整数",
     limitClamped: "已钳到 {min}-{max} 范围：{value}",
     endpointLabel: "HuggingFace 镜像地址（可选）",
@@ -174,17 +177,16 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     enforceLabel: "强制 search-first（先 zg_search 再 grep/rg）",
     enforceHint:
       "开启后，已建索引工作区内的 grep/rg 受配额门禁约束：每次成功 zg_search 解锁下方次数的 grep/rg（时效见下），用尽或过期后再次拦截（提高检索覆盖与准确性）",
-    budgetLabel: "每次 zg_search 解锁的 grep/rg 次数（1-20）",
-    budgetHint: "配额越小语义检索越频繁、准确性约束越强；清空恢复默认 3",
+    budgetLabel: "每次 zg_search 解锁的 grep/rg 次数（{min}-{max}）",
+    budgetHint: "配额越小语义检索越频繁、准确性约束越强；清空恢复默认 {default}",
     budgetInvalid: "解锁次数必须是 {min}-{max} 的整数",
-    windowLabel: "解锁时效（分钟，1-240）",
-    windowHint: "超过该时长未再次 zg_search，配额整体过期；清空恢复默认 10",
+    windowLabel: "解锁时效（分钟，{min}-{max}）",
+    windowHint: "超过该时长未再次 zg_search，配额整体过期；清空恢复默认 {default}",
     windowInvalid: "解锁时效必须是 {min}-{max} 的整数",
     rebuildLabel: "工作区重建（切换 embedding 并保存后执行）",
-    daemonReadyNote:
-      "守护进程：就绪 —— 检索可走 server 模式，索引有增量刷新与后台刷新，embedding 模型池常驻。",
+    daemonReadyNote: "守护进程：就绪（zg server 在跑）。",
     daemonOfflineNote:
-      "守护进程：未就绪 —— 检索按直连模式逐次冷加载 embedding 模型（大工作区更慢），refresh=background 与索引增量刷新不可用；需要时在终端执行 `zg server on`。",
+      "守护进程：未就绪。守护进程提供的索引增量刷新、refresh=background 与常驻模型池在缺席时都不可用；需要时在终端执行 `zg server on`。",
     rebuildHint: "以当前默认模型重建：{embedding}；等价于 zg index --rebuild。{roots}",
     rootsNoteWith: "候选工作区来自本 daemon 已打开过的会话（服务端白名单）。",
     rootsNoteEmpty: "尚无可选工作区：先在该工作区里开一个会话（任一次工具调用即登记）。",
@@ -195,6 +197,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildKilled: "重建进程被终止",
     rebuildFailed: "重建作业被宿主注册表判定失败（没拿到进程退出码）",
     rebuildExitCode: "重建进程退出码 {exitCode}（zg 未安装/权限不足/沙箱拒绝都会走到这里）",
+    rebuildExitUnknown: "重建失败，且没有可读的进程退出码（应答的 status 无法识别）",
     rebuildMissingJobId: "启动重建失败：应答缺 jobId",
     rebuildRootNotAbsolute: "root 必须是绝对路径（以 / 开头）",
     rebuildUnavailable: "宿主没有提供工作区重建读面（未装远程服务）",
@@ -219,7 +222,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     embeddingLabel: "Default local embedding",
     embeddingHint:
       "Affects newly built indexes only; after switching and saving, press Rebuild below to re-embed existing indexes",
-    limitLabel: "Default hits per group (1-50)",
+    limitLabel: "Default hits per group ({min}-{max})",
     limitInvalid: "enter an integer between {min} and {max}",
     limitClamped: "clamped into the {min}-{max} range: {value}",
     endpointLabel: "HuggingFace mirror URL (optional)",
@@ -228,19 +231,18 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     enforceLabel: "Enforce search-first (zg_search before grep/rg)",
     enforceHint:
       "When on, grep/rg inside indexed workspaces is quota-gated: each successful zg_search unlocks the number of grep/rg calls below (valid for the window below), and the gate blocks again once it is spent or expired (better coverage and relevance)",
-    budgetLabel: "grep/rg calls unlocked per zg_search (1-20)",
+    budgetLabel: "grep/rg calls unlocked per zg_search ({min}-{max})",
     budgetHint:
-      "A smaller quota means more semantic searches and a stronger relevance constraint; clear to restore the default 3",
+      "A smaller quota means more semantic searches and a stronger relevance constraint; clear to restore the default {default}",
     budgetInvalid: "the unlock quota must be an integer between {min} and {max}",
-    windowLabel: "Unlock window (minutes, 1-240)",
+    windowLabel: "Unlock window (minutes, {min}-{max})",
     windowHint:
-      "Without another zg_search inside this window the whole quota expires; clear to restore the default 10",
+      "Without another zg_search inside this window the whole quota expires; clear to restore the default {default}",
     windowInvalid: "the unlock window must be an integer between {min} and {max}",
     rebuildLabel: "Workspace rebuild (run after switching embedding and saving)",
-    daemonReadyNote:
-      "Daemon: ready — searches can use server mode, with incremental and background index refreshing and a resident embedding model pool.",
+    daemonReadyNote: "Daemon: ready (zg server is running).",
     daemonOfflineNote:
-      "Daemon: not ready — searches run in direct mode and cold-load the embedding model every call (slower on large workspaces); refresh=background and incremental index refresh are unavailable. Run `zg server on` in a terminal when you want it.",
+      "Daemon: not ready. What the daemon provides — incremental index refresh, refresh=background and the resident embedding model pool — is unavailable while it is absent; run `zg server on` in a terminal when you want it.",
     rebuildHint:
       "Rebuild with the current default model: {embedding}; same as zg index --rebuild. {roots}",
     rootsNoteWith:
@@ -256,6 +258,8 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildFailed: "the host job registry reported the rebuild as failed (no process exit code)",
     rebuildExitCode:
       "the rebuild process exited with code {exitCode} (missing zg, insufficient permissions and sandbox denials all land here)",
+    rebuildExitUnknown:
+      "the rebuild failed and no process exit code is readable (the response status is unrecognized)",
     rebuildMissingJobId: "failed to start the rebuild: the response has no jobId",
     rebuildRootNotAbsolute: "root must be an absolute path (starting with /)",
     rebuildUnavailable: "the host does not expose the rebuild Remote API",

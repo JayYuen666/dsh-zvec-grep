@@ -172,6 +172,20 @@ describe("isGrepRgCommand", () => {
     assert.equal(isGrepRgCommand('rg "foo|bar" && echo done'), true);
   });
 
+  it("包装命令自己的选项、取值、裸数值与壳层赋值都不断开命令位链", () => {
+    // 这一组是漏判方向的历史缺口：只认「包装命令紧邻的下一个 token」时，
+    // 下面每一条里的 grep/rg 都不在命令位上，整条命令被读成「不是检索」而放行。
+    assert.equal(isGrepRgCommand("git --no-pager grep foo"), true);
+    assert.equal(isGrepRgCommand("xargs -0 grep TODO"), true);
+    assert.equal(isGrepRgCommand("nice -n 10 rg foo"), true);
+    assert.equal(isGrepRgCommand("timeout 5 rg foo"), true);
+    assert.equal(isGrepRgCommand("sudo -u root grep foo"), true);
+    assert.equal(isGrepRgCommand("VAR=1 grep foo"), true);
+    // 反向：这些形态之后没有检索调用，仍旧不命中（不能因为放宽而误拦）
+    assert.equal(isGrepRgCommand("git log"), false);
+    assert.equal(isGrepRgCommand("nice -n 10 echo hi"), false);
+  });
+
   it("非检索命令不命中", () => {
     assert.equal(isGrepRgCommand("ls -la"), false);
     assert.equal(isGrepRgCommand("git log --grep=foo"), false);
@@ -242,6 +256,15 @@ describe("pathInsideRoot", () => {
     // `..` 越出文件系统根：归一化本身失败 → 判在根外（不抛错）
     assert.equal(pathInsideRoot("a/../../../b", root, zhMessages), false);
     assert.equal(pathInsideRoot("/repo/../../out", root, zhMessages), false);
+  });
+
+  it("root 就是文件系统根时，任何绝对路径都在它之内", () => {
+    // 回归用例：拼接前缀时 `${"/"} + "/"` 是 `//`，任何归一化后的绝对路径都不会以它
+    // 开头 ⇒ root="/" 时所有目标都被判「根之外」：门禁恒放行、授权恒误拒。
+    assert.equal(pathInsideRoot("/foo", "/", zhMessages), true);
+    assert.equal(pathInsideRoot("/foo/bar", "/", zhMessages), true);
+    assert.equal(pathInsideRoot("/", "/", zhMessages), true);
+    assert.equal(pathInsideRoot("foo", "/", zhMessages), true);
   });
 });
 
@@ -319,6 +342,13 @@ describe("findIndexRoot", () => {
     const probe = probeOf(new Set(["/a"]));
     assert.equal(findIndexRoot("/a/b/c/d/e/f/g/h/i/j", probe, 8), undefined);
     assert.equal(findIndexRoot("/a/b/c/d/e/f/g/h/i", probe, 8), "/a");
+  });
+
+  it("相对路径无从向上判：按「探测不到」返回 undefined，不探到文件系统根", () => {
+    // 相对串的祖先链不是文件系统事实；旧实现会一路剥到 "/" 并拿它当探测起点——
+    // "/" 下恰好撞名时整条门禁会被一个不存在的索引根点亮。
+    const probe = probeOf(new Set(["/", "repo", "repo/app"]));
+    assert.equal(findIndexRoot("repo/app", probe), undefined);
   });
 
   it("尾部斜杠归一化", () => {
@@ -586,7 +616,7 @@ describe("searchFirstGuard", () => {
     assert.equal(reason?.includes(INDEXED), true);
   });
 
-  it("原生 grep 工具同样拦截；path 出界放行", () => {
+  it("原生 grep 工具同样拦截；path 出索引根放行", () => {
     const { deps } = makeDeps();
     const reason = searchFirstGuard(
       { name: "grep", arguments: { pattern: "foo" }, agent: agent("s1", INDEXED) },
@@ -613,6 +643,68 @@ describe("searchFirstGuard", () => {
         zhMessages,
       ),
       reason,
+    );
+  });
+
+  it("会话开在索引根子目录时，原生 grep 面的界内/界外也按索引根判（与 shell 面统一）", () => {
+    // 旧实现按会话 cwd 判：/repo/packages/other 与 ../other 相对 cwd 出界被放行，
+    // 同样的目标走 shell 面却会被拦——工具面就成了绕过门禁的旁门。
+    const { deps } = makeDeps();
+    for (const path of ["/repo/packages/other", "../other"]) {
+      const reason = searchFirstGuard(
+        { name: "grep", arguments: { pattern: "foo", path }, agent: agent("s1", INDEXED_SUBDIR) },
+        deps,
+        zhMessages,
+      );
+      assert.ok(reason !== undefined, `${path} 在索引根之内，必须被拦`);
+      assert.ok(reason.includes("zg_search"));
+    }
+    // 真出索引根的目标照旧放行。
+    assert.equal(
+      searchFirstGuard(
+        {
+          name: "grep",
+          arguments: { pattern: "foo", path: "/tmp/other" },
+          agent: agent("s1", INDEXED_SUBDIR),
+        },
+        deps,
+        zhMessages,
+      ),
+      undefined,
+    );
+    // 相对路径按 cwd 解析后越出文件系统根：目标必然不在索引根内（判范围不判合法性）。
+    assert.equal(
+      searchFirstGuard(
+        {
+          name: "grep",
+          arguments: { pattern: "foo", path: "a/../../../b" },
+          agent: agent("s1", INDEXED),
+        },
+        deps,
+        zhMessages,
+      ),
+      undefined,
+    );
+  });
+
+  it("向上探测的层数可由 deps 注入（深目录工作区由部署放宽，门禁不自作主张）", () => {
+    const { deps } = makeDeps();
+    // 缺省 8 层：子目录两层之内能命中 /repo。
+    assert.ok(
+      searchFirstGuard(
+        { name: "grep", arguments: { pattern: "foo" }, agent: agent("s1", INDEXED_SUBDIR) },
+        deps,
+        zhMessages,
+      ) !== undefined,
+    );
+    // 注入 0 层：只探 cwd 本身，祖先不参与 → 无索引根 → 放行。
+    assert.equal(
+      searchFirstGuard(
+        { name: "grep", arguments: { pattern: "foo" }, agent: agent("s1", INDEXED_SUBDIR) },
+        { ...deps, findIndexDepth: 0 },
+        zhMessages,
+      ),
+      undefined,
     );
   });
 
@@ -683,6 +775,14 @@ describe("rootSessionKeyOf（子代理与主代理共享一份配额）", () => 
   it("链上某一跳查不到：停在那一跳，不越过去", () => {
     assert.equal(rootSessionKeyOf(at("child", "mid"), table({ mid: "root" })), "root");
     assert.equal(rootSessionKeyOf(at("child", "mid"), table({})), "mid");
+  });
+
+  it("lookup 抛错（会话存储读失败）按「查不到父」停住，异常不穿出本函数", () => {
+    // 本函数的文档承诺降级不抛错：一次存储故障若穿出去，整条门禁就变成「所有检索都报错」。
+    const key = rootSessionKeyOf(at("child", "mid"), () => {
+      throw new Error("session store blew up");
+    });
+    assert.equal(key, "mid");
   });
 
   it("链成环时停住，不无限上溯", () => {

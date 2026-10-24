@@ -273,7 +273,8 @@ interface ShellRunResult {
   sandbox?: {
     mode: "read-only" | "workspace-write" | "danger-full-access";
     denied: boolean;
-    enforcement?: "full" | "partial";
+    /** "" 是刻意的探针：经序列化的运行态数据可能交回空串，归因层必须当「没配」。 */
+    enforcement?: "full" | "partial" | "";
     runnerFailed?: boolean;
   };
 }
@@ -311,7 +312,7 @@ interface MockProc {
   sandbox?: {
     mode: "read-only" | "workspace-write" | "danger-full-access";
     denied: boolean;
-    enforcement?: "full" | "partial";
+    enforcement?: "full" | "partial" | "";
     runnerFailed?: boolean;
   };
   /** 0.1.7 ShellExecution 的前台投影：后台 job 从不 await 它。 */
@@ -1149,6 +1150,19 @@ function okRun(stdoutText = "OK"): ShellRunResult {
   return { exitCode: 0, stdout: { text: stdoutText, truncated: false }, stderr: { text: "" } };
 }
 
+/** 坏 hfEndpoint 探针：给一个规范化后为空/无 host 的值，交回构造命令时带的 env（应缺省）。 */
+async function probeBadEndpointEnv(
+  bad: string,
+  root: string,
+): Promise<Record<string, string> | undefined> {
+  const probeCtx = makeCtx();
+  probeCtx.settingsValue["hfEndpoint"] = bad;
+  applyTo(probeCtx);
+  probeCtx.shell.runResults.push(okRun());
+  await toolOf(probeCtx, "zg_search").execute({ root, query: "x" }, execOf(root));
+  return probeCtx.shell.resolveCalls[0]?.env;
+}
+
 // ── 注册面 ────────────────────────────────────────────────────────────────
 
 describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
@@ -1358,12 +1372,13 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
   });
 
   it("探测失败一律按「版本未知」放行，绝不拿读不懂的输出去拦真实用户", async () => {
-    // 四种「探测不出来」：非零退出、形状不认识、带 v 前缀的版本号、stdout 空。
+    // 四种「探测不出来」：非零退出、形状不认识、v 前缀后带空格的畸形、stdout 空。
     // 「读不懂」与「太老」必须分开——混在一起就成了拿猜出来的版本去拦真实用户。
+    // （v0.2.1 这种「v 前缀 + 合法三段」现在是**读得懂**的，归 tooOld 那一组拦。）
     const unreadable = [
       { exitCode: 1, stdout: { text: "" }, stderr: { text: "boom" } },
       { exitCode: 0, stdout: { text: "not a version" }, stderr: { text: "" } },
-      { exitCode: 0, stdout: { text: "v0.2.1" }, stderr: { text: "" } },
+      { exitCode: 0, stdout: { text: "v 0.2.1" }, stderr: { text: "" } },
       { exitCode: 0, stdout: { text: "" }, stderr: { text: "" } },
     ];
     // 四种并行跑（各自一套 ctx，互不相干）：顺序无关，且不必在循环里 await。
@@ -2153,6 +2168,26 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     );
   });
 
+  it("enforcement 是空串（经序列化的运行态数据）按缺席处理：不拼残缺后缀", async () => {
+    ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "denied", truncated: false },
+      sandbox: { mode: SANDBOX_WORKSPACE_WRITE, denied: true, enforcement: "" },
+    });
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root)),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /mode=workspace-write/u);
+        assert.ok(!message.includes("enforcement="), `空串不得拼进模板：${message}`);
+        return true;
+      },
+    );
+  });
+
   it("沙箱拒绝但 exit 0：结果照常返回，但显式打「可能不完整」警告", async () => {
     ctx = makeCtx();
     applyTo(ctx);
@@ -2236,6 +2271,13 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     ctx.shell.runResults.push(okRun());
     await toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(root));
     assert.equal(ctx.shell.resolveCalls[0]?.env, undefined);
+  });
+
+  it("hfEndpoint 规范化后是空串或无 host 的伪 URL：宁可不带 env，也不发畸形 HF_ENDPOINT", async () => {
+    // `/`、`///` trim 后非空但剥完尾斜杠是空串；`http://` 没有 host。发出去只会把
+    // 失败推迟到 node-llama-cpp 的下载期。
+    assert.equal(await probeBadEndpointEnv("///", root), undefined, "剥完尾斜杠为空串");
+    assert.equal(await probeBadEndpointEnv("http://", root), undefined, "无 host 的伪 URL");
   });
 
   it("hfEndpoint 为空/缺省时 rebuild 的 spec 也不传 env", async () => {
@@ -2438,17 +2480,28 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
       },
     );
 
-    it("drop 那一臂跳过预检：drop + 坏 ignoreFiles 不被误拒，命令里也没有 --ignore-file", async () => {
+    it("drop 携带索引侧参数（含 ignoreFiles）被点名拒绝，预检的误导文案不出现", async () => {
+      // drop 那一臂的命令只有 `--drop --yes`，索引用不上的参数静默收下只会让人以为生效了；
+      // 构造器点名拒绝，而存在性预检对 drop 整段跳过，那句「给一个真实存在的忽略文件」
+      // 不会抢在前面出现。
       const ctx = makeCtx();
       applyTo(ctx);
       ctx.shell.runResults.push(okRun("DROPPED"));
-      await toolOf(ctx, "zg_index").execute(
-        { root, confirm: true, drop: true, ignoreFiles: ["nope.ignore"] },
-        execOf(root),
+      await assert.rejects(
+        () =>
+          toolOf(ctx, "zg_index").execute(
+            { root, confirm: true, drop: true, ignoreFiles: ["nope.ignore"] },
+            execOf(root),
+          ),
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          assert.match(message, /drop 与这些索引侧参数互斥/u);
+          assert.match(message, /ignoreFiles/u);
+          assert.ok(!message.includes("存在且当前进程可读"), "预检的误导文案不得抢在构造拒绝之前");
+          return true;
+        },
       );
-      const command = String(ctx.shell.resolveCalls[0]?.command);
-      assert.match(command, /--drop/u);
-      assert.ok(!command.includes("--ignore-file"), command);
+      assert.equal(ctx.shell.resolveCalls.length, 0, "拒绝发生在命令构造期，没有进程可起");
     });
   });
 
@@ -2547,6 +2600,43 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
     const env = ctx.shell.resolveCalls[0]?.env ?? {};
     assert.equal(env["ZVEC_GREP_ENDPOINT"], undefined, "非字符串端点 = 没配");
     assert.equal(env["ZVEC_GREP_API_KEY"], undefined, "非字符串凭据名 = 没配");
+  });
+
+  it("凭据变量名不是常规标识符（含 __proto__ 这类键）：按「没配」处理，不读 process.env", async () => {
+    // 名字不受约束等于允许行 config 把宿主进程里任意变量转发给子进程；`__proto__`
+    // 这类键还会让索引访问交回对象而不是字符串。
+    const ctx = makeCtx();
+    const restore = withEnv(EMBED_KEY_ENV, FAKE_KEY);
+    try {
+      applyTo(ctx, {
+        allowRemoteEmbedding: true,
+        remoteEmbeddingEndpoint: REMOTE_ENDPOINT,
+        remoteEmbeddingApiKeyFrom: "not a valid-name",
+      });
+      ctx.shell.runResults.push(okRun());
+      await toolOf(ctx, "zg_index").execute(
+        { root, confirm: true, embedding: REMOTE_EMBEDDING },
+        execOf(root),
+      );
+      const env = ctx.shell.resolveCalls[0]?.env ?? {};
+      assert.equal(env["ZVEC_GREP_ENDPOINT"], REMOTE_ENDPOINT, "端点那一路不受影响");
+      assert.equal(env["ZVEC_GREP_API_KEY"], undefined, "不合规的名字等于没配");
+      const protoCtx = makeCtx();
+      applyTo(protoCtx, {
+        allowRemoteEmbedding: true,
+        remoteEmbeddingEndpoint: REMOTE_ENDPOINT,
+        remoteEmbeddingApiKeyFrom: "__proto__",
+      });
+      protoCtx.shell.runResults.push(okRun());
+      await toolOf(protoCtx, "zg_index").execute(
+        { root, confirm: true, embedding: REMOTE_EMBEDDING },
+        execOf(root),
+      );
+      const protoEnv = protoCtx.shell.resolveCalls[0]?.env ?? {};
+      assert.equal(protoEnv["ZVEC_GREP_API_KEY"], undefined, "特殊键不得读出任何东西");
+    } finally {
+      restore();
+    }
   });
 
   it("点名的那个环境变量没设/是空白：不下发凭据，但端点照发", async () => {

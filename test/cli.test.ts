@@ -95,6 +95,15 @@ describe("resolveRoot（0.1.5：root 缺省=会话工作区兜底）", () => {
     assert.throws(() => resolveRoot(undefined, "/a\u0000b", zhMessages), /NUL/u);
   });
 
+  it("显式的非字符串值当场报类型错，不滑进 fallback 分支", () => {
+    // `{root: 123}` 若静默回退到会话工作区，搜索就在模型没指定的目录上执行并交回
+    // 一份「合法」结果——与本文件「非法定类型即抛错」的口径一致。
+    assert.throws(() => resolveRoot(123, "/sess", zhMessages), /root 必须是字符串（收到 number）/u);
+    assert.throws(() => resolveRoot({}, "/sess", zhMessages), /root 必须是字符串（收到 object）/u);
+    // null / undefined 仍是「没给」，照旧回退。
+    assert.equal(resolveRoot(null, "/sess", zhMessages), "/sess");
+  });
+
   it("两者都缺 → 报错且提示可省略", () => {
     assert.throws(() => resolveRoot(undefined, undefined, zhMessages), /root 必填/u);
     assert.throws(() => resolveRoot("", "", zhMessages), /可省略/u);
@@ -626,13 +635,36 @@ describe("buildIndexCommand", () => {
     );
   });
 
-  it("drop 带 --yes 且忽略 embedding/其它选项", () => {
-    const { command } = buildIndexCommand(
-      { root: "/ws", drop: true, rebuild: true, embedding: "x" },
+  it("drop 干净时只发 --drop --yes --mode（多余参数一个都不进命令）", () => {
+    const { command } = buildIndexCommand({ root: "/ws", drop: true }, DEFAULT, zhMessages);
+    assert.equal(command, "zg index '/ws' --drop --yes --mode auto");
+  });
+
+  it("drop 携带索引侧参数：一次点名全部拒绝，绝不静默丢弃", () => {
+    // drop 那一臂只发 `--drop --yes`，任何别的旗标都进不了命令。静默收下会让模型以为
+    // 过滤/重建/embedding 生效了（embedding 还绕过 allowlist），其实那条 zg 只会把索引删掉。
+    let message = "";
+    try {
+      buildIndexCommand(
+        { root: "/ws", drop: true, rebuild: true, embedding: "x", maxDepth: 2, hidden: true },
+        DEFAULT,
+        zhMessages,
+      );
+      assert.fail("drop 携带索引侧参数必须被拒");
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    assert.match(message, /drop 与这些索引侧参数互斥/u);
+    for (const name of ["rebuild", "embedding", "maxDepth", "hidden"]) {
+      assert.ok(message.includes(name), `要点名 ${name}：${message}`);
+    }
+    // 显式 null 与缺省同样按「没给」处理，不算携带。
+    const cleanDrop = buildIndexCommand(
+      { root: "/ws", drop: true, globs: null, maxDepth: undefined },
       DEFAULT,
       zhMessages,
     );
-    assert.equal(command, "zg index '/ws' --drop --yes --mode auto");
+    assert.ok(cleanDrop.command.includes("--drop"));
   });
 
   it("drop 与 resetPaths 互斥：构造期拒，而不是把 resetPaths 静默丢掉", () => {
@@ -917,6 +949,13 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
     );
   });
 
+  it("既超条数又混入非字符串项：首条报错指向类型错（根因），不是条数", () => {
+    const many = Array.from({ length: 200 }, (_unused, index) =>
+      index === 150 ? 5 : `g${String(index)}`,
+    );
+    assert.throws(() => stringList(many, "globs", zhMessages), /globs 含非字符串项（number）/u);
+  });
+
   it("数组超条数即报", () => {
     // 上限写数字而不是引常量：这条断言的价值就是把 128 这档闸门钉住。
     // 该数字与 zg 自己对外的路径过滤项上限一致，不是本包自定的数。
@@ -942,12 +981,28 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
     );
   });
 
-  it("整条命令规模超限即报（防 E2BIG）", () => {
+  it("整条命令规模超限即报（按 UTF-8 字节计，防 E2BIG）", () => {
     // 组数取路由上限、每组顶到单条上限，整条命令必然冲过 MAX_COMMAND_BYTES。
     const routes = Array.from({ length: MAX_QUERY_ROUTES }, () => "z".repeat(MAX_QUERY_CHARS));
     assert.throws(
       () => buildSearchCommand({ root: "/ws", queries: routes }, zhMessages),
-      new RegExp(`超过 ${MAX_COMMAND_BYTES} 字符上限，请缩小检索范围`, "u"),
+      new RegExp(`超过 ${MAX_COMMAND_BYTES} 字节上限，请缩小检索范围`, "u"),
+    );
+  });
+
+  it("规模闸门按 UTF-8 字节比：码元数没超、字节数超的命令同样被拦", () => {
+    // 12 条全中文 query：.length（UTF-16 码元）= 12 × 3000 = 36000，远低于 64K；
+    // UTF-8 字节 = 3 × 36000 ≈ 108KB，已越过 Linux MAX_ARG_STRLEN≈128KB 的方向。
+    // 闸门若按码元数比，这条命令会被静默放行并在 execve 上 E2BIG。
+    const routes = Array.from({ length: 12 }, () => "中".repeat(3000));
+    const command = routes;
+    assert.ok(
+      command.join("").length < MAX_COMMAND_BYTES,
+      "前置条件：码元数确实在旧口径的闸门之下",
+    );
+    assert.throws(
+      () => buildSearchCommand({ root: "/ws", queries: routes }, zhMessages),
+      /字节上限/u,
     );
   });
 

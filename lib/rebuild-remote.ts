@@ -50,6 +50,7 @@ import { procSandboxNote } from "./sandbox-note.ts";
 import type { RebuildRegistry } from "./rebuild-state.ts";
 import { REBUILD_REMOTE_NAMESPACE } from "./rebuild-shape.ts";
 import type {
+  RebuildRefusedStatus,
   RebuildRoots,
   RebuildStartRequest,
   RebuildStartResult,
@@ -368,7 +369,7 @@ function acceptableRoot(
   raw: unknown,
   ledger: RebuildLedger,
   started: ZvecGrepMessages,
-): { root: string } | { error: { value: string; status: number } } {
+): { root: string } | { error: { value: string; status: RebuildRefusedStatus } } {
   let root: string;
   try {
     root = assertAbsoluteRoot(raw, started);
@@ -526,13 +527,14 @@ function rebuildJobSpec(
         // hooks"），所以 await 只能装在一枚立即执行的 async 箭头里当场产出
         // Promise<JobOutcome>，不能把 run 本身改成 async（那会让 run 返回 Promise）。
         done: (async () => {
-          await proc.done;
-          cancelKillTimer();
-          // 进程落定即交还占位并唤醒等锁的检索者。放在 finally 里：无论产出成败都
-          // 必须释放，否则这棵树会被永久标成「重建中」，检索一直排队等一条已死的重建。
+          // 收口必须包住 `await proc.done` 本身：那条 reject 时不进下面的 try，
+          // cancelKillTimer() 与 release(root) 都会被跳过 —— 超时定时器留着（残到插件
+          // 卸载才回收），而这棵树被永久标成「重建中」，检索一直排队等一条早已落定的重建。
           try {
+            await proc.done;
             return jobOutcomeOf(proc);
           } finally {
+            cancelKillTimer();
             routes.rebuilds.release(root);
           }
         })(),
@@ -563,7 +565,9 @@ export async function spawnIndexWrite(
   started: ZvecGrepMessages,
   indexArgs: IndexArgs,
   embedding: string,
-): Promise<{ proc: ShellExecution; command: string } | { error: string; status: number }> {
+): Promise<
+  { proc: ShellExecution; command: string } | { error: string; status: RebuildRefusedStatus }
+> {
   const { config, host } = routes;
   let spawned: { proc: ShellExecution; command: string };
   try {
@@ -617,7 +621,7 @@ export function attachIndexWrite(
   root: string,
   started: ZvecGrepMessages,
   spawned: { proc: ShellExecution; command: string },
-): { jobId: JobId } | { error: string; status: number } {
+): { jobId: JobId } | { error: string; status: RebuildRefusedStatus } {
   const { jobsOf, records } = routes;
   const { proc, command } = spawned;
   // 上面 `await host.shell.execute()` 让出了一拍：那期间 `jobs` 可能被关掉或换成另一枚
@@ -629,7 +633,15 @@ export function attachIndexWrite(
     killProc(proc);
     return { error: started.endpointJobsUnavailable, status: 503 };
   }
-  pruneRebuildHistory(starting, records);
+  // 历史裁剪也包在失败收口里：`list()` / `remove()` 抛错时若不接住，异常会穿过本函数，
+  // 调用方那两条 release 都轮不到执行 —— 刚 spawn 的 zg 成了孤儿（继续写这棵树），
+  // 占位也永远留在「重建中」。
+  try {
+    pruneRebuildHistory(starting, records);
+  } catch (error) {
+    killProc(proc);
+    return { error: startupFailureText(error, started), status: 500 };
+  }
   // 丢失记账先于 start：源的 read 可能在 start 里同步跑第一拍。
   const state: RebuildState = {
     // kind/label 与下面那份规格同源（就是命令本身）；startedAt 等官方签。
@@ -678,18 +690,25 @@ function releaseRebuildRecords(
     }
   } else {
     for (const record of records.values()) {
-      const view = jobView(jobs, record.id);
-      if (view === null || !sameJob(record.state, view)) {
-        // 名册里没有这条（已被别人收走），或者同名不同命（`jobs` 换过一枚实例）：
-        // 两种都只剩我们手里的进程可收，绝不去 kill/remove 别人那条健康作业。
+      // 每条独立收口：一条收失败不能中断整轮，也不能跳过 records.clear() —— 那正是
+      // 「卸载跑完了、侧表里却还钉着一批已死的记录」那一档，之后每次 apply 都要再撞一遍。
+      try {
+        const view = jobView(jobs, record.id);
+        if (view === null || !sameJob(record.state, view)) {
+          // 名册里没有这条（已被别人收走），或者同名不同命（`jobs` 换过一枚实例）：
+          // 两种都只剩我们手里的进程可收，绝不去 kill/remove 别人那条健康作业。
+          killProc(record.proc);
+        } else if (isLiveStatus(view.status)) {
+          // 走注册表而不是直接杀进程：官方件据此把记录推到 stopping、把 reason 落进
+          // detail，再经本包的 cancel() 收到 proc.kill()。绕过它会让模型名册里那条
+          // 永远停在 running，环也一直不关（实测：本包测试就先被这条抓到过）。
+          jobs.kill(record.id, undefined, unloadReason);
+        } else {
+          jobs.remove(record.id);
+        }
+      } catch {
+        // 注册表对它不认了也能走到这里（remove 在跑作业上会抛）：进程还是我们手里的，收掉。
         killProc(record.proc);
-      } else if (isLiveStatus(view.status)) {
-        // 走注册表而不是直接杀进程：官方件据此把记录推到 stopping、把 reason 落进
-        // detail，再经本包的 cancel() 收到 proc.kill()。绕过它会让模型名册里那条
-        // 永远停在 running，环也一直不关（实测：本包测试就先被这条抓到过）。
-        jobs.kill(record.id, undefined, unloadReason);
-      } else {
-        jobs.remove(record.id);
       }
     }
   }
