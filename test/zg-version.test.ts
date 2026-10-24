@@ -39,21 +39,23 @@ describe("parseZgVersion", () => {
     assert.deepEqual(ver("  1.10.3  \n"), { major: 1, minor: 10, patch: 3 });
   });
 
+  it("v 前缀容忍：老 zg 若输出 v0.1.0，门槛要拦得住它而不是当成「读不懂」放行", () => {
+    assert.deepEqual(ver("v0.2.2"), { major: 0, minor: 2, patch: 2 });
+    assert.deepEqual(ver("v1.2.3\n"), { major: 1, minor: 2, patch: 3 });
+  });
+
+  it("分量至多 9 位数字：超长数字串会被 Number() 折成丢精度的巨数，宁可读不懂", () => {
+    // 10 个 9 的分量若被解析成 Infinity/巨数，「版本极大」会静默通过门槛——fail-open。
+    assert.equal(parseZgVersion("9999999999.0.0"), undefined);
+    assert.equal(parseZgVersion("1.99999999999.0"), undefined);
+  });
+
   it("多段版本号（1.2.3.4）不认：宁可读不懂也不猜", () => {
     assert.equal(parseZgVersion("1.2.3.4"), undefined);
   });
 
-  it("前缀/pre-release/比较符一律不认", () => {
-    for (const text of [
-      "v0.2.2",
-      "0.2.2-rc.1",
-      ">=0.2.2",
-      "zvec-grep 0.2.2",
-      "0.2",
-      "0.2.x",
-      "",
-      "   \n",
-    ]) {
+  it("标题前缀/pre-release/比较符一律不认", () => {
+    for (const text of ["0.2.2-rc.1", ">=0.2.2", "zvec-grep 0.2.2", "0.2", "0.2.x", "", "   \n"]) {
       assert.equal(parseZgVersion(text), undefined, `不该认：${JSON.stringify(text)}`);
     }
   });
@@ -102,9 +104,13 @@ describe("tooOldZgVersion", () => {
   });
 
   it("读不懂的一律按「探测不到」放行，绝不拿猜出来的版本去拦真实用户", () => {
-    for (const text of ["", "not a version", "v0.2.1", "0.2.1-rc.1"]) {
+    for (const text of ["", "not a version", "0.2.1-rc.1"]) {
       assert.equal(tooOldZgVersion(text), undefined, `读不懂就放行：${JSON.stringify(text)}`);
     }
+  });
+
+  it("带 v 前缀的老版本不再逃过门槛：v0.2.1 确知太老，交回实际版本", () => {
+    assert.deepEqual(tooOldZgVersion("v0.2.1"), { major: 0, minor: 2, patch: 1 });
   });
 
   it("门槛常量与比较用的字面量同源（改一处必须改两处，这里钉住）", () => {

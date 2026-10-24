@@ -1,4 +1,26 @@
 # 钉住行尾，不让 checkout 跟着平台走：Windows runner 上 Git for Windows 的机器级
 # core.autocrlf=true 会把工作树换成 CRLF，而 oxfmt 的 endOfLine 默认是 lf —— 于是
 # fmt:check 只在 windows 那一格把每个文件都判成未格式化（内容一字不差）。
+#
+# eol=lf 只对**重新检出**生效：本文件加入之前已有的克隆，工作树里还是 CRLF，fmt:check
+# 会照旧全量判红——那不是配置没生效。对既有工作树做一次 `git add --renormalize .`
+# 并提交（或删掉重 clone），本地与 CI 就回到同一份字节。
 * text=auto eol=lf
+#
+# 二进制资产显式声明：text=auto 对「看起来像文本」的二进制（部分图片/字体/压缩包）
+# 只靠 NUL 字节判定，漏判会把文件当文本做行尾归一化、破坏字节。仓库当前没有这类文件，
+# 规则先立在这里，新资产落地即安全。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.zip binary
+*.gz binary
+*.zst binary
+*.whl binary
+*.node binary

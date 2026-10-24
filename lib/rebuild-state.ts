@@ -96,32 +96,52 @@ export interface RebuildRegistry {
   keys: () => string[];
 }
 
-/** 上限容器的条目数：超过按插入序淘汰最早的（常驻进程内存有界）。 */
+/**
+ * 活跃表超过这个条数就报警。
+ *
+ * 它**不是**淘汰阈值。表里的每一条要么正在被调用方起（`starting`：进程可能已经 spawn、
+ * 只是官方注册表还没接纳），要么已经拿到作业号（`running`）。两种都不能淘汰——淘汰会把
+ * 条目兑现成「已落定」并从表里删掉，等待者被告知结束了，而同根的下一次 claim 会成功，
+ * 于是两条 `zg index` 同时啃一份索引，撞上 zg 的写锁直接失败。那正是这个注册表存在的理由。
+ *
+ * 「`jobId === undefined` 就是还没起进程」这个前提不成立：claim 在 spawn **之前**登记，
+ * 所以 undefined 恰恰覆盖了「进程已在跑、作业号还没补上」这段窗口期。在这段窗口里淘汰
+ * 占位，调用方手里那枚凭据当场作废，它随后 attach 到一条已不存在的条目上静默空转，
+ * 那条 zg 就成了没人管的孤儿。
+ *
+ * 正常路径上表的大小由并发重建条数决定（官方注册表自己卡着并发数），条目在 release 时
+ * 删除。所以超过阈值只可能是「有一次 claim 没配对 release」——那是本包自己的缺陷，
+ * 报警让人看见远比悄悄淘汰一条正在跑的重建安全。
+ */
 export const MAX_TRACKED_REBUILDS = 32;
 
 /**
- * 容量上限：超过就淘汰若干条目，但**绝不淘汰已经交出作业号的那条**。
+ * 表超过阈值就报警一次（不删任何条目）。
  *
- * 为什么：淘汰会把条目从表里删掉并兑现它的 `settled`——对一条真在跑的重建来说，那等于
- * 告诉所有等待者「结束了」，而它的 zg 其实还在写这棵树的索引。表一空，下一条 claim 就会
- * 成功，于是两条 `zg index` 同时啃一份索引，撞上 zg 的写锁直接失败——那正是这个注册表
- * 存在的理由。官方作业注册表本身就把同时在跑的作业数卡在一个很小的量级，所以「全部都是
- * running、淘汰不动」时表短暂超限是无害的，内存依然有界。
+ * 为什么只报不删：见 MAX_TRACKED_REBUILDS 的注释——两个阶段都可能有真在跑的 zg，
+ * 淘汰就是造孤儿。真正该做的是让「有一次 claim 没配对 release」这件事被人看见。
+ * 只在刚越过阈值那一刻报一次（回落之后才重新武装），否则每次 claim 都刷一行。
+ * @param entries 活跃表
+ * @param max 阈值
+ * @param alreadyCrowded 上一次判定为「已越阈值」
+ * @returns 本次是否越阈值（供调用方回写状态）
  */
-function trimToMax(entries: Map<string, ActiveRebuild>, max: number, keep: ActiveRebuild): void {
-  // 快照一次再遍历：下面要在循环体里 delete 自己。
-  for (const [root, entry] of entries) {
-    if (entries.size <= max) {
-      return;
-    }
-    // 跳过刚 claim 出来的那一条：调用方正拿着它的引用往回走，而 claim 的返回值就是
-    // 「占位成功」的唯一凭据。把它淘汰掉等于当场把这个凭据作废。
-    // 在跑的（已有作业号）那一条同样跳过：见上面那段注释。
-    if (entry !== keep && entry.jobId === undefined) {
-      entries.delete(root);
-      entry.settle();
-    }
+function warnIfCrowded(
+  entries: Map<string, ActiveRebuild>,
+  max: number,
+  alreadyCrowded: boolean,
+): boolean {
+  if (entries.size <= max) {
+    return false;
   }
+  if (!alreadyCrowded) {
+    console.warn(
+      `[zvec-grep] 活跃重建表有 ${String(entries.size)} 条，超过阈值 ${String(max)}：` +
+        "这不是容量淘汰（淘汰会让正在跑的重建失去占位，同根就能起第二条 zg），" +
+        "而是有一次 claim 没配对 release —— 请把这段告警连同调用场景报给维护者。",
+    );
+  }
+  return true;
 }
 
 /**
@@ -162,6 +182,7 @@ export function createRebuildRegistry(
   const now = options.now ?? Date.now;
   const maxTracked = options.maxTracked ?? MAX_TRACKED_REBUILDS;
   const entries = new Map<string, ActiveRebuild>();
+  let crowded = false;
 
   const release = (root: string): boolean => {
     const entry = entries.get(root);
@@ -170,6 +191,10 @@ export function createRebuildRegistry(
     }
     entries.delete(root);
     entry.settle();
+    // 回落到阈值以下就重新武装告警：下一次真越阈值还要再报一次。
+    if (entries.size <= maxTracked) {
+      crowded = false;
+    }
     return true;
   };
 
@@ -194,7 +219,7 @@ export function createRebuildRegistry(
         settle,
       };
       entries.set(root, entry);
-      trimToMax(entries, maxTracked, entry);
+      crowded = warnIfCrowded(entries, maxTracked, crowded);
       return entry;
     },
 

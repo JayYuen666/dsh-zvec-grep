@@ -13,7 +13,7 @@
 // 必须用同一套 root 判据，否则「guard 放行、execute 抛错」会把同一件事说两遍。
 
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
-import { assertAbsoluteRoot } from "./cli.ts";
+import { assertAbsoluteRoot, normalizeAbsolutePath } from "./cli.ts";
 import { fill } from "./messages.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
 import {
@@ -204,6 +204,8 @@ export const WORKSPACE_MANIFEST_FILE = "manifest.json";
  * 从 startDir 向上找含 zg 索引库的最近祖先（含自身），返回该索引根。
  * 会话工作区可能是索引根的子目录（如索引在仓库根、会话开在子包）——不向上走
  * 会漏拦。probe 注入（宿主用 existsSync），本函数保持纯函数可单测。
+ * 相对路径无从向上判（祖先链不是文件系统事实），按「探测不到」处理：返回 undefined，
+ * 与「上一层没有索引」同形，门禁按无索引放行。
  */
 export function findIndexRoot(
   startDir: string,
@@ -212,16 +214,18 @@ export function findIndexRoot(
 ): string | undefined {
   let dir = normalizeRoot(startDir);
   let found: string | undefined;
-  for (let depth = 0; depth <= maxDepth; depth += 1) {
-    if (probe(dir)) {
-      found = dir;
-      break;
+  if (startDir.startsWith("/")) {
+    for (let depth = 0; depth <= maxDepth; depth += 1) {
+      if (probe(dir)) {
+        found = dir;
+        break;
+      }
+      if (dir === "/") {
+        break;
+      }
+      const cut = dir.lastIndexOf("/");
+      dir = cut <= 0 ? "/" : dir.slice(0, cut);
     }
-    if (dir === "/") {
-      break;
-    }
-    const cut = dir.lastIndexOf("/");
-    dir = cut <= 0 ? "/" : dir.slice(0, cut);
   }
   return found;
 }
@@ -285,7 +289,15 @@ export function rootSessionKeyOf(
       // 宿主没有会话查询面：无从再往上，退回已知的最后一跳。
       return cursor;
     }
-    const next: unknown = lookup(cursor)?.parentSession;
+    // lookup 是宿主注入的会话存储读面，可能抛（存储读失败）。本函数承诺降级不抛错：
+    // 读不出父就停在已知的最后一跳，绝不让一次存储故障把整条门禁变成「所有检索都报错」。
+    let parentView: { parentSession?: unknown } | undefined;
+    try {
+      parentView = lookup(cursor);
+    } catch {
+      parentView = undefined;
+    }
+    const next: unknown = parentView?.parentSession;
     if (typeof next !== "string" || next.length === 0 || seen.has(next)) {
       return cursor;
     }
@@ -295,13 +307,17 @@ export function rootSessionKeyOf(
   return cursor;
 }
 
-/** 内置默认阈值（可在设置里覆盖：grepBudgetPerSearch / unlockWindowMin）。 */
-export const DEFAULT_GREP_BUDGET = 3;
-export const DEFAULT_UNLOCK_WINDOW_MIN = 10;
+/** 内置默认阈值（可在设置里覆盖：grepBudgetPerSearch / unlockWindowMin）。
+ *  值源在 lib/limits.ts（与宿主 schema、设置卡同源），这里只转出既有消费面。 */
+export { DEFAULT_GREP_BUDGET, DEFAULT_UNLOCK_WINDOW_MIN } from "./limits.ts";
 
 export interface SearchFirstDeps {
   enabled: boolean;
-  /** 目录是否存在 zg 索引库（宿主注入 existsSync(dir + '/.zvec-grep')）。 */
+  /**
+   * 目录是否是一个**已建索引的索引根**（宿主注入 indexProbeOf）：判据是
+   * `<dir>/.zvec-grep/manifest.json` 存在且 manifest 覆盖该 root。只判目录名会把
+   * zg 自己的全局 home（`~/.zvec-grep`）撞成索引，门禁就在没有索引可搜的工作区里拦人。
+   */
   indexProbe: (dir: string) => boolean;
   /** 时钟注入（Date.now），单测可控过期。 */
   now: () => number;
@@ -324,13 +340,18 @@ export interface SearchFirstDeps {
    * 只放宽配额这一道，索引根范围与外部路径判定仍由本门禁自己把关。
    */
   rebuildBypass?: (indexRoot: string) => boolean;
+  /**
+   * 向上探测索引根的最大层数（缺省 8，见 findIndexRoot）。索引根在更深处的
+   * 工作区由部署显式放宽；不注入时保持缺省，门禁不为此自作主张。
+   */
+  findIndexDepth?: number;
 }
 
 /**
  * search-first 门禁（硬约束）：拦截对象为
  * - bash/pwsh：命令串里出现 grep/rg 检索调用（isGrepRgCommand），且目标未被
  *   hasExternalTarget 判定为索引根之外；
- * - 原生 grep 工具：检索目标位于会话工作区内（path 出界不属工作区检索，放行）。
+ * - 原生 grep 工具：检索目标位于索引根之内（按索引根判，理由见 buildSearchFirstReason）。
  * 会话工作区（含祖先）存在 zg 索引且当前无可用解锁额度（从未 zg_search、配额
  * 用尽或已过期）→ 拒绝并给出可行动出路。解锁额度按「会话 × 索引根」计，
  * 每次成功的 zg_search 重置为 N 次、M 分钟有效——保证语义检索频率与 grep
@@ -343,18 +364,55 @@ export interface SearchFirstDeps {
 /**
  * 索引根已定后的门禁裁决：无索引根 / 检索索引根之外 / 有可扣额度 → 放行
  * （undefined）；否则返回拦截文案。放行会触发 consumeGrep 副作用。
+ * 两个拦截面的「之内/之外」都以**索引根**为准（不是会话工作区）：会话开在索引根的
+ * 子目录时，`../sibling` 或 `/repo/other` 相对 cwd 出界、相对索引根却在界内——shell 面
+ * 的 hasExternalTarget 本来就按索引根判，原生 grep 面若按 cwd 判，同样的目标会从
+ * 工具面绕过门禁，两个面各说各话。
  */
+
+/** 门禁一次裁决的目标面：shell 面给命令串（文本面判），原生 grep 面给检索目标（路径面判）。 */
+type SearchScope =
+  | { readonly kind: "shell"; readonly command: string }
+  | { readonly kind: "native"; readonly target: string | undefined };
+
+/**
+ * 原生 grep 面的目标是否落在索引根之内。相对路径先按**会话工作区**解析成绝对路径，
+ * 再按索引根判内外——按索引根直接拼相对段会把 `../other` 拼进索引根内部，方向判反。
+ * `..` 越出文件系统根：目标必然不在索引根之内（判范围不判合法性，同 pathInsideRoot）。
+ */
+function nativeTargetInsideRoot(
+  cwd: string,
+  indexRoot: string,
+  target: string | undefined,
+  messages: ZvecGrepMessages,
+): boolean {
+  if (target === undefined || target.trim().length === 0) {
+    return true;
+  }
+  const text = target.trim();
+  const joined = text.startsWith("/") ? text : `${normalizeRoot(cwd)}/${text}`;
+  let absolute: string;
+  try {
+    absolute = normalizeAbsolutePath(joined, messages);
+  } catch {
+    return false;
+  }
+  return pathInsideRoot(absolute, indexRoot, messages);
+}
+
 function buildSearchFirstReason(
   cwd: string,
-  command: string | undefined,
+  scope: SearchScope,
   deps: SearchFirstDeps,
   messages: ZvecGrepMessages,
 ): string | undefined {
-  const indexRoot = findIndexRoot(cwd, deps.indexProbe);
+  const indexRoot = findIndexRoot(cwd, deps.indexProbe, deps.findIndexDepth);
   let reason: string | undefined;
   const inScope =
     indexRoot !== undefined &&
-    (command === undefined || !hasExternalTarget(indexRoot, command, messages));
+    (scope.kind === "shell"
+      ? !hasExternalTarget(indexRoot, scope.command, messages)
+      : nativeTargetInsideRoot(cwd, indexRoot, scope.target, messages));
   if (inScope) {
     // 重建期放行先于配额判定：那条重建占着这棵树的写锁，此刻无论有没有配额都该放行，
     // 因为语义检索根本读不到索引。且这一放行**不消耗**既有配额——重建造成的等待不该
@@ -402,12 +460,12 @@ function shellSearchProblem(
   const commandRaw = args["command"];
   const command = typeof commandRaw === "string" ? commandRaw : "";
   return isGrepRgCommand(command)
-    ? buildSearchFirstReason(cwd, command, deps, messages)
+    ? buildSearchFirstReason(cwd, { kind: "shell", command }, deps, messages)
     : undefined;
 }
 
 /**
- * 原生 grep 工具面的一次检索裁决：`path` 出界 = 不是本工作区的检索 → 放行
+ * 原生 grep 工具面的一次检索裁决：目标在索引根之外 = 不是本工作区的检索 → 放行
  * （与 pathInsideRoot 的「判范围不判合法性」同侧）。无 path 参数按搜整个工作区。
  */
 function nativeGrepProblem(
@@ -417,9 +475,7 @@ function nativeGrepProblem(
   messages: ZvecGrepMessages,
 ): string | undefined {
   const target = typeof args["path"] === "string" ? args["path"] : undefined;
-  return pathInsideRoot(target, cwd, messages)
-    ? buildSearchFirstReason(cwd, undefined, deps, messages)
-    : undefined;
+  return buildSearchFirstReason(cwd, { kind: "native", target }, deps, messages);
 }
 
 /**

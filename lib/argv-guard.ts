@@ -18,7 +18,8 @@ import type { ZvecGrepMessages } from "./messages.ts";
 // 闭集里则能在构造阶段就报出人话。`MAX_QUERY_ROUTES` 与 `LIMIT_MAX` 原本已取齐。
 //
 // MAX_COMMAND_BYTES 是本包自己的一档：整条命令经 `bash -c <command>` 作为**单个** argv 项
-// 传给内核，Linux MAX_ARG_STRLEN≈128KB、macOS ARG_MAX 总量 1MB，取 64K 字符留一半余量。
+// 传给内核，Linux MAX_ARG_STRLEN≈128KB、macOS ARG_MAX 总量 1MB，取 64K **UTF-8 字节**
+// 留一半余量（判据按字节比：多字节内容一个码元可占 3~4 字节，按码元数比会放过 E2BIG）。
 export const MAX_COMMAND_BYTES = 64_000;
 /** 检索路由（query/queries/fts/vector）合计组数上限。 */
 export const MAX_QUERY_ROUTES = 32;
@@ -87,9 +88,8 @@ export function stringList(
   if (!Array.isArray(value)) {
     throw new TypeError(fill(messages.mustBeStringArray, { name }));
   }
-  if (value.length > maxItems) {
-    throw new TypeError(fill(messages.tooManyItems, { name, maxItems, actual: value.length }));
-  }
+  // 逐项校验先于条数上限：数组既超长又混入非字符串项时，首条报错要指向根因（类型错），
+  // 否则用户按「最多 N 项」删完还会在同一个类型错上再撞一次。
   const out: string[] = [];
   for (const item of value) {
     if (typeof item !== "string") {
@@ -102,6 +102,9 @@ export function stringList(
     if (trimmed.length > 0) {
       out.push(trimmed);
     }
+  }
+  if (value.length > maxItems) {
+    throw new TypeError(fill(messages.tooManyItems, { name, maxItems, actual: value.length }));
   }
   return out;
 }
@@ -154,6 +157,8 @@ export const SECRET_EXCLUDE_GLOBS: readonly string[] = [
   "!*.p12",
   "!*.pfx",
   "!*.keystore",
+  "!*.jks",
+  "!*.ppk",
   "!id_rsa*",
   "!id_ed25519*",
 ];

@@ -253,7 +253,7 @@ export interface ZvecGrepMessages {
   readonly tooManyItems: string;
   /** 数组含非字符串项：`{name}`、`{received}`。 */
   readonly nonStringItem: string;
-  /** 整条命令超上限：`{length}`、`{maxChars}`。 */
+  /** 整条命令超字节上限（UTF-8 计，防 E2BIG）：`{length}`、`{maxBytes}`。 */
   readonly commandTooLong: string;
   /** 检索路由超上限：`{count}`、`{max}`。 */
   readonly tooManyQueryRoutes: string;
@@ -267,8 +267,11 @@ export interface ZvecGrepMessages {
   readonly embeddingNotAllowed: string;
   /** drop 与 resetPaths 互斥。 */
   readonly dropWithResetPaths: string;
-  /** ignoreFiles 里的路径不是「存在且当前进程可读的文件」（不存在 / 是目录 / 读不了都算；真 zg
-   *  遇到读不成的忽略文件会整次索引失败并把坏路径写进索引状态，之后这条树再也起不来）。 */
+  /** drop 携带了索引用不上的参数：`{names}` 点名列表。 */
+  readonly dropWithIndexArgs: string;
+  /** 解析后的忽略文件目标不是「存在且当前进程可读的文件」（{path}：相对条目按 root 解析、
+   *  绝对条目原样；不存在 / 是目录 / 读不了都算；真 zg 遇到读不成的忽略文件会整次索引失败
+   *  并把坏路径写进索引状态，之后这条树再也起不来）。 */
   readonly ignoreFileMissing: string;
   /** 无索引时自动改走穷举检索的前置说明。 */
   readonly exhaustiveFallbackNote: string;
@@ -311,7 +314,7 @@ const ABSOLUTE_ROOT_HINT =
 export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
   zh: {
     searchToolDescription:
-      "对已建索引的工作区做语义/混合检索（BM25+向量+RRF），用于精确查找无法回答的问题：架构、调用链、依赖、生命周期、数据流/控制流、设计意图、跨文件对比与综合。root 缺省为当前会话工作区；显式传入时必须落在本会话可操作范围内（会话工作区本身、它的上级或下级目录，或本会话已登记过的工作区）。检索会自动同步既有索引的新鲜度（--refresh wait），因此改完代码无需先手动 zg_index 也能搜到新内容；但从未建索引的 root 仍会明确报错，不会静默建索引。每个命中都带**有界源码片段**（--preview short：锚点行 + 少量上下文），足够时视为已读证据，需要更多上下文再 read。精确字面/正则/文件名/报错串查找请用原生 grep/glob。大型工作区请用 globs/fileTypes 缩小范围，否则可能超时。至少提供 query/queries/fts/vector 之一。已建索引的工作区 grep/rg 受 search-first 门禁约束：每次成功的 zg_search 会为当前会话解锁 grepBudgetPerSearch 次 grep/rg（unlockWindowMin 分钟内有效），配额用尽或过期后需换一个更准确的 query/fts 重新检索。",
+      "对已建索引的工作区做语义/混合检索（BM25+向量+RRF），用于精确查找无法回答的问题：架构、调用链、依赖、生命周期、数据流/控制流、设计意图、跨文件对比与综合。root 缺省为当前会话工作区；显式传入时必须落在本会话可操作范围内（会话工作区本身、它的上级或下级目录，或本会话已登记过的工作区）。检索会自动同步既有索引的新鲜度（--refresh wait），因此改完代码无需先手动 zg_index 也能搜到新内容；从未建索引的 root 也不会被静默建索引：调用会改走穷举词法检索，并在结果里显式声明这一点。每个命中都带**有界源码片段**（--preview short：锚点行 + 少量上下文），足够时视为已读证据，需要更多上下文再 read。精确字面/正则/文件名/报错串查找请用原生 grep/glob。大型工作区请用 globs/fileTypes 缩小范围，否则可能超时。至少提供 query/queries/fts/vector 之一。已建索引的工作区 grep/rg 受 search-first 门禁约束：每次成功的 zg_search 会为当前会话解锁 grepBudgetPerSearch 次 grep/rg（unlockWindowMin 分钟内有效），配额用尽或过期后需换一个更准确的 query/fts 重新检索。",
     indexToolDescription:
       "为工作区 root 创建/增量更新/重建/删除持久检索索引（建后 zg_search 才可用）。仅在用户明确要求建/重建/删索引时调用，且 confirm 必须为 true；绝不静默建索引。root 缺省为当前会话工作区；显式传入时必须落在本会话可操作范围内——会话工作区本身、它的上级或下级目录，或本会话已登记过的工作区；其余绝对路径一律拒绝（一个合法绝对路径不构成授权）。embedding 默认用设置里的 defaultEmbedding，也可显式指定，但**只接受本地候选清单内的模型**（远程 embedding 会把工作区内容送到外部端点，须由用户在部署配置里显式开放，模型侧无法开启）；切换 embedding 需 rebuild=true 才重新生效。删除传 drop=true。要清掉这个根继承来的文件选择设置传 resetPaths=true。",
     statusToolDescription:
@@ -352,7 +355,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     ignoreFilesDescription:
       "额外的 ignore 文件路径（如 .gitignore 之外的排除清单），透传 zg --ignore-file",
     excludeSecretsDescription:
-      "是否排除私钥/密钥库格式（*.pem/*.key/*.p12/*.pfx/*.keystore/id_rsa*），默认 true。本插件的排除规则排在用户正向 glob 之后，用户规则覆盖不掉它——所以这一位是「要不要索引私钥」的唯一开关：置 false 会把这批文件灌进向量库，此后检索可以把它们回显到上下文。只有用户明确要求索引密钥夹具时才给 false",
+      "是否排除私钥/密钥库格式（*.pem/*.key/*.p12/*.pfx/*.keystore/*.jks/*.ppk/id_rsa*），默认 true。本插件的排除规则排在用户正向 glob 之后，用户规则覆盖不掉它——所以这一位是「要不要索引私钥」的唯一开关：置 false 会把这批文件灌进向量库，此后检索可以把它们回显到上下文。只有用户明确要求索引密钥夹具时才给 false",
     hiddenDescription: "包含隐藏文件（默认不含，隐藏密钥文件因此已被排除）",
     noIgnoreDescription: "不读 ignore 文件",
     maxDepthDescription: "最大目录深度",
@@ -516,7 +519,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     mustBeStringArray: "{name} 必须是字符串数组",
     tooManyItems: "{name} 最多 {maxItems} 项（实际 {actual}）",
     nonStringItem: "{name} 含非字符串项（{received}）",
-    commandTooLong: "zg 命令总长 {length} 超过 {maxChars} 字符上限，请缩小检索范围",
+    commandTooLong: "zg 命令总长 {length} 字节，超过 {maxBytes} 字节上限，请缩小检索范围",
     tooManyQueryRoutes: "检索路由合计 {count} 组，超过 {max} 组上限",
     searchNeedsQuery: "zg_search 需要 query/queries/fts/vector 至少其一",
     exhaustiveNeedsPattern: "穷举检索（rg=true）需要一个 query 作为匹配模式",
@@ -526,8 +529,10 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "embedding 引用 {reference} 不在本地候选清单内，而本部署未开放远程 embedding。远程 embedding 会把工作区内容送到外部端点，必须由用户在部署配置里显式开放（allowRemoteEmbedding），本插件不接受模型侧开启。可选本地模型：{choices}。若用户确已自行配好远程凭据（zg config provider set / zg auth grant <root> --capability embedding --scope workspace），请在插件部署配置里打开对应开关后重试。",
     dropWithResetPaths:
       "drop 与 resetPaths 互斥：--drop 整条命令只有删除索引一件事，resetPaths 无处安放（上游 zg 也拒这一对）。要清继承的文件选择设置，请不要传 drop。",
+    dropWithIndexArgs:
+      "drop 与这些索引侧参数互斥：{names}。--drop 整条命令只有删除索引一件事，它们不会被使用（静默收下只会让人以为过滤/重建生效了）；请去掉这些参数后重发删除。",
     ignoreFileMissing:
-      "ignoreFiles 里的 {path} 在 {root} 下不是一份「存在且当前进程可读的文件」（不存在、是目录、或有文件但读不了都算）。上游 zg 遇到读不成的忽略文件不会按「没有这条规则」继续，而是整次索引失败（ENOENT / EISDIR / EACCES），并把这条坏路径写进工作区索引状态——此后这条树上的 zg index / zg status 都会报同一个错，--reset-paths 也清不掉，只有 zg_index drop 能救。请给一个真实存在、当前用户可读的忽略文件路径。",
+      "ignoreFiles 里的 {path} 不是一份「存在且当前进程可读的文件」（不存在、是目录、或有文件但读不了都算）。上游 zg 遇到读不成的忽略文件不会按「没有这条规则」继续，而是整次索引失败（ENOENT / EISDIR / EACCES），并把这条坏路径写进工作区索引状态——此后这条树上的 zg index / zg status 都会报同一个错，--reset-paths 也清不掉，只有 zg_index drop 能救。请给一个真实存在、当前用户可读的忽略文件路径。",
     exhaustiveFallbackNote:
       "[zvec-grep] 该工作区（含向上各级）尚无 zg 索引，已自动改用穷举词法检索（rg 模式）。结果是逐行字面匹配，不是语义相关度排序；需要语义检索请先 zg_index 建索引。",
     rgDescription:
@@ -554,8 +559,8 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "design intent, cross-file comparison and synthesis. root defaults to the current session " +
       "workspace; you may also name another already-indexed absolute path. Search refreshes the " +
       "existing index automatically (--refresh wait), so code edited moments ago is searchable " +
-      "without re-running zg_index; a root that was never indexed still fails loudly rather than " +
-      "silently building an index. Every hit carries a **bounded source snippet** (--preview short: " +
+      "without re-running zg_index; a root that was never indexed is not indexed silently " +
+      "either: the call switches to exhaustive literal search and says so in the result. Every hit carries a **bounded source snippet** (--preview short: " +
       "anchor line plus a little context) — treat it as read evidence when enough, otherwise read " +
       "for more context. Use the native grep/glob for exact literal/regex/filename/error-string " +
       "lookups. Narrow large workspaces with globs/fileTypes or the search may time out. Provide at " +
@@ -567,9 +572,12 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "Create / incrementally update / rebuild / delete the persistent search index for workspace " +
       "root (zg_search only works after that). Call it only when the user explicitly asks to " +
       "build/rebuild/drop the index, and confirm must be true; never index silently. root defaults " +
-      "to the current session workspace; another absolute path may be named explicitly (a target the " +
-      "user confirmed). embedding defaults to the configured defaultEmbedding and may be set " +
-      "explicitly, but **only models in the local catalog are accepted** (remote embedding sends " +
+      "to the current session workspace; another absolute path is allowed only when this session " +
+      "can already reach it — a workspace or a parent/child of one this session has opened, or " +
+      "one this session already registered — and anything else is refused (a path merely " +
+      "existing is not an authorization). embedding defaults to the configured defaultEmbedding " +
+      "and may be set explicitly, but **only models in the local catalog are accepted** (remote " +
+      "embedding sends " +
       "workspace content to an external endpoint and must be enabled explicitly by the user in the " +
       "deployment config — the model side cannot turn it on); switching embedding only takes effect " +
       "with rebuild=true. Pass drop=true to delete. Pass resetPaths=true to clear the file-selection " +
@@ -620,7 +628,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "zg --ignore-file",
     excludeSecretsDescription:
       "Whether to exclude private-key/keystore formats (*.pem/*.key/*.p12/*.pfx/" +
-      "*.keystore/id_rsa*), default true. These exclusion rules are evaluated after user " +
+      "*.keystore/*.jks/*.ppk/id_rsa*), default true. These exclusion rules are evaluated after user " +
       "include globs, so no user glob can bring the files back: this flag is the only switch " +
       "for indexing private keys, and false feeds them into the vector store, from where " +
       "search can echo them back into context. Set false only when the user explicitly asks " +
@@ -845,7 +853,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     tooManyItems: "{name} allows at most {maxItems} items (actual {actual})",
     nonStringItem: "{name} contains a non-string item ({received})",
     commandTooLong:
-      "the zg command is {length} characters, over the {maxChars} character limit — narrow the search",
+      "the zg command is {length} bytes, over the {maxBytes} byte limit — narrow the search",
     tooManyQueryRoutes: "{count} query routes in total, over the limit of {max}",
     searchNeedsQuery: "zg_search needs at least one of query/queries/fts/vector",
     exhaustiveNeedsPattern: "exhaustive search (rg=true) needs a query to use as the pattern",
@@ -864,8 +872,12 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "drop conflicts with resetPaths: --drop does nothing but delete the index, so resetPaths has " +
       "nowhere to go (upstream zg rejects the pair too). To clear inherited file-selection settings, " +
       "do not pass drop.",
+    dropWithIndexArgs:
+      "drop conflicts with these index-side parameters: {names}. --drop does nothing but delete the " +
+      "index, so they would never be used (accepting them silently only suggests the filters/rebuild " +
+      "took effect); remove them and resend the drop.",
     ignoreFileMissing:
-      "{path} under {root} is not an existing file the current process can read (missing, a " +
+      "{path} is not an existing file the current process can read (missing, a " +
       "directory, or present-but-unreadable all count). Upstream zg does not treat a failed " +
       'ignore-file read as "no such rule": the whole indexing run fails (ENOENT / EISDIR / EACCES) ' +
       "and the bad path is written into the workspace index state, after which every zg index / " +

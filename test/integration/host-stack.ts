@@ -170,8 +170,14 @@ export async function startHost(
     return spec;
   };
 
+  // 每次调用一个 controller，并把它留在册上：宿主真跑起来时 signal 是取消通道
+  // （卸载/tool 超时都会 abort）。就地解构丢弃 controller 会让这条通道永远是死线，
+  // 于是「卸载后仍在飞的那一发被取消」这件事在台架里根本测不出来。
+  const callSignals: AbortController[] = [];
   const call = async (name: string, args: unknown, agent?: unknown): Promise<ToolOutcome> => {
-    const { signal } = new AbortController();
+    const controller = new AbortController();
+    callSignals.push(controller);
+    const { signal } = controller;
     return (ctx.tools as unknown as { execute: (input: unknown) => Promise<ToolOutcome> }).execute({
       signal,
       callId: `call-${Math.random().toString(36).slice(2, 8)}`,
@@ -179,6 +185,11 @@ export async function startHost(
       arguments: args,
       ...(agent === undefined ? {} : { agent }),
     });
+  };
+  const abortAll = (): void => {
+    for (const controller of callSignals.splice(0)) {
+      controller.abort();
+    }
   };
   const patchApproval = (outcome: "allowed-once" | "rejected" | "unavailable"): unknown[] => {
     const asked: unknown[] = [];
@@ -205,9 +216,11 @@ export async function startHost(
     textOf,
     patchApproval,
     unload: async () => {
+      abortAll();
       await pluginFiber.dispose();
     },
     dispose: async () => {
+      abortAll();
       await (ctx as unknown as { fiber: { dispose: () => Promise<void> } }).fiber.dispose();
       rmSync(spillDir, { recursive: true, force: true });
     },
@@ -227,7 +240,7 @@ export interface Host {
   call: (name: string, args: unknown, agent?: unknown) => Promise<ToolOutcome>;
   textOf: (outcome: ToolOutcome) => string;
   patchApproval: (outcome: "allowed-once" | "rejected" | "unavailable") => unknown[];
-  /** 只卸载本插件（模拟宿主重载那一行），不等同于 dispose 整台宿主。 */
+  /** 只卸载本插件（模拟宿主重载那一行）；在册的调用信号随之 abort，不等同于 dispose 整台宿主。 */
   unload: () => Promise<void>;
   dispose: () => Promise<void>;
 }

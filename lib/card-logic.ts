@@ -15,6 +15,14 @@ import type { ConfigForm, ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-
 // 只管「六个字段各显示什么」。
 import { draftOf, numberText } from "./card-draft.ts";
 import { DEFAULT_EMBEDDING } from "./embedding-catalog.ts";
+// 数值区间单源：显示文案与钳制区间引同一份常量（host schema 与输入区间同源，见该文件头）。
+import {
+  DEFAULT_GREP_BUDGET,
+  DEFAULT_LIMIT,
+  DEFAULT_UNLOCK_WINDOW_MIN,
+  LIMIT_MAX,
+  LIMIT_MIN,
+} from "./limits.ts";
 
 /**
  * 本文件用到的 UI 文案键（字典在 src/ui-messages.ts：漏一个键或名字打错，
@@ -26,7 +34,8 @@ export type CardTextKey =
   | "rebuildRunning"
   | "rebuildKilled"
   | "rebuildFailed"
-  | "rebuildExitCode";
+  | "rebuildExitCode"
+  | "rebuildExitUnknown";
 
 /**
  * 引导端点交回的守护进程就绪态该显示哪一行。
@@ -163,9 +172,24 @@ export interface CardFields {
   unlockWindow: string;
 }
 
-const DEFAULT_LIMIT_TEXT = "10";
-const DEFAULT_BUDGET_TEXT = "3";
-const DEFAULT_WINDOW_TEXT = "10";
+/**
+ * 三个数值字段的显示值都是「草稿优先 + 默认文案」，且共享同一条清空语义：
+ * touched 里显式写了 undefined（用户清空输入）= 待 unset，显示空串；「从没动过、
+ * 快照里也没有」不是清空，显示默认文案。判据统一收在这里，与 buildRangeRow /
+ * limitDraftOf 的「清空即回『未填』」对齐。
+ */
+function numericFieldDisplay(
+  touched: Record<string, unknown>,
+  value: Record<string, unknown>,
+  field: string,
+  fallback: string,
+): string {
+  const draft = draftOf(touched, value, field);
+  if (draft === undefined) {
+    return Object.hasOwn(touched, field) ? "" : fallback;
+  }
+  return numberText(draft, fallback);
+}
 
 /** 六个字段的草稿显示值（ZgCard 只渲染这里算出来的东西）。 */
 export function draftFields(
@@ -175,31 +199,31 @@ export function draftFields(
   const embedding = draftOf(touched, value, "defaultEmbedding");
   const endpoint = draftOf(touched, value, "hfEndpoint");
   const enforce = draftOf(touched, value, "enforceSearchFirst");
-  // defaultLimit 清空 = 草稿里显式 undefined（待 unset 回默认），显示空串；
-  // 而「用户从没动过、快照里也没有」不是清空，显示默认文案。
-  const limitDraft = draftOf(touched, value, "defaultLimit");
-  let limitDisplay = numberText(limitDraft, DEFAULT_LIMIT_TEXT);
-  if (limitDraft === undefined) {
-    limitDisplay = "defaultLimit" in touched ? "" : DEFAULT_LIMIT_TEXT;
-  }
   return {
     embedding:
       typeof embedding === "string" && embedding.length > 0 ? embedding : DEFAULT_EMBEDDING,
-    limitDisplay,
+    limitDisplay: numericFieldDisplay(touched, value, "defaultLimit", String(DEFAULT_LIMIT)),
     hfEndpoint: typeof endpoint === "string" ? endpoint : "",
     enforceSearchFirst: enforce !== false,
-    grepBudget: numberText(draftOf(touched, value, "grepBudgetPerSearch"), DEFAULT_BUDGET_TEXT),
-    unlockWindow: numberText(draftOf(touched, value, "unlockWindowMin"), DEFAULT_WINDOW_TEXT),
+    grepBudget: numericFieldDisplay(
+      touched,
+      value,
+      "grepBudgetPerSearch",
+      String(DEFAULT_GREP_BUDGET),
+    ),
+    unlockWindow: numericFieldDisplay(
+      touched,
+      value,
+      "unlockWindowMin",
+      String(DEFAULT_UNLOCK_WINDOW_MIN),
+    ),
   };
 }
 
 // ── limit 输入校验 ─────────────────────────────────────────────────────────
 // type=number 的受控 input：非法/清空的击键若静默丢弃，用户得不到任何反馈。
 // 空 → empty（草稿写 undefined，保存时 unset 回 base 默认）；
-// 越界整数 → clamped（钳到 1-50 并提示）；其它 → invalid（提示，不写草稿）。
-
-const LIMIT_MIN = 1;
-const LIMIT_MAX = 50;
+// 越界整数 → clamped（钳到区间并提示）；其它 → invalid（提示，不写草稿）。
 
 export type LimitResolution =
   | { kind: "valid"; value: number }
@@ -235,22 +259,30 @@ export function resolveLimitInput(raw: string, t: CardText): LimitResolution {
 
 /**
  * limit 击键 → 草稿层该写什么（保存仍由保存条统一驱动）。
- * invalid 不改草稿、只回提示；empty 写 undefined（=待 unset）；valid/clamped 写数值。
+ * invalid 不改草稿、只回提示（error 位）；empty 写 undefined（=待 unset）；
+ * valid/clamped 写数值——clamped 另带 hint：越界已被钳制这件事对用户不能静默，
+ * 但它不是失败（值已写入），故走独立的 hint 位而不是 error 位。
  */
 export interface LimitDraft {
   draft: unknown;
   error: string | null;
+  /** clamped 那一臂的「已钳到区间」提示；其余分支恒为 null。 */
+  hint: string | null;
 }
 
 export function limitDraftOf(raw: string, t: CardText): LimitDraft {
   const resolution = resolveLimitInput(raw, t);
   if (resolution.kind === "invalid") {
-    return { draft: undefined, error: resolution.hint };
+    return { draft: undefined, error: resolution.hint, hint: null };
   }
   if (resolution.kind === "empty") {
-    return { draft: undefined, error: null };
+    return { draft: undefined, error: null, hint: null };
   }
-  return { draft: resolution.value, error: null };
+  return {
+    draft: resolution.value,
+    error: null,
+    hint: resolution.kind === "clamped" ? resolution.hint : null,
+  };
 }
 
 // ── 重建端点应答解析 ───────────────────────────────────────────────────────
@@ -289,8 +321,12 @@ export function parseRebuildPoll(body: Record<string, unknown>, t: CardText): Re
     reason = t("rebuildKilled");
   } else if (status === "failed") {
     reason = t("rebuildFailed");
+  } else if (typeof exitCode === "number" && Number.isFinite(exitCode)) {
+    reason = t("rebuildExitCode", { exitCode });
   } else {
-    reason = t("rebuildExitCode", { exitCode: String(exitCode) });
+    // status 是旧 host/畸形应答里的未知词（或缺席）且没有可读的退出码：拼
+    // 「退出码 undefined」这类文案只会误导排查，回落到通用失败文案。
+    reason = t("rebuildExitUnknown");
   }
   return { phase: "error", output: outputText.length > 0 ? `${reason}\n${outputText}` : reason };
 }

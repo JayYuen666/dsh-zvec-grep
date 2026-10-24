@@ -317,10 +317,10 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
       }
     }, 60_000);
 
-    it("drop 那一臂跳过预检：drop + 不存在的 ignoreFiles 不被误拒（ignoreFiles 本就不进 drop 命令）", async () => {
-      // buildIndexCommand 的 drop 分支只有 `zg index <root> --drop --yes`，ignoreFiles 被静默
-      // 丢掉、根本不进 zg（也就无从损坏索引）。预检若照跑，会拿"给一个真实存在的忽略文件"
-      // 这句误导文案把一次合法的删索引拦下——故 drop 为真时整段跳过。
+    it("drop 携带索引侧参数被点名拒绝（ignoreFiles 不进 drop 命令，也不该被静默收下）", async () => {
+      // buildIndexCommand 的 drop 分支只有 `zg index <root> --drop --yes`。索引用不上的
+      // 参数静默收下只会让模型以为过滤生效了（也就无从损坏索引），故构造期一次点名拒绝；
+      // 存在性预检对 drop 整段跳过，那句"给一个真实存在的忽略文件"不会抢在前面出现。
       const host = await startHost();
       const ws = workspace();
       try {
@@ -329,13 +329,14 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
           { confirm: true, drop: true, ignoreFiles: [MISSING_IGNORE] },
           host.agentOf(ws),
         );
-        // 命令照构造、照起：drop 分支带 --drop、且不含 --ignore-file（那条被丢掉了）。
-        const call = host.shellCalls.find((row) => row.request.command.startsWith("zg index"));
-        assert.ok(call !== undefined, host.textOf(outcome));
-        expect(call.spec.command).toContain("--drop");
-        expect(call.spec.command).not.toContain("--ignore-file");
+        expect(host.textOf(outcome)).toContain("drop 与这些索引侧参数互斥");
+        expect(host.textOf(outcome)).toContain("ignoreFiles");
         // 绝不是那句存在性误拒（预检被 drop 跳过，没读 ignoreFiles）。
         expect(host.textOf(outcome)).not.toContain(MISSING_IGNORE);
+        // 没有任何 `zg index` 命令被构造出去（版本门槛的探测调用不算——它在占位之前）。
+        expect(
+          host.shellCalls.filter((row) => row.request.command.startsWith("zg index")),
+        ).toHaveLength(0);
       } finally {
         await host.dispose();
       }

@@ -2,6 +2,7 @@
 // 等待者的四种出口，以及容量上限。纯逻辑，不触宿主面。
 import { describe, it, vi } from "vitest";
 import assert from "node:assert/strict";
+import { setTimeout as delay } from "node:timers/promises";
 import { getEventListeners } from "node:events";
 // 官方作业品牌串的**值**形式（JobId("x") 只是给同一个字符串贴牌，不做校验）。
 // 测试不是产物，值导入不破坏 host.js 的自包含；生产侧一律 type-only。
@@ -283,51 +284,78 @@ describe("覆盖判据（covering）", () => {
   });
 });
 
-describe("容量上限", () => {
-  it("超过上限淘汰最早的**未启动**条目，并唤醒其等待者", async () => {
-    const rebuilds = createRebuildRegistry({ maxTracked: 2 });
-    rebuilds.claim("/a", "card");
-    rebuilds.claim("/b", "card");
-    const waiting = rebuilds.wait("/a", zh, 60_000);
-    rebuilds.claim("/c", "card");
-    assert.deepEqual(rebuilds.keys().toSorted(), ["/b", "/c"]);
-    assert.equal(await waiting, "settled");
+describe("容量阈值", () => {
+  it("超过阈值只报警、不淘汰：在途的一条被挤掉会让同根起第二条 zg", () => {
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (message?: unknown): void => {
+      warned.push(String(message));
+    };
+    try {
+      const rebuilds = createRebuildRegistry({ maxTracked: 2 });
+      // A 刚 claim、还在起进程（jobId 仍是 undefined）：这正是旧实现会淘汰的那一档。
+      const a = rebuilds.claim("/a", "card");
+      assert.ok(a !== null);
+      assert.equal(a.jobId, undefined);
+      rebuilds.claim("/b", "card");
+      rebuilds.claim("/c", "card");
+      // 三条全在，一条都没被删。
+      assert.deepEqual(rebuilds.keys().toSorted(), ["/a", "/b", "/c"]);
+      // A 的条目还是同一个对象：调用方手里那枚凭据没作废。
+      assert.equal(rebuilds.active("/a"), a);
+      // 同根仍然互斥：旧实现把它淘汰掉之后这里会成功。
+      assert.equal(rebuilds.claim("/a", "tool"), null);
+    } finally {
+      console.warn = original;
+    }
+    assert.equal(warned.filter((line) => line.includes("活跃重建表")).length, 1, "只报一次");
+    assert.match(warned.join("\n"), /超过阈值 2/u);
   });
 
-  it("已在跑的重建**永不**被淘汰：否则占位一空，同一根就能起第二条 zg", async () => {
-    // 淘汰会把条目兑现成「结束」并从表里删掉。对真在跑的那条来说，那等于告诉所有等待者
-    // 「好了」，而它的 zg 其实还在写这棵树——随后同根的第二次 claim 会成功，两条 zg index
-    // 同时啃一份索引，撞上 zg 的写锁直接失败。那正是这个注册表存在的理由。
-    const rebuilds = createRebuildRegistry({ maxTracked: 1 });
-    rebuilds.claim("/running", "card");
-    rebuilds.attach("/running", jobIdOf("job-1"));
-    // 上限 1、表里已有一条在跑的 ⇒ 淘汰无可淘汰，新来的这条是唯一候选，但它**刚被 claim
-    // 出来**，不能被自己挤掉（那会让 claim 的返回值当场作废）。于是表短暂到 2。
-    const fresh = rebuilds.claim("/fresh", "tool");
-    assert.notEqual(fresh, null, "新 claim 应当成功");
-    assert.deepEqual(
-      rebuilds.keys().toSorted(),
-      ["/fresh", "/running"],
-      "两条都得留下：在跑的不能被挤，刚 claim 的也不能被自己挤掉",
-    );
-    assert.equal(
-      rebuilds.claim("/running", "tool"),
-      null,
-      "同根仍然互斥：占位没被淘汰掉，第二条 claim 就该被拒",
-    );
+  it("在途占位的等待者不会被超限误唤醒（淘汰会把它兑现成「已落定」）", async () => {
+    // 这一跑也会越过阈值：告警本身不是被测对象，屏蔽掉以免 stderr 横幅进噪点表。
+    const original = console.warn;
+    console.warn = (): void => undefined;
+    try {
+      const rebuilds = createRebuildRegistry({ maxTracked: 1 });
+      rebuilds.claim("/repo", "card");
+      const waiting = rebuilds.wait("/repo", zh, 60_000);
+      rebuilds.claim("/other", "tool");
+      // 用 setTimeout 的 promise 形态（`timers/promises`）：既避开 promise(avoid-new)，
+      // 也不用自己包一层 executor。
+      const raced = await Promise.race([waiting, delay(20, "still-waiting")]);
+      assert.equal(raced, "still-waiting", "占位还在，等待者不该被告知已落定");
+      // 真释放才唤醒。
+      rebuilds.release("/repo");
+      assert.equal(await waiting, "settled");
+    } finally {
+      console.warn = original;
+    }
   });
 
-  it("全部都是在跑的条目时表短暂超限（常驻内存仍有界，官方注册表自己卡着并发数）", async () => {
-    const rebuilds = createRebuildRegistry({ maxTracked: 1 });
-    rebuilds.claim("/a", "card");
-    rebuilds.attach("/a", jobIdOf("job-1"));
-    rebuilds.claim("/b", "card");
-    rebuilds.attach("/b", jobIdOf("job-2"));
-    rebuilds.claim("/c", "card");
-    assert.deepEqual(rebuilds.keys().toSorted(), ["/a", "/b", "/c"]);
-    // 三条互斥都还成立：这是「不淘汰在跑的」换来的唯一代价，而它正是我们要保的那条性质。
-    for (const root of ["/a", "/b", "/c"]) {
-      assert.equal(rebuilds.claim(root, "tool"), null, `${root} 应当仍互斥`);
+  it("回落到阈值以下才重新武装告警（不在每次 claim 时刷屏）", () => {
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (message?: unknown): void => {
+      warned.push(String(message));
+    };
+    try {
+      const rebuilds = createRebuildRegistry({ maxTracked: 1 });
+      rebuilds.claim("/a", "card");
+      rebuilds.claim("/b", "card");
+      rebuilds.claim("/c", "card");
+      // 仍在阈值之上：不再重复报。
+      rebuilds.claim("/d", "card");
+      assert.equal(warned.length, 1);
+      // 回落到阈值以内之后再越阈，应该再报一次。
+      rebuilds.release("/b");
+      rebuilds.release("/c");
+      rebuilds.release("/d");
+      rebuilds.claim("/e", "card");
+      rebuilds.claim("/f", "card");
+      assert.equal(warned.length, 2);
+    } finally {
+      console.warn = original;
     }
   });
 });

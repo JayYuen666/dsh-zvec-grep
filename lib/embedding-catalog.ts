@@ -1,6 +1,8 @@
 // zvec-grep 本地 embedding 候选清单。
-// 数据源：zg v0.2.1 的 EMBEDDING_MODEL_CATALOG（src/engine/models/catalog.ts）中
-// 所有 provider === 'local' 的条目。这是卡片的单一数据源：host.ts（默认值校验）
+// 数据源：zvec-grep v0.2.2 的 EMBEDDING_MODEL_CATALOG（src/engine/models/catalog.ts）中
+// 所有 provider === 'local' 的条目——引用、后端、维度三列已与 v0.2.2 源码逐条核对一致
+// （本包命令形态的下界 MINIMUM_ZG_VERSION 也是 0.2.2，同步基线不再指更早的版本）。
+// 这是卡片的单一数据源：host.ts（默认值校验）
 // 与 src/client-entry.ts（<select> 候选）都从这里取；zg 自身在 index 时还会
 // 用 requireEmbeddingModelCatalogEntry 二次校验，未知引用会拒绝，双保险。
 //
@@ -10,10 +12,12 @@
 
 export type LocalEmbeddingBackend = "llama-cpp" | "transformers-js" | "model2vec";
 
+/** 字段全 readonly：候选清单是不可变数据，消费者改写条目会造出「卡片显示的维度与
+ *  zg 实际索引维度不一致」这类无报错的漂移，约束必须落在类型上。 */
 export interface LocalEmbeddingOption {
-  reference: string;
-  backend: LocalEmbeddingBackend;
-  dimension: number;
+  readonly reference: string;
+  readonly backend: LocalEmbeddingBackend;
+  readonly dimension: number;
 }
 
 /** 默认模型：本地最强（1024 维 / 8192 上下文 / 中英通用），约 640MB 一次性下载。 */

@@ -9,13 +9,15 @@
 // 纯函数，无 DOM、不读设置：卡片是「先暂存、点保存才写入」的草稿模型，touched 是草稿层、
 // 快照 value 是已提交层，两层的优先级只由这里决定。
 
-/** 草稿优先取值：touched 有该键（哪怕值是 undefined=待清空）即用草稿。 */
+/** 草稿优先取值：touched 有该键（哪怕值是 undefined=待清空）即用草稿。
+ *  只判**自有**属性：本函数收任意字段名，`in` 会沿原型链命中 `toString` /
+ *  `constructor` 这类继承键，把 Object.prototype 的成员当成草稿交出去。 */
 export function draftOf(
   touched: Record<string, unknown>,
   value: Record<string, unknown>,
   field: string,
 ): unknown {
-  return field in touched ? touched[field] : value[field];
+  return Object.hasOwn(touched, field) ? touched[field] : value[field];
 }
 
 /** 数值型输入的显示文本：非有限数（含 undefined）回落到默认文案。 */

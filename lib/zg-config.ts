@@ -25,16 +25,30 @@ export interface ZgDeployConfig {
   readonly remoteEmbeddingApiKeyFrom: string;
 }
 
+/** http(s) 且带 host 的基地址才算端点：`http://`、`/` 这类值不是可用的镜像基地址。 */
+function isUsableBaseUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname !== "";
+  } catch {
+    return false;
+  }
+}
+
 /** 各环境读一个 HF 镜像/代理基地址的优先级：显式入参 > 设置。
  *  `typeof` 判断是 host 侧兜底：值域正常时 schema 的 `.default()` 已保证是字符串，
- *  引用被交回 undefined（条目未投影/宿主退化）时宁可不带 env，也不发一个空 HF_ENDPOINT。 */
+ *  引用被交回 undefined（条目未投影/宿主退化）时宁可不带 env，也不发一个空 HF_ENDPOINT。
+ *  规范化（剥尾斜杠）之后还要再验一次：`/`、`///` 会被剥成空串，`http://` 这类没有
+ *  host 的值也不是基地址——发一个空的或畸形的 HF_ENDPOINT 只会把失败推迟到
+ *  node-llama-cpp 的下载期，定位成本远高于这里的一次静默省略。 */
 function hfEndpointEnv(config: ZgDeployConfig): Record<string, string> | undefined {
   const endpoint = config.hfEndpoint.get();
   let env: Record<string, string> | undefined;
-  if (typeof endpoint === "string" && endpoint.trim().length > 0) {
-    // 规范化：去掉尾部斜杠，node-llama-cpp 的 resolveHuggingFaceEndpoint 自会补尾斜杠。
+  if (typeof endpoint === "string") {
     const normalized = endpoint.trim().replace(/\/+$/u, "");
-    env = { HF_ENDPOINT: normalized };
+    if (normalized.length > 0 && isUsableBaseUrl(normalized)) {
+      env = { HF_ENDPOINT: normalized };
+    }
   }
   return env;
 }
@@ -58,6 +72,13 @@ function trimmedConfigString(value: string | undefined): string | undefined {
 export function allowRemoteEmbedding(config: ZgDeployConfig): boolean {
   return config.allowRemoteEmbedding;
 }
+
+/**
+ * 远程凭据走的环境变量名形状：常规标识符。名字不受约束等于允许行 config 把宿主进程里
+ * 任意变量（含与 zg 无关的敏感值）转发给子进程；`__proto__` / `constructor` 这类键还会
+ * 让 `process.env[name]` 读到对象而不是字符串。不匹配的名字按「没配」处理。
+ */
+const ENV_NAME_SHAPE = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 
 /**
  * zg 子进程的环境变量：HF 镜像 + （仅在部署开放远程 embedding 时的）远程端点与凭据。
@@ -84,9 +105,11 @@ export function zgEnv(config: ZgDeployConfig): Record<string, string> | undefine
       env["ZVEC_GREP_ENDPOINT"] = endpoint;
     }
     const keyName = trimmedConfigString(config.remoteEmbeddingApiKeyFrom);
-    // 只读那一个被点名的变量名，不把整份 process.env 倒出去。
-    const key = keyName === undefined ? undefined : process.env[keyName];
-    const secret = key?.trim();
+    // 只读那一个被点名的变量名，不把整份 process.env 倒出去；名字先过形状再取值，
+    // 取到的也按 string 收窄（`process.env` 的索引访问在特殊键上不保证交回字符串）。
+    const key =
+      keyName !== undefined && ENV_NAME_SHAPE.test(keyName) ? process.env[keyName] : undefined;
+    const secret = typeof key === "string" ? key.trim() : undefined;
     if (secret !== undefined && secret.length > 0) {
       env["ZVEC_GREP_API_KEY"] = secret;
     }

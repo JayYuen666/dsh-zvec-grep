@@ -37,6 +37,12 @@ const tZh: CardText = (key, params) => fill(UI_MESSAGES.zh[key], params ?? {});
 const tEn: CardText = (key, params) => fill(UI_MESSAGES.en[key], params ?? {});
 
 /**
+ * 中文「无退出码」文案的期望整句：三个用例共用（exitCode null / 缺 status / NaN），
+ * 引字典键等于让字典自己给自己作证，独立抄一份。
+ */
+const ZH_REBUILD_EXIT_UNKNOWN = "重建失败，且没有可读的进程退出码（应答的 status 无法识别）";
+
+/**
  * 中文「limit 非法」提示的期望整句：`tZh` 从 UI_MESSAGES 渲染出来就是这一串，断言里
  * 独立抄一份——引字典键/字典文本等于让字典自己给自己作证。三个用例共用（abc / 3.5 / 1e99）。
  */
@@ -185,6 +191,12 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
     assert.equal(draftOf({}, {}, "missing"), undefined);
   });
 
+  it("只判自有属性：继承键（toString 等）不算 touched，落回已提交层", () => {
+    // `field in touched` 会沿原型链命中 Object.prototype 的成员，把函数/对象当草稿交出去。
+    assert.equal(draftOf({}, { toString: 5 }, "toString"), 5);
+    assert.equal(typeof draftOf({}, {}, "toString"), "function", "继承成员没有被当草稿拦下");
+  });
+
   it("六个字段全部草稿优先（含 hfEndpoint 与 embedding）", () => {
     const committed = {
       defaultEmbedding: "local/committed",
@@ -261,6 +273,30 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
     assert.equal(draftFields({ defaultLimit: undefined }, {}).limitDisplay, "");
     assert.equal(draftFields({}, { defaultLimit: undefined }).limitDisplay, "10");
   });
+
+  it("三个数值字段的清空语义一致：显式清空显示空串，没动过显示默认文案", () => {
+    // grepBudget/unlockWindow 与 defaultLimit 走同一条判据：buildRangeRow 清空时写入
+    // undefined（待 unset），显示若回落到默认文案，界面就像「已填默认值」，脏数据仍在。
+    const displayKey = {
+      defaultLimit: "limitDisplay",
+      grepBudgetPerSearch: "grepBudget",
+      unlockWindowMin: "unlockWindow",
+    } as const;
+    const cases: readonly [keyof typeof displayKey, string][] = [
+      ["defaultLimit", "10"],
+      ["grepBudgetPerSearch", "3"],
+      ["unlockWindowMin", "10"],
+    ];
+    for (const [field, fallback] of cases) {
+      const key = displayKey[field];
+      assert.equal(draftFields({ [field]: undefined }, {})[key], "");
+      assert.equal(
+        draftFields({}, { [field]: undefined })[key],
+        fallback,
+        "快照里的 undefined（没动过）不是清空",
+      );
+    }
+  });
 });
 
 describe("resolveLimitInput / limitDraftOf（limit 输入校验）", () => {
@@ -306,10 +342,28 @@ describe("resolveLimitInput / limitDraftOf（limit 输入校验）", () => {
   });
 
   it("limitDraftOf：invalid 只回提示，empty 写 undefined，valid/clamped 写数值", () => {
-    assert.deepEqual(limitDraftOf("abc", tZh), { draft: undefined, error: ZH_LIMIT_INVALID_HINT });
-    assert.deepEqual(limitDraftOf("", tZh), { draft: undefined, error: null });
-    assert.deepEqual(limitDraftOf("7", tZh), { draft: 7, error: null });
-    assert.deepEqual(limitDraftOf("99", tZh), { draft: 50, error: null });
+    assert.deepEqual(limitDraftOf("abc", tZh), {
+      draft: undefined,
+      error: ZH_LIMIT_INVALID_HINT,
+      hint: null,
+    });
+    assert.deepEqual(limitDraftOf("", tZh), { draft: undefined, error: null, hint: null });
+    assert.deepEqual(limitDraftOf("7", tZh), { draft: 7, error: null, hint: null });
+  });
+
+  it("clamped 的值照常写入草稿，提示走独立的 hint 位（不是 error）", () => {
+    // 越界已被钳制这件事不能静默（limitClamped 文案在生产路径上要真的显示出来），
+    // 但它不是失败：error 为 null 时调用方照常写草稿。
+    assert.deepEqual(limitDraftOf("99", tZh), {
+      draft: 50,
+      error: null,
+      hint: "已钳到 1-50 范围：50",
+    });
+    assert.deepEqual(limitDraftOf("0", tZh), {
+      draft: 1,
+      error: null,
+      hint: "已钳到 1-50 范围：1",
+    });
   });
 });
 
@@ -392,6 +446,25 @@ describe("parseRebuildPoll（completed 且 exit 0 才算成功）", () => {
     assert.equal(
       parseRebuildPoll({ status: "pending", output: 42 }, tZh).output.includes("42"),
       false,
+    );
+  });
+
+  it("退出码只在确是有限数字时展示；缺失/畸形回落到通用失败文案", () => {
+    // 「重建进程退出码 undefined / null」这类文案只会误导排查（该函数收的就是
+    // Record<string, unknown>，字段缺席本就该容忍）。
+    assert.equal(
+      parseRebuildPoll({ status: "completed", exitCode: null }, tZh).output,
+      ZH_REBUILD_EXIT_UNKNOWN,
+    );
+    assert.equal(parseRebuildPoll({}, tZh).output, ZH_REBUILD_EXIT_UNKNOWN);
+    assert.equal(
+      parseRebuildPoll({ status: "completed", exitCode: Number.NaN }, tZh).output,
+      ZH_REBUILD_EXIT_UNKNOWN,
+    );
+    // 确是有限数字 → 照旧展示退出码（bash-local 任何自然退出都是 completed）。
+    assert.match(
+      parseRebuildPoll({ status: "completed", exitCode: 127 }, tZh).output,
+      /退出码 127/u,
     );
   });
 });

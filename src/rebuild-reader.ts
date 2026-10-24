@@ -142,16 +142,47 @@ const isRebuildNamespace = (value: unknown): value is RebuildNamespace =>
   typeof value["status"] === "function";
 
 /**
- * 造出真正的读取器（挂载一次 + 每次读命名空间服务）。
+ * 线上拒绝（result.ok=false）翻成异常：code 与 message 都来自网关的错误对象。
+ * 三个方法同构，收成一个入口——同一份判据，不抄三份。
+ */
+async function unwrapWire<Value>(
+  call: Promise<
+    { ok: false; error: { code: string; message: string } } | { ok: true; value: Value }
+  >,
+): Promise<Value> {
+  const result = await call;
+  // 两个分支都写成真实语句（if-return / throw）：裸 if-throw 的隐式空 else 在 v8 的块覆盖
+  // 里会记成一个无处落位的空块，整包 100% 门禁会被这条伪块随机打红。
+  if (result.ok) {
+    return result.value;
+  }
+  throw new Error(`${result.error.code}: ${result.error.message}`);
+}
+
+/**
+ * 造出真正的读取器（remote 每次现读 + 挂载只在成功后缓存）。
  * @param ctx - 客户端上下文
- * @param remote - 已核过形状的远程面
  * @returns 读取器
  */
-function buildRebuildReader(ctx: RemoteHost, remote: RemoteMounter): RebuildReader {
+function buildRebuildReader(ctx: RemoteHost): RebuildReader {
   let mounted: Promise<unknown> | undefined;
   const namespaceOf = async (): Promise<RebuildNamespace> => {
-    mounted ??= remote.$mount({ package: PACKAGE_NAME, descriptors: REBUILD_DESCRIPTORS });
-    await mounted;
+    // remote 是未写进 inject 的可选服务，cordis 不保证提供方在卡片 apply 之前完成注册：
+    // 每次调用现读（与宿主侧可选服务的既定口径一致），缺席时点名抛错——把 apply 期读到
+    // 的 undefined 定死，读取器就永远起不来，且没有任何时机重新解析。
+    const mounter = ctx.get?.("remote");
+    if (!isRemoteMounter(mounter)) {
+      throw new Error("工作区重建读面不可用：宿主网关没有提供 remote 服务");
+    }
+    try {
+      mounted ??= mounter.$mount({ package: PACKAGE_NAME, descriptors: REBUILD_DESCRIPTORS });
+      await mounted;
+    } catch (error) {
+      // 挂载失败不留在缓存里：rejected promise 一旦复用，之后每次轮询（含 2s 一次的
+      // status）都会撞同一个 rejection，重试永远不会发生。
+      mounted = undefined;
+      throw error;
+    }
     const namespace = ctx.get?.(REBUILD_SERVICE_KEY, false);
     if (!isRebuildNamespace(namespace)) {
       throw new Error(`${REBUILD_SERVICE_KEY} 未提供：宿主网关没有挂上这枚命名空间`);
@@ -161,51 +192,41 @@ function buildRebuildReader(ctx: RemoteHost, remote: RemoteMounter): RebuildRead
   return {
     async roots(): Promise<RebuildRoots> {
       const ns = await namespaceOf();
-      const result = await ns.roots();
-      if (!result.ok) {
-        throw new Error(`${result.error.code}: ${result.error.message}`);
-      }
-      return result.value;
+      return unwrapWire(ns.roots());
     },
     async rebuild(root: string): Promise<RebuildStartResult & { ok: true }> {
       const ns = await namespaceOf();
-      const result = await ns.rebuild({ root });
-      if (!result.ok) {
-        throw new Error(`${result.error.code}: ${result.error.message}`);
+      const value = await unwrapWire(ns.rebuild({ root }));
+      if (value.ok) {
+        return value;
       }
-      if (!result.value.ok) {
-        throw new Error(result.value.error);
-      }
-      return result.value;
+      throw new Error(value.error);
     },
     async status(jobId: string): Promise<Record<string, unknown>> {
       const ns = await namespaceOf();
-      const result = await ns.status({ jobId });
-      if (!result.ok) {
-        throw new Error(`${result.error.code}: ${result.error.message}`);
-      }
-      if (!result.value.ok) {
-        throw new Error(result.value.error);
-      }
+      const value = await unwrapWire(ns.status({ jobId }));
       // 摊平成普通对象：卡片侧那层解析只认 `status/exitCode/output` 三个键。
-      return { ...result.value };
+      if (value.ok) {
+        return { ...value };
+      }
+      throw new Error(value.error);
     },
   };
 }
 
 /**
- * 造一个「读宿主侧工作区重建」的读取器；**当前部署没有远程面时返回 `undefined`**
- * （卡片照常渲染，只是点重建时给出错误 —— 与 host 侧可选读面同一条口径）。
+ * 造一个「读宿主侧工作区重建」的读取器；**连 ctx.get 面都不在时返回 `undefined`**
+ * （卡片照常渲染，点重建时给出错误）。remote 服务是否在场**不在这一步判**：
+ * 解析推迟到每次调用（见 buildRebuildReader），apply 期它可能还没注册。
  *
- * `$mount` 是**幂等**的（挂进本 fiber，随卡片卸载自动撤），所以这里缓存那枚 promise：
- * 同一次会话里反复轮询只挂一次。
+ * `$mount` 是**幂等**的（挂进本 fiber，随卡片卸载自动撤），成功后缓存那枚 promise：
+ * 同一次会话里反复轮询只挂一次；失败则清缓存，下一次调用重新挂。
  *
  * @param ctx - 客户端上下文（只用 `get` 一位）
- * @returns 读取器；没有远程面时 `undefined`
+ * @returns 读取器；ctx 没有 get 面时 `undefined`
  */
 export function createRebuildReader(ctx: RemoteHost): RebuildReader | undefined {
-  const remote = ctx.get?.("remote");
   // 单 return（三元的另一支是 `undefined`）：`consistent-return` 不接受"早退 undefined + 晚退函数"
   // 这种混合形状，而这里两种结果本来就是同一件事的两面。
-  return isRemoteMounter(remote) ? buildRebuildReader(ctx, remote) : undefined;
+  return typeof ctx.get === "function" ? buildRebuildReader(ctx) : undefined;
 }

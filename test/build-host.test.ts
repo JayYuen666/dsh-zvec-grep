@@ -12,7 +12,7 @@ import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { buildHost } from "../build-host.mjs";
+import { buildHost, singleEntryChunk } from "../build-host.mjs";
 import { hostFreshnessEvidence } from "./host-freshness.ts";
 
 describe("buildHost()", () => {
@@ -109,5 +109,54 @@ describe("换装的产物面（ctx.jobs 只有类型面）", () => {
         `${name} 必须在 devDependencies`,
       );
     }
+  });
+});
+
+/** 输出守卫测试用的最小 chunk 正文。 */
+const CHUNK_CODE = "export {};";
+/** 输出守卫测试用的产物文件名。 */
+const ARTIFACT_FILE = "artifact.js";
+
+/**
+ * 造一个最小输出项；判据只看 type/fileName/isEntry/code。
+ * @param type - rolldown 输出项类型
+ * @param fileName - 产物文件名
+ * @param extra - 该类型需要的其余字段
+ * @returns 可交给 singleEntryChunk 的输出项
+ */
+function outputItem(
+  type: string,
+  fileName: string,
+  extra: Partial<{ isEntry: boolean; code: string }> = {},
+): { type: string; fileName: string } & Partial<{ isEntry: boolean; code: string }> {
+  return { type, fileName, ...extra };
+}
+
+describe("单文件产物的输出守卫", () => {
+  it("拒绝多个 chunk：单文件产物不能静默丢掉第二个", () => {
+    const output = [
+      outputItem("chunk", ARTIFACT_FILE, { isEntry: true, code: CHUNK_CODE }),
+      outputItem("chunk", "chunk-abc.js", { isEntry: false, code: CHUNK_CODE }),
+    ];
+    assert.throws(() => singleEntryChunk(output, "entry.ts"), /2 项输出/u);
+  });
+
+  it("拒绝 asset：单文件产物没有落盘 asset 的位置", () => {
+    const output = [
+      outputItem("chunk", ARTIFACT_FILE, { isEntry: true, code: CHUNK_CODE }),
+      outputItem("asset", "x.css"),
+    ];
+    assert.throws(() => singleEntryChunk(output, "entry.ts"), /2 项输出/u);
+  });
+
+  it("拒绝非 entry 的单个 chunk", () => {
+    const output = [outputItem("chunk", "chunk-abc.js", { isEntry: false, code: CHUNK_CODE })];
+    assert.throws(() => singleEntryChunk(output, "entry.ts"), /entry chunk/u);
+  });
+
+  it("接受唯一的 entry chunk", () => {
+    const output = [outputItem("chunk", ARTIFACT_FILE, { isEntry: true, code: CHUNK_CODE })];
+    const chunk = singleEntryChunk(output, "entry.ts");
+    assert.equal(chunk.code, CHUNK_CODE);
   });
 });

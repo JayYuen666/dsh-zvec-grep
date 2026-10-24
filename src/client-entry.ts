@@ -25,6 +25,15 @@ import type { LocaleDictOf } from "@deepseek-ai/dsh-client-ui-slots";
 import type { SlotRegistry } from "@deepseek-ai/dsh-client-ui-renderer/client";
 import { LOCAL_EMBEDDINGS } from "../lib/embedding-catalog.ts";
 import type { LocalEmbeddingBackend } from "../lib/embedding-catalog.ts";
+// 数值区间单源：输入框区间与文案插值引同一份常量（host schema 与 lib/card-logic 同源）。
+import {
+  BUDGET_MAX,
+  DEFAULT_GREP_BUDGET,
+  DEFAULT_UNLOCK_WINDOW_MIN,
+  LIMIT_MAX,
+  LIMIT_MIN,
+  WINDOW_MAX,
+} from "../lib/limits.ts";
 import { diffTouched } from "@jayyuen66/dsh-plugin-shared/lib/card-diff";
 import {
   cardStore,
@@ -62,10 +71,6 @@ const NS: LocaleNs = "zvec-grep";
 const BUNDLE_PKG = "@jayyuen66/dsh-zvec-grep";
 /** 重建轮询间隔（宿主后台进程，2s 足够跟上 zg 的进度输出）。 */
 const REBUILD_POLL_MS = 2000;
-/** 解锁配额/时效的合法上限（与 host Config 的 schema 同范围，输入框与提示共用）。 */
-const BUDGET_MAX = 20;
-const WINDOW_MAX = 240;
-
 const CARD_CSS = [
   ".zgc-card{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:12px;list-style:none;transition:border-color .16s,background .16s}",
   ".zgc-card:hover{border-color:var(--dsw-alias-label-dimmed)}",
@@ -198,7 +203,8 @@ interface CardSlotProps {
   unset: (field: string) => Promise<boolean>;
   /**
    * 宿主重建读面（官方 Remote 的消费侧，见 src/rebuild-reader.ts）。
-   * `undefined` = 当前部署没有远程面：卡片照常渲染，点重建时给出错误。
+   * `undefined` = 连读取器都无从构造（ctx 缺 get 面）：卡片照常渲染，点重建时给出错误。
+   * remote 服务与命名空间的缺席不在这里——读取器在每次调用时现读并给出点名文案。
    */
   rebuildRemote: RebuildReader | undefined;
 }
@@ -258,6 +264,12 @@ interface CardDeps {
   t: Translate;
   fields: CardFields;
   writable: boolean;
+  /**
+   * 正文控件能否改：既要有写权限、又不能有保存条在途。
+   * 保存期间的修改会被 await 回来后的 `setTouched(next)` 整份覆盖掉（`next` 由
+   * 发起保存那一刻的 `touched` 算出），用户看到的字被弹回，且没有任何提示。
+   */
+  editable: boolean;
   /** 重建端点白名单候选（来自 rebuild-roots 引导端点）。 */
   roots: string[];
   /** 守护进程就绪态（同样来自引导端点；undefined = 这一档未知，不显示）。 */
@@ -293,14 +305,14 @@ function rebuildHintText(t: Translate, embedding: string, hasRoots: boolean): st
 
 /** 数值输入的合法区间文案（同上：t() 不进 onChange 的三层嵌套）。 */
 function rangeErrorText(t: Translate, key: "budgetInvalid" | "windowInvalid", max: number): string {
-  return t(key, { min: 1, max });
+  return t(key, { min: LIMIT_MIN, max });
 }
 
 /** embedding <select> 的分组候选（逐层构造，避免 createElement 深层嵌套）。 */
 function buildOptionGroups(
   t: Translate,
   embeddingValue: string,
-  writable: boolean,
+  editable: boolean,
   setField: (field: string, draft: unknown) => void,
 ): ReactNode[] {
   const groups: ReactNode[] = [];
@@ -328,7 +340,7 @@ function buildOptionGroups(
       {
         className: "zgc-select",
         value: embeddingValue,
-        disabled: !writable,
+        disabled: !editable,
         onChange: (ev: { target: { value: string } }) => {
           setField("defaultEmbedding", ev.target.value);
         },
@@ -340,10 +352,10 @@ function buildOptionGroups(
 
 /** embedding 行：本地后端分组的 <select>（候选文本带维度插值）。 */
 function buildEmbeddingRow(deps: CardDeps): ReactNode {
-  const { fields, setField, t, writable } = deps;
+  const { editable, fields, setField, t } = deps;
   const embeddingLabel = createElement("div", { className: "zgc-label" }, t("embeddingLabel"));
   const embeddingHint = createElement("div", { className: "zgc-hint" }, t("embeddingHint"));
-  const embeddingSelects = buildOptionGroups(t, fields.embedding, writable, setField);
+  const embeddingSelects = buildOptionGroups(t, fields.embedding, editable, setField);
   return createElement(
     "div",
     { className: "zgc-row" },
@@ -355,18 +367,24 @@ function buildEmbeddingRow(deps: CardDeps): ReactNode {
 
 /** defaultLimit 行：数字输入，区间判定在 lib/card-logic.ts 的 limitDraftOf。 */
 function buildLimitRow(deps: CardDeps): ReactNode {
-  const { fields, setField, setSaveError, t, writable } = deps;
-  const limitLabel = createElement("div", { className: "zgc-label" }, t("limitLabel"));
+  const { editable, fields, setField, setSaveError, t } = deps;
+  const limitLabel = createElement(
+    "div",
+    { className: "zgc-label" },
+    t("limitLabel", { min: LIMIT_MIN, max: LIMIT_MAX }),
+  );
   const limitInput = createElement("input", {
     className: "zgc-input",
     type: "number",
-    min: 1,
-    max: 50,
+    min: LIMIT_MIN,
+    max: LIMIT_MAX,
     value: fields.limitDisplay,
-    disabled: !writable,
+    disabled: !editable,
     onChange: (ev: { target: { value: string } }) => {
       const draft = limitDraftOf(ev.target.value, t);
-      setSaveError(draft.error);
+      // 钳制提示走同一个保存条位：它不是失败（值已写入草稿），但「越界已被钳到区间」
+      // 不能静默；error 位（真正的失败）优先。
+      setSaveError(draft.error ?? draft.hint);
       if (draft.error === null) {
         setField("defaultLimit", draft.draft);
       }
@@ -377,14 +395,14 @@ function buildLimitRow(deps: CardDeps): ReactNode {
 
 /** hfEndpoint 行：镜像基地址（占位符即 schema 默认的那枚镜像，留空走官方 HF）。 */
 function buildEndpointRow(deps: CardDeps): ReactNode {
-  const { fields, setField, t, writable } = deps;
+  const { editable, fields, setField, t } = deps;
   const endpointLabel = createElement("div", { className: "zgc-label" }, t("endpointLabel"));
   const endpointHint = createElement("div", { className: "zgc-hint" }, t("endpointHint"));
   const endpointInput = createElement("input", {
     className: "zgc-input",
     value: fields.hfEndpoint,
     placeholder: "https://modelscope.cn/models",
-    disabled: !writable,
+    disabled: !editable,
     onChange: (ev: { target: { value: string } }) => {
       setField("hfEndpoint", ev.target.value);
     },
@@ -394,11 +412,11 @@ function buildEndpointRow(deps: CardDeps): ReactNode {
 
 /** enforceSearchFirst 行：整行可点的勾选（只读时光标退回 default，与禁用态一致）。 */
 function buildEnforceRow(deps: CardDeps): ReactNode {
-  const { fields, setField, t, writable } = deps;
+  const { editable, fields, setField, t } = deps;
   const enforceCheckbox = createElement("input", {
     type: "checkbox",
     checked: fields.enforceSearchFirst,
-    disabled: !writable,
+    disabled: !editable,
     onChange: (ev: { target: { checked: boolean } }) => {
       setField("enforceSearchFirst", ev.target.checked);
     },
@@ -411,7 +429,7 @@ function buildEnforceRow(deps: CardDeps): ReactNode {
         display: "flex",
         gap: "8px",
         alignItems: "center",
-        cursor: writable ? "pointer" : "default",
+        cursor: editable ? "pointer" : "default",
       },
     },
     enforceCheckbox,
@@ -431,24 +449,34 @@ interface RangeRowSpec {
   /** 草稿字段名：与 host Config 的 volatile 字段同名。 */
   field: string;
   invalidKey: "budgetInvalid" | "windowInvalid";
-  /** 合法上限（下限恒为 1，与 Config schema 的 min(1) 同一口径）。 */
+  /** 合法上限（下限恒为 LIMIT_MIN，与 Config schema 的 min(1) 同一口径）。 */
   max: number;
+  /** 清空后回退的默认值（文案插值用，与 Config schema 的 .default 同源）。 */
+  default: number;
   /** 输入的显示值：草稿优先（见 draftFields）。 */
   value: string;
 }
 
 /** 配额 / 时效行：区间内落草稿、清空即回「未填」、越界给区间文案并置保存条错误。 */
 function buildRangeRow(deps: CardDeps, spec: RangeRowSpec): ReactNode {
-  const { setField, setSaveError, t, writable } = deps;
-  const label = createElement("div", { className: "zgc-label" }, t(spec.labelKey));
-  const hint = createElement("div", { className: "zgc-hint" }, t(spec.hintKey));
+  const { editable, setField, setSaveError, t } = deps;
+  const label = createElement(
+    "div",
+    { className: "zgc-label" },
+    t(spec.labelKey, { min: LIMIT_MIN, max: spec.max }),
+  );
+  const hint = createElement(
+    "div",
+    { className: "zgc-hint" },
+    t(spec.hintKey, { default: spec.default }),
+  );
   const input = createElement("input", {
     className: "zgc-input",
     type: "number",
-    min: 1,
+    min: LIMIT_MIN,
     max: spec.max,
     value: spec.value,
-    disabled: !writable,
+    disabled: !editable,
     onChange: (ev: { target: { value: string } }) => {
       const { value: raw } = ev.target;
       if (raw === "") {
@@ -561,6 +589,7 @@ function buildCardBody(deps: CardDeps): ReactNode[] {
       field: "grepBudgetPerSearch",
       invalidKey: "budgetInvalid",
       max: BUDGET_MAX,
+      default: DEFAULT_GREP_BUDGET,
       value: fields.grepBudget,
     }),
     buildRangeRow(deps, {
@@ -569,6 +598,7 @@ function buildCardBody(deps: CardDeps): ReactNode[] {
       field: "unlockWindowMin",
       invalidKey: "windowInvalid",
       max: WINDOW_MAX,
+      default: DEFAULT_UNLOCK_WINDOW_MIN,
       value: fields.unlockWindow,
     }),
     createElement(SaveBar, {
@@ -612,7 +642,7 @@ function pushFieldWrite(
   }
 }
 
-/** 读取器缺席时的可行动文案：宿主没装远程面（或网关没挂上这枚命名空间）。 */
+/** 读取器缺席时的可行动文案（只剩 ctx.get 缺席这一档；remote/命名空间的缺席由读取器现抛）。 */
 function requireReader(reader: RebuildReader | undefined, t: Translate): RebuildReader {
   if (reader === undefined) {
     throw new Error(t("rebuildUnavailable"));
@@ -654,6 +684,14 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
   const [access, setAccess] = useState<RebuildAccess>(NO_ACCESS);
   const [rebuild, setRebuild] = useState<RebuildState>({ phase: "idle", output: "" });
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 在途守卫与挂载位：setInterval 不等上一发回来就又触发一次，慢响应下多枚 status
+  // 会同时在飞、按完成先后乱序 setRebuild——后回来的旧结果把 phase 覆写回 running，
+  // 已经到终态的面板于是永远不会停。卸载后也要拒绝再写 state。
+  const pollingRef = useRef(false);
+  const mountedRef = useRef<boolean>(true);
+  // 经函数读：直接写 `mountedRef.current` 时类型检查把它收窄成字面量 `true`（赋值发生在
+  // 另一个闭包里，tsc 看不见），于是「已卸载」这一支会被判成永远为假。
+  const isMounted = (): boolean => mountedRef.current;
 
   function stopPolling(): void {
     if (pollRef.current !== null) {
@@ -663,8 +701,10 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
   }
 
   // 卸载时一定停轮询：卡片关闭后继续 setInterval 会一直打 status。
+  // 挂载位同样在这里落回 false：已经在飞的那一发回来时不许再 setRebuild。
   useEffect(
     () => () => {
+      mountedRef.current = false;
       stopPolling();
     },
     [],
@@ -700,16 +740,28 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
   }, [refreshAccess]);
 
   async function pollStatus(jobId: string): Promise<void> {
+    if (pollingRef.current || !isMounted()) {
+      return;
+    }
+    pollingRef.current = true;
     try {
       const body = await requireReader(reader, t).status(jobId);
+      if (!isMounted()) {
+        return;
+      }
       const poll = parseRebuildPoll(body, t);
       if (poll.phase !== "running") {
         stopPolling();
       }
       setRebuild({ phase: poll.phase, output: poll.output });
     } catch (error) {
+      if (!isMounted()) {
+        return;
+      }
       stopPolling();
       setRebuild({ phase: "error", output: errorText(error) });
+    } finally {
+      pollingRef.current = false;
     }
   }
 
@@ -824,6 +876,7 @@ function ZgCard(props: CardSlotProps): ReactNode {
     t,
     fields,
     writable,
+    editable: writable && !busy,
     roots: rebuildView.roots,
     serverReady: rebuildView.serverReady,
     root: rebuildView.root,
@@ -978,7 +1031,8 @@ function apply(ctx: ClientCtx): void {
   // 函数交给卡片。语言切换由宿主驱动 slot 重渲染，无需重载页面。
   ctx.effect(() => ctx.locale.register(NS, UI_MESSAGES), "zvec-grep-card: locale dictionaries");
   const t = ctx.locale.bind(NS);
-  // 远程读面在 apply 期造一次：`$mount` 幂等（随卡片卸载自动撤），反复轮询只挂一次。
+  // 远程读面的读取器在 apply 期造一次；remote 服务与 $mount 都由读取器在调用时现取
+  // （apply 期它们可能还没注册，见 src/rebuild-reader.ts）。
   const rebuildRemote = createRebuildReader(ctx);
   // 写通道受理位**原样透传**给卡片（消费在 save()：false → saveRejected 且整批保留
   // touched；这里只补字段级 console.error 供排查，rejection 照旧上抛给 save 的
