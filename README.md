@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/v/@jayyuen66/dsh-zvec-grep?style=flat-square&logo=npm&logoColor=white" alt="npm version" /></a>
-  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/dm/@jayyuen66/dsh-zvec-grep?style=flat-square" alt="npm downloads" /></a>
+  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/d18m/@jayyuen66/dsh-zvec-grep?style=flat-square" alt="npm downloads (total)" /></a>
   <a href="https://github.com/JayYuen666/dsh-zvec-grep/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-zvec-grep/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D22.12-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
@@ -114,7 +114,7 @@ If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entr
 
 ## <img src="https://api.iconify.design/lucide/search.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Tools exposed to the model
 
-Output is plain text; timeouts 5 min (search) / 10 min (index) / 60 s (status); stdout capped at 400000 bytes, truncated to the tail with a note. Sandbox runner failure, policy denial and a genuine zg failure are told apart; incomplete results are flagged. A `root` must be a string, and the constructed command is capped in UTF-8 bytes (not code units): a non-string root or an over-long command is refused instead of falling back to the session workspace or hitting the OS argument limit.
+Output is plain text; timeouts 5 min (search) / 10 min (index) / 60 s (status); stdout capped at 400000 bytes, truncated to the tail with a note. Sandbox runner failure, policy denial and a genuine zg failure are told apart; incomplete results are flagged. A `root` must be a string, and the constructed command is capped in UTF-8 bytes (not code units): a non-string root or an over-long command is refused instead of falling back to the session workspace or hitting the OS argument limit. A `limit` outside 1-50 is refused the same way, naming the allowed range - a silently clamped count would read as the truth about this search; omit it for the default.
 
 ### zg_search
 
@@ -255,6 +255,7 @@ A "rebuild workspace" run is one **unowned** job in the host's `ctx.jobs` (`kind
 | --- | --- |
 | grep/rg refused with "no zg_search has run yet" | The search-first gate; run zg_search. Quota spent or expired - re-search with a sharper query to refresh it, no need to disable the plugin. |
 | Search times out | Default `--refresh wait` refreshes synchronously; narrow with globs/fileTypes, lower the limit, or start the daemon - direct mode cold-loads the embedding model on every call, which is why that budget is 5 minutes. |
+| "the zg index lock is held by another operation (ownerOperation: ...)" | The lock holder is not a rebuild (an index refresh is the usual one), and this command does not wait for it - such an operation can run very long, and queueing behind it would be unbounded. Retry later, or query again once it settles; only a rebuild-owned lock waits and retries automatically. zg's original failure text is appended, so you can read which lock it was. |
 | Rebuild refused with "not in the workspace whitelist" | That directory never had a session in this daemon; start one there first, or let the model call zg_index with confirm=true. |
 | Card reports a failed rebuild although zg looks finished | Success is "completed with exit 0" - exit 127 (zg missing) also lands in completed; read the output tail. |
 | A root that was never indexed | zg_search fails loudly; building happens only via zg_index on an explicit request. |

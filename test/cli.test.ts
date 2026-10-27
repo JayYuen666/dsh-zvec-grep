@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   assertAbsoluteRoot,
   resolveRoot,
-  clampLimit,
+  resolveLimit,
   buildSearchCommand,
   buildIndexCommand,
   buildStatusCommand,
@@ -110,30 +110,31 @@ describe("resolveRoot（0.1.5：root 缺省=会话工作区兜底）", () => {
   });
 });
 
-describe("clampLimit", () => {
+describe("resolveLimit", () => {
   it("未定义或 null 回默认 10（省略是合法用法）", () => {
-    assert.equal(clampLimit(undefined, zhMessages), 10);
-    assert.equal(clampLimit(null, zhMessages), 10);
+    assert.equal(resolveLimit(undefined, zhMessages), 10);
+    assert.equal(resolveLimit(null, zhMessages), 10);
   });
 
   it("给了但不是非负整数即抛（不再静默回默认）", () => {
-    assert.throws(() => clampLimit("x", zhMessages), /非负整数/u);
-    assert.throws(() => clampLimit(1.5, zhMessages), /非负整数/u);
-    assert.throws(() => clampLimit(-1, zhMessages), /非负整数/u);
-    assert.throws(() => clampLimit(Number.NaN, zhMessages), /非负整数/u);
+    assert.throws(() => resolveLimit("x", zhMessages), /非负整数/u);
+    assert.throws(() => resolveLimit(1.5, zhMessages), /非负整数/u);
+    assert.throws(() => resolveLimit(-1, zhMessages), /非负整数/u);
+    assert.throws(() => resolveLimit(Number.NaN, zhMessages), /非负整数/u);
   });
 
-  it("越界钳到 [1,50]", () => {
-    assert.equal(clampLimit(0, zhMessages), 1);
-    assert.equal(clampLimit(99, zhMessages), 50);
+  it("越界拒绝并点名区间（不静默钳制：钳过的少结果会被当成事实）", () => {
+    assert.throws(() => resolveLimit(0, zhMessages), /允许范围 1–50/u);
+    assert.throws(() => resolveLimit(51, zhMessages), /允许范围 1–50/u);
+    assert.throws(() => resolveLimit(999, zhMessages), /允许范围 1–50/u);
   });
 
   it("区间内原样", () => {
-    assert.equal(clampLimit(7, zhMessages), 7);
+    assert.equal(resolveLimit(7, zhMessages), 7);
   });
 
   it("自定义回退值", () => {
-    assert.equal(clampLimit(undefined, zhMessages, 20), 20);
+    assert.equal(resolveLimit(undefined, zhMessages, 20), 20);
   });
 });
 

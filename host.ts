@@ -92,7 +92,7 @@ import {
   buildStatusCommand,
   boolOf,
   resolveRoot,
-  clampLimit,
+  resolveLimit,
   requestsBackgroundRefresh,
   DEFAULT_CLIENT_MODE,
   DEFAULT_LIMIT,
@@ -101,6 +101,7 @@ import {
   SYMBOL_TYPE_NAMES,
 } from "./lib/cli.ts";
 import type { BackgroundSupport, ClientMode, IndexArgs, SearchArgs } from "./lib/cli.ts";
+import { BUDGET_MAX, LIMIT_MAX, LIMIT_MIN, WINDOW_MAX } from "./lib/limits.ts";
 import {
   ROUTING_NAME,
   ROUTING_ORDER,
@@ -922,9 +923,19 @@ async function runForegroundOnce(
       return resolved;
     }
     const concurrent = classifyConcurrentFailure(result.stderr.text);
-    throw concurrent?.kind === "lock-busy" && concurrent.rebuild
-      ? new RebuildLockBusyError(failure)
-      : new Error(failure);
+    if (concurrent?.kind === "lock-busy" && concurrent.rebuild) {
+      throw new RebuildLockBusyError(failure);
+    }
+    if (concurrent?.kind === "lock-busy") {
+      // 重建占锁有等待重试；别的占锁方（常见是增量刷新）没有——这类操作可能跑很久，排队
+      // 等于无界挂起。换成点名占锁方的可读错误，原始失败原文随行，不吞证据。
+      throw new Error(
+        `${fill(opts.messages.lockBusyOtherOperation, {
+          op: concurrent.ownerOperation ?? "unknown",
+        })}\n${failure}`,
+      );
+    }
+    throw new Error(failure);
   }
   const notes = successNotes(result, opts.messages, opts.stdoutMaxBytes);
   const { text } = result.stdout;
@@ -1031,10 +1042,9 @@ function assertRootExists(root: string, messages: ZvecGrepMessages): string {
 // 每张卡的值都在 schema 里有 `.default()`，故正常情况下这些 getter 永不为 undefined；
 // 保留 `typeof`/`??` 兜底只针对一个真实退化——条目没有 volatile 投影、宿主交回空引用。
 // 值域（1-50 / 1-20 / 1-240）由 Config schema 保证，越界的最终兜底在 lib/cli.ts。
-
 /**
  * 默认每组结果数：值域 1-50 由 Config schema（隐式命名空间与行 config 共用）保证，
- * 这里只处理「字段缺省」。真正兜住越界的是 cli.clampLimit（命令构造边界）。
+ * 这里只处理「字段缺省」。越界的拒绝在 cli.resolveLimit（命令构造边界），不在此重复。
  */
 function readDefaultLimit(config: Config): number {
   return config.defaultLimit.get() ?? DEFAULT_LIMIT;
@@ -1285,7 +1295,7 @@ function define(host: HostCtx, spec: ToolSpec): void {
  *  （超时三项 + stdout 上限）只走行 config，标 volatile 反而会把它们变成设置卡项。 */
 const configSchema = Schema.object({
   defaultEmbedding: Schema.string().default(DEFAULT_EMBEDDING).volatile(),
-  defaultLimit: Schema.natural().min(1).max(50).default(DEFAULT_LIMIT).volatile(),
+  defaultLimit: Schema.natural().min(LIMIT_MIN).max(LIMIT_MAX).default(DEFAULT_LIMIT).volatile(),
   // ⚠ 这个字面量是**政策**不是占位值：本环境 huggingface.co 不可达，默认必须走
   // ModelScope 镜像（已实测可下载 qwen3）。改成"更通用"的 HF 默认等于让每张新装
   // 的卡在首次 zg_index 上失败。卡片上可改为其它兼容镜像，或留空走官方 HF。
@@ -1295,8 +1305,16 @@ const configSchema = Schema.object({
   enforceSearchFirst: Schema.boolean().default(true).volatile(),
   // 配额+时效解锁：每次成功 zg_search 解锁 N 次 grep/rg、M 分钟内有效；
   // 用尽/过期再拦——保证语义检索频率与 grep 用量成正比，而非一次放行终身豁免。
-  grepBudgetPerSearch: Schema.natural().min(1).max(20).default(DEFAULT_GREP_BUDGET).volatile(),
-  unlockWindowMin: Schema.natural().min(1).max(240).default(DEFAULT_UNLOCK_WINDOW_MIN).volatile(),
+  grepBudgetPerSearch: Schema.natural()
+    .min(LIMIT_MIN)
+    .max(BUDGET_MAX)
+    .default(DEFAULT_GREP_BUDGET)
+    .volatile(),
+  unlockWindowMin: Schema.natural()
+    .min(LIMIT_MIN)
+    .max(WINDOW_MAX)
+    .default(DEFAULT_UNLOCK_WINDOW_MIN)
+    .volatile(),
   // ── 非 volatile 部署值（形态照 ctx-observe 的 fallbackWindow）──
   // 不标 .volatile() ⇒ 不进设置卡（宿主 describe() 只投影 volatile 字段），装载期被
   // cordis 填成普通值交进 apply；cordis.yml 的行 config 是改值入口。默认值与上方常量
@@ -1847,9 +1865,9 @@ async function runSearchTool(
     env: zgEnv(config),
     stdoutMaxBytes: config.stdoutMaxBytes,
     messages,
-    // 命中摘要（仅 search）：limit 用与命令同一 clamp，摘要口径与实际请求一致。
+    // 命中摘要（仅 search）：limit 用与命令同一取值规则（省略回默认、越界拒绝），摘要口径与实际请求一致。
     // 穷举模式的输出没有 `hits:` 计数行，摘要会按「不数就不谎称」自动不出——不必特判。
-    summaryLimit: clampLimit(searchArgs.limit, messages),
+    summaryLimit: resolveLimit(searchArgs.limit, messages),
     // 重建感知：同根正在重建时等它落定后重试一次，而不是把该根的检索通道整个关掉。
     rebuildWait: {
       root: resolvedRoot,

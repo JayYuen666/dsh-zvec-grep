@@ -2,6 +2,21 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.8
+
+### Changed
+
+- **`limit` 越界改成点名拒绝，不再静默钳制**（`lib/cli.ts` 的 `clampLimit` 随之更名 `resolveLimit`）：`0`、`51`、`999` 一律抛错并报出允许区间（新文案 `limitOutOfRange`，中英双语）。静默钳过的值交回的是一个模型读不出的失真——它请求 999 条、实际拿到 50 条，会把「只有 50 处」当成这次检索的事实；拒绝并点名区间，下一轮它自己把数改对。省略与 `null` 照旧回默认值（那是合法用法），非整数、负数、非数字仍按「必须是非负整数」抛。工具参数说明 `limitDescription`（双语）同步写明越出区间直接报错，模型在第一轮就看到拒绝语义、不必先撞一次错误。命中摘要的 `summaryLimit` 与命令构造引同一个函数，摘要口径仍与实际请求一致。
+- **宿主 `configSchema` 的数值区间改引 `lib/limits.ts` 常量**：`defaultLimit` / `grepBudgetPerSearch` / `unlockWindowMin` 三条的 `.min()/.max()` 此前写的是字面量，本轮换成 `LIMIT_MIN` / `LIMIT_MAX` / `BUDGET_MAX` / `WINDOW_MAX`。取值一个都没动，两份 README 里的区间数字照旧。**顺带纠正 0.1.7 那条声明**——它写着「宿主 schema、命令钳制、卡片显示与输入提示引同一份常量」，实际只落到后三者，schema 侧那三份副本是本轮才收的；写超实现的这句没有门能拦，靠读代码发现。
+
+### Added
+
+- **索引锁被非重建操作占用时点名占锁方**（新文案 `lockBusyOtherOperation`，中英双语）：`ZVEC_GREP.ENGINE.LOCK.BUSY` 且 `ownerOperation` 不是 `index.rebuild` 时（增量刷新是常见的那一个），原先交回的只有 zg 的原始失败文本，读者分不清「本命令没等这类操作」和「等过之后仍然失败」。现在把点名占锁方、说明为何不排队（这类操作可能跑很久，排队等于无界挂起）那句话放在前面，zg 的原始失败原文随行——证据不吞。回执里缺 `ownerOperation` 时按 `unknown` 点名，不退成一条裸失败。重建占锁照旧走等待重试，两类占锁方不再共用同一条出口。
+
+### Not changed, deliberately
+
+- **设置卡的数值框仍然钳到边界并在保存条上提示**（`lib/card-logic.ts`），与本条工具侧的拒绝口径不同。人打错一个越界数，钳到边界比让整次保存失败更合人意；模型给的 `limit` 需要的是「这一轮错了」的反馈。两侧读同一组常量，区间不会各说各话。
+
 ## 0.1.7
 
 ### Added

@@ -336,12 +336,14 @@ export function resolveRoot(
 }
 
 /**
- * limit 钳制：省略（undefined/null）回默认；给了但不是非负整数即抛；越界钳到 [LIMIT_MIN, LIMIT_MAX]。
+ * limit 取值：省略（undefined/null）回默认；不是非负整数即抛；越界拒绝并点名区间。
  *
  * 类型只认 number：`Number()` 会把 `true` 折成 1、把 `[]` 折成 0——模型给一个类型错的 limit
- * 就会静默只回一条结果，而它会把「只有一处命中」当成这次检索的事实。
+ * 就会静默只回一条结果，而它会把「只有一处命中」当成这次检索的事实。越界同样拒绝而不是
+ * 钳制：静默钳过的 limit 让模型以为要回了 999 条、实际只看到 50 条，还把「少」当成了事实；
+ * 拒绝并报区间，下一轮它自己改对。
  */
-export function clampLimit(
+export function resolveLimit(
   value: unknown,
   messages: ZvecGrepMessages,
   fallback: number = DEFAULT_LIMIT,
@@ -355,7 +357,10 @@ export function clampLimit(
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new Error(messages.limitInvalid);
   }
-  return Math.min(LIMIT_MAX, Math.max(LIMIT_MIN, value));
+  if (value < LIMIT_MIN || value > LIMIT_MAX) {
+    throw new Error(fill(messages.limitOutOfRange, { min: LIMIT_MIN, max: LIMIT_MAX }));
+  }
+  return value;
 }
 
 /** 检索类数组（queries/fts/vector）取值：条数与单条长度都放宽到 query 档。 */
@@ -525,7 +530,7 @@ function buildIndexedCommand(
   }
   parts.push(
     "--limit",
-    String(clampLimit(args.limit, messages)),
+    String(resolveLimit(args.limit, messages)),
     "--preview",
     previewOf(args.preview, messages),
     "--refresh",
@@ -615,7 +620,7 @@ function buildExhaustiveCommand(
   } else {
     parts.push(shq(pattern));
   }
-  parts.push("--limit", String(clampLimit(args.limit, messages)));
+  parts.push("--limit", String(resolveLimit(args.limit, messages)));
   pushPathFilters(parts, args, messages);
   pushTimeFilters(parts, args, messages);
   parts.push(deviceFlag(args.device, messages), modeFlag(mode));

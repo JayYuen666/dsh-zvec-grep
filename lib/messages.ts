@@ -98,6 +98,8 @@ export interface ZvecGrepMessages {
   readonly rebuildWaitTimeout: string;
   /** 等待同根重建落定期间被取消：`{root}`。*/
   readonly rebuildWaitAborted: string;
+  /** 索引锁被非重建操作占用（常见是增量刷新）：`{op}`（ownerOperation 原文）。 */
+  readonly lockBusyOtherOperation: string;
   /** 该根正在重建时的状态投影：`{root}`、`{jobId}`。*/
   readonly statusRebuilding: string;
   /** `--check-ready` 判出未就绪时的收尾注脚（报告已在上方）：`{root}`、`{detail}`。 */
@@ -247,6 +249,8 @@ export interface ZvecGrepMessages {
   readonly rootRequiredWithFallback: string;
   /** limit 给了但不是非负整数（缺失是合法用法，走默认值）。 */
   readonly limitInvalid: string;
+  /** limit 越出允许区间被拒绝：`{min}`、`{max}`。 */
+  readonly limitOutOfRange: string;
   /** 非字符串数组：`{name}`。 */
   readonly mustBeStringArray: string;
   /** 数组超条数：`{name}`、`{maxItems}`、`{actual}`。 */
@@ -329,7 +333,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     ftsDescription: "词法查询组（如标识符、报错串）",
     vectorDescription: "纯语义查询组",
     fuseDescription: "融合所有组为单一排名",
-    limitDescription: "每组最大条数 1-50，默认 10",
+    limitDescription: "每组最大条数 1-50，默认 10；越出区间直接报错",
     previewDescription:
       "每条命中带的源码片段大小：none 只给锚点行、short 给锚点加一段有界上下文、full 给整段源码。默认 short",
     refreshDescription:
@@ -401,6 +405,8 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "等待 {root} 的重建完成超时（约 {seconds} 秒），重建可能仍在进行；请稍后重试。" +
       "本次不会发放 grep/rg 配额——重建期间索引不可读，先等它结束。",
     rebuildWaitAborted: "等待 {root} 的重建完成时被中止。",
+    lockBusyOtherOperation:
+      "zg 索引锁正被其他操作占用（ownerOperation: {op}），本命令没有等待它结束：这类操作（如索引刷新）可能耗时很久，稍后重试或等它落定后再查",
     statusRebuilding:
       "{root} 正在重建中（作业 {jobId}）。重建期间索引不可读，检索会自动等待它完成后重试。" +
       "如需查看实时输出，请在设置卡的工作区重建面板里观察。此刻即使问「索引是否就绪」也是否定的答案——重建落定后再问。",
@@ -516,6 +522,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     rootIsFsRoot: "root 不能是文件系统根目录 /",
     rootRequiredWithFallback: "root 必填，且为工作区绝对路径（可省略：缺省为当前会话工作区）",
     limitInvalid: "limit 必须是非负整数（省略则用默认值）",
+    limitOutOfRange: "limit 超出允许范围 {min}–{max}（省略则用默认值）",
     mustBeStringArray: "{name} 必须是字符串数组",
     tooManyItems: "{name} 最多 {maxItems} 项（实际 {actual}）",
     nonStringItem: "{name} 含非字符串项（{received}）",
@@ -594,7 +601,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     ftsDescription: "Lexical query groups (identifiers, error strings)",
     vectorDescription: "Purely semantic query groups",
     fuseDescription: "Fuse all groups into a single ranking",
-    limitDescription: "Max hits per group, 1-50, default 10",
+    limitDescription: "Max hits per group, 1-50, default 10; a value outside that range is refused",
     previewDescription:
       "How much source each hit carries: none anchor line only, short anchor plus a bounded context window, full the whole chunk. Default short",
     refreshDescription:
@@ -701,6 +708,8 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "timed out after about {seconds}s waiting for the rebuild of {root}; it may still be running. " +
       "Retry later. No grep/rg quota is granted: the index is unreadable while the rebuild runs.",
     rebuildWaitAborted: "aborted while waiting for the rebuild of {root} to finish",
+    lockBusyOtherOperation:
+      "the zg index lock is held by another operation (ownerOperation: {op}); this command did not wait for it: such operations (e.g. an index refresh) can run very long — retry later, or query again once it settles",
     statusRebuilding:
       "{root} is being rebuilt (job {jobId}). The index is unreadable while the rebuild runs; " +
       "searches wait for it to finish and retry. Watch live output in the settings card rebuild panel. " +
@@ -849,6 +858,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "root is required and must be an absolute workspace path (it may be omitted: defaults to the " +
       "current session workspace)",
     limitInvalid: "limit must be a non-negative integer (omit it to use the default)",
+    limitOutOfRange: "limit is out of the allowed range {min}–{max} (omit it to use the default)",
     mustBeStringArray: "{name} must be an array of strings",
     tooManyItems: "{name} allows at most {maxItems} items (actual {actual})",
     nonStringItem: "{name} contains a non-string item ({received})",

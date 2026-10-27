@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/v/@jayyuen66/dsh-zvec-grep?style=flat-square&logo=npm&logoColor=white" alt="npm version" /></a>
-  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/dm/@jayyuen66/dsh-zvec-grep?style=flat-square" alt="npm downloads" /></a>
+  <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/d18m/@jayyuen66/dsh-zvec-grep?style=flat-square" alt="npm downloads (total)" /></a>
   <a href="https://github.com/JayYuen666/dsh-zvec-grep/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-zvec-grep/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D22.12-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
@@ -114,7 +114,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ## <img src="https://api.iconify.design/lucide/search.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 提供给模型的工具
 
-输出为纯文本；超时 5 分钟（search）/ 10 分钟（index）/ 60 秒（status）；stdout 上限 400000 字节，超限截尾并提示。沙箱 runner 失败、策略拒绝与 zg 自身失败分开归因；结果可能不完整时显式打标。`root` 必须是字符串，构造出的命令按 UTF-8 字节（不是码元）封顶：非字符串的 root 与超长命令直接拒绝，不会回落到会话工作区，也不会撞上内核参数上限。
+输出为纯文本；超时 5 分钟（search）/ 10 分钟（index）/ 60 秒（status）；stdout 上限 400000 字节，超限截尾并提示。沙箱 runner 失败、策略拒绝与 zg 自身失败分开归因；结果可能不完整时显式打标。`root` 必须是字符串，构造出的命令按 UTF-8 字节（不是码元）封顶：非字符串的 root 与超长命令直接拒绝，不会回落到会话工作区，也不会撞上内核参数上限。`limit` 越出 1-50 同样直接拒绝并点名区间，不静默钳制——钳过的少结果会被模型当成这次检索的事实；省略则用默认值。
 
 ### zg_search
 
@@ -255,6 +255,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 | --- | --- |
 | grep/rg 被拒且提示「尚未执行过 zg_search」 | 这是 search-first 门禁，先 zg_search；配额用尽或过期同理，换个更准的 query 重搜续上，不必关插件。 |
 | 检索超时 | 默认 `--refresh wait` 同步刷新索引；用 globs/fileTypes 缩小范围、调小 limit，或起守护进程——直连模式每次冷加载 embedding 模型，那才是预算给到 5 分钟的原因。 |
+| 报错「zg 索引锁正被其他操作占用（ownerOperation: …）」 | 占锁方不是重建（常见是增量刷新），这一条命令不为它等待——那类操作可能跑很久，排队等于无界挂起。稍后重试，或等它落定后再查；只有重建占锁走自动等待重试。zg 的原始失败文本随行，可核对是哪一把锁。 |
 | 重建被拒「root 不在观测白名单内」 | 该目录从未在本 daemon 开过会话；先在那里起会话，或让模型带 confirm=true 调 zg_index。 |
 | 卡片显示重建失败而 zg 看着像跑完了 | 成功判据是 completed 且 exit 0——exit 127（zg 没装）也落在 completed，看输出尾部。 |
 | 从未建索引的 root | zg_search 明确报错；建索引只在明确请求时由 zg_index 做。 |

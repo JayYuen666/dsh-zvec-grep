@@ -4492,15 +4492,15 @@ function makeIndexedTemp(): string {
   return dir;
 }
 
-/** zg 重建持锁时的一次失败执行（锁名、操作名、进程号都按实测抄）。 */
-function lockBusyRun(ownerOperation = "index.rebuild"): ShellRunResult {
+/** zg 重建持锁时的一次失败执行（锁名、操作名、进程号都按实测抄；ownerOperation 可缺）。 */
+function lockBusyRun(ownerOperation: string | null = "index.rebuild"): ShellRunResult {
   const stderr = [
     "Error: Index unavailable",
     "Code: ZVEC_GREP.ENGINE.LOCK.BUSY",
     "Details:",
     "  lock: /ws/.zvec-grep/locks/home.write",
     "  operation: info",
-    `  ownerOperation: ${ownerOperation}`,
+    ...(ownerOperation === null ? [] : [`  ownerOperation: ${ownerOperation}`]),
     "  ownerPid: 14962",
   ].join("\n");
   return {
@@ -5378,6 +5378,36 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
     await assert.rejects(
       () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
       /索引不可用|Index unavailable|exit/iu,
+    );
+  });
+
+  it("占锁方是刷新之类的非重建操作：点名锁被谁占，原始失败原文随行", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    await rebuildInFlight(ctx, root);
+    ctx.shell.runResults.push(lockBusyRun("context.refresh"));
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      (error: unknown) => {
+        const text = (error as Error).message;
+        assert.match(text, /正被其他操作占用/u);
+        assert.match(text, /ownerOperation: context\.refresh/u);
+        assert.match(text, /LOCK\.BUSY/u, "原始失败原文必须随行，不吞证据");
+        return true;
+      },
+    );
+  });
+
+  it("锁忙回执缺 ownerOperation：占锁方按 unknown 点名，不退回裸失败", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws();
+    await rebuildInFlight(ctx, root);
+    ctx.shell.runResults.push(lockBusyRun(null));
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /ownerOperation: unknown[\s\S]*LOCK\.BUSY/u,
     );
   });
 
