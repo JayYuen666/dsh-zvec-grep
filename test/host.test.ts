@@ -5516,7 +5516,7 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
     ctx.shell.runResults.push(lockBusyRun());
     await assert.rejects(
       () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
-      /重建/iu,
+      /重建/u,
     );
     await started.release();
   });

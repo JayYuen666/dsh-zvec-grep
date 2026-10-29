@@ -26,8 +26,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import { Context as CordisContext } from "@deepseek-ai/cordis";
+import { SessionStore } from "@deepseek-ai/dsh-session";
+import { SessionProjectionRegistry } from "@deepseek-ai/dsh-session-projection";
 import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 import { ToolRuntime } from "@deepseek-ai/dsh-tools";
+import type { ToolBatchInput } from "@deepseek-ai/dsh-tools";
+import {
+  apply as applyNativeExecutor,
+  inject as nativeExecutorInject,
+} from "@deepseek-ai/dsh-tool-executor-native";
+import { ToolCallId as brandToolCallId } from "@deepseek-ai/dsh-llm/brand";
 import { ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
 import { LocalSubprocessRuntime } from "@deepseek-ai/dsh-subprocess-local";
@@ -80,9 +88,13 @@ export class StubSettings {
 }
 
 /** 一枚会话替身：只带本包真正读的 `agent.session.header.cwd`（与 dsh-tool-fs-search 同模式）。 */
-function agentOf(cwd: string, id = "sess-1"): unknown {
-  return { session: { id, header: { cwd } } };
+function agentOf(cwd: string, id = "sess-1"): BatchAgent {
+  // 本包只读 session.header.cwd；给的是官方 Agent 的最小投影，不是完整实现。
+  return { session: { id, header: { cwd } } } as unknown as BatchAgent;
 }
+
+/** 官方批次里可选的 Agent 位（本包只读它的 session.header.cwd，用最小投影即可）。 */
+type BatchAgent = NonNullable<ToolBatchInput["agent"]>;
 
 /** 工具交回的模型可见文本（render 之后的 content 文本块拼接）。 */
 function textOf(outcome: ToolOutcome): string {
@@ -118,6 +130,9 @@ export async function startHost(
   };
   await load(SystemPrompt);
   await load(ToolRuntime);
+  // alpha.2 起批次交给组合里显式提供的执行器；不装这一枚，`tools.execute` 直接以
+  // TOOL_EXECUTOR_UNAVAILABLE 拒绝。用的是官方原生执行器，不在台架里复述它的实现。
+  await load({ inject: nativeExecutorInject, apply: applyNativeExecutor });
   const settings = new StubSettings(ctx);
   if (options.locale !== undefined) {
     // 官方 locale 偏好（host.ts 的 createLocaleMessages 跨命名空间读的那一行）。
@@ -126,6 +141,11 @@ export async function startHost(
   if (options.settings !== false) {
     ctx.provide("settings", settings);
   }
+  // 官方 ApprovalService 的 `static inject = ["sessionProjections"]`：alpha.2 起它要把
+  // 每次问/答写进会话日志，投影注册表不在位时整条 fiber 不激活，`ctx.get("approval")`
+  // 读不到 ⇒ 管线的 ask 静默降级成拒绝。会话与投影都用官方件，不在台架里造替身。
+  await load(SessionStore);
+  await load(SessionProjectionRegistry);
   if (options.approval === true) {
     await load(ApprovalService, { policy: "never" });
   }
@@ -174,17 +194,29 @@ export async function startHost(
   // （卸载/tool 超时都会 abort）。就地解构丢弃 controller 会让这条通道永远是死线，
   // 于是「卸载后仍在飞的那一发被取消」这件事在台架里根本测不出来。
   const callSignals: AbortController[] = [];
-  const call = async (name: string, args: unknown, agent?: unknown): Promise<ToolOutcome> => {
+  const call = async (name: string, args: unknown, agent?: BatchAgent): Promise<ToolOutcome> => {
     const controller = new AbortController();
     callSignals.push(controller);
     const { signal } = controller;
-    return (ctx.tools as unknown as { execute: (input: unknown) => Promise<ToolOutcome> }).execute({
+    // alpha.2 的 `tools.execute` 吃批次：单发也包成一条 `calls`，再把唯一那条结果拆回来。
+    // `arguments` 是模型产出的原始 JSON 串，不是已解析对象。
+    const batch = await ctx.tools.execute({
+      calls: [
+        {
+          type: "tool-call",
+          id: brandToolCallId(`call-${Math.random().toString(36).slice(2, 8)}`),
+          name,
+          arguments: JSON.stringify(args),
+        },
+      ],
       signal,
-      callId: `call-${Math.random().toString(36).slice(2, 8)}`,
-      name,
-      arguments: args,
       ...(agent === undefined ? {} : { agent }),
     });
+    const [only] = batch.results;
+    if (only === undefined) {
+      throw new Error(`tools.execute 对单发调用没有交回结果：${name}`);
+    }
+    return only.result;
   };
   const abortAll = (): void => {
     for (const controller of callSignals.splice(0)) {
@@ -236,8 +268,8 @@ export interface Host {
   /** 真实 HTTP 监听端口（webServer 绑 127.0.0.1:0）。 */
   port: number;
   spillDir: string;
-  agentOf: (cwd: string, id?: string) => unknown;
-  call: (name: string, args: unknown, agent?: unknown) => Promise<ToolOutcome>;
+  agentOf: (cwd: string, id?: string) => BatchAgent;
+  call: (name: string, args: unknown, agent?: BatchAgent) => Promise<ToolOutcome>;
   textOf: (outcome: ToolOutcome) => string;
   patchApproval: (outcome: "allowed-once" | "rejected" | "unavailable") => unknown[];
   /** 只卸载本插件（模拟宿主重载那一行）；在册的调用信号随之 abort，不等同于 dispose 整台宿主。 */

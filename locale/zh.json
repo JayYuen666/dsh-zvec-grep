@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Zvec 索引检索",
+    "description": "用本地索引检索工作区，替代裸 grep，并可要求先走索引检索再允许直查。",
+    "detail": "docs/DETAIL.zh.md"
+  }
+}

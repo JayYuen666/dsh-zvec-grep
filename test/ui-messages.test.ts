@@ -7,7 +7,7 @@ import type { UiMessages } from "../src/ui-messages.ts";
 
 /** 模板里的 {占位符} 名字集合：只认花括号包住的词（英文整条文案里的裸词，如 "Save"，不是占位符）。 */
 function placeholders(template: string): Set<string> {
-  return new Set([...template.matchAll(/(?<=\{)\w+(?=\})/gu)].map((found) => found[0]));
+  return new Set(Array.from(template.matchAll(/(?<=\{)\w+(?=\})/gu), (found) => found[0]));
 }
 
 const KEYS = Object.keys(UI_MESSAGES.zh) as (keyof UiMessages)[];

@@ -4,6 +4,7 @@
 // 从那里直接取用——用例逐条照旧，只是 import 跟着拆分走（断言一字未改）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
+import { Context } from "@deepseek-ai/cordis";
 import {
   ROUTING_NAME,
   ROUTING_ORDER,
@@ -364,6 +365,8 @@ const agent = (id: string, cwd: string): { session: { id: string; header: { cwd:
 
 describe("searchFirstGuard", () => {
   const INDEXED = "/repo";
+  /** 一条会被门禁拦的检索命令（多处用例共用，避免同一字面量散落）。 */
+  const RG_SRC = "rg foo src";
   const NOW = 1_000_000_000;
   // looked = 查表用到的索引根；consumed = 每次扣减后的余量（宿主同款副作用）。
   const makeDeps = (
@@ -432,6 +435,78 @@ describe("searchFirstGuard", () => {
     );
   });
 
+  it("步骤准入里没有 zg_search ⇒ 不强迫先调它（放行 grep）", () => {
+    const { deps } = makeDeps();
+    // 只有 bash 的准入：模型本步骤根本调不动 zg_search，拦下来只会把它堵死。
+    const toolSet = {
+      dispose: (): void => {
+        void 0;
+      },
+      view: () => new Map<string, never>([["bash", {} as never]]),
+    };
+    assert.equal(
+      searchFirstGuard(
+        {
+          name: "bash",
+          arguments: { command: RG_SRC },
+          agent: agent("s1", INDEXED),
+          toolSet,
+        },
+        deps,
+        zhMessages,
+      ),
+      undefined,
+    );
+  });
+
+  it("步骤准入里有 zg_search ⇒ 照旧拦（未解锁时）", () => {
+    const { deps } = makeDeps();
+    const toolSet = {
+      dispose: (): void => {
+        void 0;
+      },
+      view: () => new Map<string, never>([["zg_search", {} as never]]),
+    };
+    const reason = searchFirstGuard(
+      {
+        name: "bash",
+        arguments: { command: RG_SRC },
+        agent: agent("s1", INDEXED),
+        toolSet,
+      },
+      deps,
+      zhMessages,
+    );
+    assert.ok(reason !== undefined, "准入允许调用时判据不变");
+  });
+
+  it("准入视图按 Agent 作用域查：受限子代理的拒绝在该视图里显形", () => {
+    const { deps } = makeDeps();
+    const scopes: unknown[] = [];
+    const ctx = new Context();
+    const toolSet = {
+      dispose: (): void => {
+        void 0;
+      },
+      view: (scope: unknown) => {
+        scopes.push(scope);
+        return new Map<string, never>();
+      },
+    };
+    const reason = searchFirstGuard(
+      {
+        name: "bash",
+        arguments: { command: RG_SRC },
+        agent: { session: { id: "s1", header: { cwd: INDEXED } }, ctx },
+        toolSet,
+      },
+      deps,
+      zhMessages,
+    );
+    assert.equal(reason, undefined, "该作用域不允许 zg_search → 放行");
+    assert.equal(scopes.length, 1, "查了一次准入视图");
+  });
+
   it("bash 非 grep 命令放行", () => {
     const { deps } = makeDeps();
     assert.equal(
@@ -447,7 +522,7 @@ describe("searchFirstGuard", () => {
   it("bash grep + 有索引 + 无解锁（从未 zg_search）→ 拒绝，消息含出路与状态", () => {
     const { deps } = makeDeps();
     const reason = searchFirstGuard(
-      { name: "bash", arguments: { command: "rg foo src" }, agent: agent("s1", INDEXED) },
+      { name: "bash", arguments: { command: RG_SRC }, agent: agent("s1", INDEXED) },
       deps,
       zhMessages,
     );

@@ -348,8 +348,11 @@ function pruneRebuildHistory(jobs: JobsService, records: Map<string, RebuildReco
  * 为什么单独认这一条：它是本包唯一会把宿主英文原话插进中文卡片的错误，又恰恰最该翻成
  * 人话的那一条——用户此时要做的是去 job_list 里收掉不需要的作业，而不是读一句英文。
  */
+/** 远端容量上限的括号形态。 */
+const CAPACITY_LIMIT = /\(limit: (?<limit>\d+)\)/u;
+
 function capacityLimitOf(error: unknown): string | undefined {
-  const matched = /\(limit: (?<limit>\d+)\)/u.exec(errorText(error));
+  const matched = CAPACITY_LIMIT.exec(errorText(error));
   return matched?.groups?.["limit"];
 }
 

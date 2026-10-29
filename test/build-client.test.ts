@@ -6,6 +6,7 @@ import vm from "node:vm";
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { z } from "zod";
 import { buildClient, singleEntryChunk } from "../build-client.mjs";
 import { declareClientFreshness } from "./client-freshness.ts";
 import { declareSchemaCoverage } from "./schema-coverage.ts";
@@ -77,7 +78,8 @@ function profileBundleName(): string {
 /** 本包 cordis.patch.yml 声明的裸条目 id（= 0.1.7 的 settings 命名空间）。 */
 function patchEntryIds(): string[] {
   const patch = readFileSync(path.join(PKG_DIR, "cordis.patch.yml"), "utf8");
-  return [...patch.matchAll(/^\s*(?:-\s+)?id:\s*(?<id>\S+)\s*$/gmu)].map(
+  return Array.from(
+    patch.matchAll(/^\s*(?:-\s+)?id:\s*(?<id>\S+)\s*$/gmu),
     (row) => row.groups?.["id"] ?? "",
   );
 }
@@ -353,8 +355,8 @@ describe("buildClient()", () => {
 
   it("两语 UI 字典都进产物（卡片侧双语不靠运行时拉取）", async () => {
     const out = await buildClient();
-    assert.ok(out.includes(UI_MESSAGES.zh.cardDescription), "中文那份在产物里");
-    assert.ok(out.includes(UI_MESSAGES.en.cardDescription), "英文那份在产物里");
+    assert.ok(out.includes(UI_MESSAGES.zh.embeddingHint), "中文那份在产物里");
+    assert.ok(out.includes(UI_MESSAGES.en.embeddingHint), "英文那份在产物里");
     assert.ok(
       out.includes("locale.register") || out.includes(".register("),
       "官方 locale 注册面在产物里",
@@ -416,6 +418,9 @@ async function loadClientExports(): Promise<{
   const mod = loaded.factory((name: string) => {
     if (name === "react") {
       return fakeReact;
+    }
+    if (name === "zod") {
+      return { z };
     }
     throw new Error(`unexpected require in client factory: ${name}`);
   });
@@ -577,8 +582,8 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
       "两语字典都注册到官方 locale（ns 即设置命名空间），且只注册一次——官方类型化重载" +
         "要求一次交齐全部内置 locale",
     );
-    assert.equal(dicts[0]?.dicts.zh.cardTitle, UI_MESSAGES.zh.cardTitle);
-    assert.equal(dicts[0].dicts.en.cardTitle, UI_MESSAGES.en.cardTitle);
+    assert.equal(dicts[0]?.dicts.zh.embeddingLabel, UI_MESSAGES.zh.embeddingLabel);
+    assert.equal(dicts[0].dicts.en.embeddingLabel, UI_MESSAGES.en.embeddingLabel);
     assert.equal(typeof dispose, "function", "注册可回收（随 effect 卸载）");
     dispose?.();
     assert.deepEqual(dicts, [], "一个 disposer 撤掉这一次调用登记的两语");
@@ -587,9 +592,9 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
     // 这里显式回广成声明类型再取 inject payload。
     const injected = host.payload as Record<string, unknown> | null;
     const t = injected?.["t"] as Translate;
-    assert.equal(t("cardTitle"), UI_MESSAGES.zh.cardTitle, "中文那份");
+    assert.equal(t("embeddingLabel"), UI_MESSAGES.zh.embeddingLabel, "中文那份");
     language.active = "en";
-    assert.equal(t("cardTitle"), UI_MESSAGES.en.cardTitle, "切语言不必重挂卡片");
+    assert.equal(t("embeddingLabel"), UI_MESSAGES.en.embeddingLabel, "切语言不必重挂卡片");
   });
 });
 

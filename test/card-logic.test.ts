@@ -267,6 +267,9 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
       draftFields({ grepBudgetPerSearch: Number.POSITIVE_INFINITY }, {}).grepBudget,
       "3",
     );
+    // 缺 scheme / 别家协议的端点不是可显示 URL，回落空串（host 侧也不会拿它去拼命令）
+    assert.equal(draftFields({ hfEndpoint: "modelscope.cn/models" }, {}).hfEndpoint, "");
+    assert.equal(draftFields({ hfEndpoint: "ftp://mirror.example" }, {}).hfEndpoint, "");
   });
 
   it("defaultLimit 清空（草稿显式 undefined）显示空串，而非默认文案", () => {
@@ -439,6 +442,12 @@ describe("parseRebuildPoll（completed 且 exit 0 才算成功）", () => {
     assert.equal(poll.output.includes("重建进程退出码"), false, "failed 没有退出码可读");
   });
 
+  it("非对象载荷 → 按未知态兜底（schema 拒收，走 safeParse 的失败支）", () => {
+    // 运行时可能送来 null / 数组（HTTP 载荷被换过）；函数签名只约束编译期。
+    assert.equal(parseRebuildPoll(null as unknown as Record<string, unknown>, tZh).phase, "error");
+    assert.equal(parseRebuildPoll([] as unknown as Record<string, unknown>, tZh).phase, "error");
+  });
+
   it("未知 status（含缺省）→ error", () => {
     assert.equal(parseRebuildPoll({ status: "pending" }, tZh).phase, "error");
     assert.equal(parseRebuildPoll({}, tZh).phase, "error");
@@ -447,6 +456,8 @@ describe("parseRebuildPoll（completed 且 exit 0 才算成功）", () => {
       parseRebuildPoll({ status: "pending", output: 42 }, tZh).output.includes("42"),
       false,
     );
+    // status 非字符串同样按未知态处理
+    assert.equal(parseRebuildPoll({ status: 42 }, tZh).phase, "error");
   });
 
   it("退出码只在确是有限数字时展示；缺失/畸形回落到通用失败文案", () => {

@@ -157,6 +157,9 @@ import {
   zgEnv,
 } from "./lib/zg-config.ts";
 
+/** 纯数字计数行。 */
+const DIGITS_ONLY = /^\d+$/u;
+
 // 设置命名空间不再由本包声明：0.1.7 隐式注册取 profile 条目 id（`zvec-grep`，
 // 见 cordis.patch.yml 的 `- id:`），与本包卡片用的 namespace 同一个串。
 // 检索默认带 --refresh wait（官方故障排查页对"改动搜不到"的推荐解法）。
@@ -847,7 +850,7 @@ export function hitSummary(
   const perGroup = lines
     .filter((line) => line.startsWith(HITS_LINE_PREFIX))
     .map((line) => line.slice(HITS_LINE_PREFIX.length))
-    .filter((digits) => /^\d+$/u.test(digits))
+    .filter((digits) => DIGITS_ONLY.test(digits))
     .map((digits) => Math.trunc(Number(digits)));
   if (perGroup.length === 0) {
     return null;

@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Zvec indexed search",
+    "description": "Searches the workspace with a local index instead of raw grep, and gates plain grep behind an indexed search.",
+    "detail": "docs/DETAIL.md"
+  }
+}

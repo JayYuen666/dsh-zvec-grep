@@ -17,6 +17,9 @@
 import { normalizeAbsolutePath } from "./cli.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
 
+/** 根目录末尾斜杠。 */
+const TRAILING_SLASHES = /\/+$/u;
+
 const GREP_COMMAND_NAMES = new Set(["grep", "egrep", "fgrep", "rg"]);
 /** 含这些旗标的命令会立即打印并退出（--help/--version/-V），不产生检索。 */
 const PROBE_FLAGS = new Set(["--help", "--version", "-V"]);
@@ -70,7 +73,7 @@ const VALUE_TAKING_FLAGS = new Set([
   "--user",
 ]);
 /** 命令前的壳层赋值（`VAR=1 grep x` 里的 `VAR=1`）：它自己不是命令，其后仍是命令位。 */
-const SHELL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/u;
+const SHELL_ASSIGNMENT = /^[A-Za-z_]\w*=/u;
 /** 包装命令的裸数值参数（`timeout 5 rg` 的 `5`）：也不是被执行的命令。 */
 const BARE_NUMBER = /^\d+$/u;
 /** 结束一个 token、但**不**开启新命令位的字符（空白、右括号、重定向）。 */
@@ -285,7 +288,7 @@ export function isGrepRgCommand(command: string): boolean {
  * 失败形态是 fail-fast 而不是静默漂移。要真正支持 Windows，得连上面那三处判据一起改。
  */
 export function normalizeRoot(root: string): string {
-  const trimmed = root.replace(/\/+$/u, "");
+  const trimmed = root.replace(TRAILING_SLASHES, "");
   return trimmed.length > 0 ? trimmed : "/";
 }
 

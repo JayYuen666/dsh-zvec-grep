@@ -19,6 +19,7 @@
 
 import { createElement, useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { z } from "zod";
 import type { Context } from "@deepseek-ai/cordis";
 import type { BuiltInLocaleId } from "@deepseek-ai/dsh-client-locale/client";
 import type { LocaleDictOf } from "@deepseek-ai/dsh-client-ui-slots";
@@ -36,10 +37,25 @@ import {
 } from "../lib/limits.ts";
 import { diffTouched } from "@jayyuen66/dsh-plugin-shared/lib/card-diff";
 import {
+  CARD_UI_CSS,
+  CardForm,
+  Field,
+  NumberField,
+  SaveBar,
+  Section,
+  SelectField,
+  TextField,
+  ToggleField,
+  splitHint,
+} from "@jayyuen66/dsh-plugin-shared/lib/card-ui";
+import type { SelectOption } from "@jayyuen66/dsh-plugin-shared/lib/card-ui";
+import {
+  BUDGET_SCHEMA,
+  LIMIT_SCHEMA,
+  WINDOW_SCHEMA,
   cardStore,
   daemonNoteKey,
   draftFields,
-  limitDraftOf,
   parseRebuildPoll,
 } from "../lib/card-logic.ts";
 import type { CardFields, CardSnapshot, SettingScope } from "../lib/card-logic.ts";
@@ -72,43 +88,12 @@ const BUNDLE_PKG = "@jayyuen66/dsh-zvec-grep";
 /** 重建轮询间隔（宿主后台进程，2s 足够跟上 zg 的进度输出）。 */
 const REBUILD_POLL_MS = 2000;
 const CARD_CSS = [
-  ".zgc-card{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:12px;list-style:none;transition:border-color .16s,background .16s}",
-  ".zgc-card:hover{border-color:var(--dsw-alias-label-dimmed)}",
-  ".zgc-card-open{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-label-dimmed)}",
-  ".zgc-card-header{appearance:none;width:100%;font:inherit;color:inherit;text-align:left;cursor:pointer;background:transparent;border:0;border-radius:12px;align-items:center;gap:12px;padding:14px 16px;display:flex}",
-  ".zgc-card-header:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}",
-  ".zgc-card-head{flex-direction:column;flex:1;gap:4px;min-width:0;display:flex}",
-  ".zgc-card-name{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:600;line-height:1.4}",
-  ".zgc-card-desc{color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:1.5}",
-  ".zgc-card-chevron{color:var(--dsw-alias-label-tertiary);flex:none;transition:transform .16s}",
-  ".zgc-card-chevron-open{transform:rotate(180deg)}",
-  ".zgc-card-body{border-top:1px solid var(--dsw-alias-border-l2);margin:0 16px;padding:8px 0 12px}",
-  ".zgc-row{display:flex;flex-direction:column;gap:6px;padding:9px 0}",
-  ".zgc-label{font-size:13px;color:var(--dsw-alias-label-primary,inherit)}",
-  ".zgc-hint{font-size:12px;color:var(--dsw-alias-label-tertiary,#8a8f99)}",
-  ".zgc-select{width:100%;font:inherit;font-size:13px;color:var(--dsw-alias-label-primary,inherit);background:var(--dsw-alias-fill-primary,transparent);border:1px solid var(--dsw-alias-border-l3,#d8dbe2);border-radius:6px;padding:6px 8px;box-sizing:border-box}",
-  ".zgc-input{width:100%;font:inherit;font-size:13px;color:var(--dsw-alias-label-primary,inherit);background:var(--dsw-alias-fill-primary,transparent);border:1px solid var(--dsw-alias-border-l3,#d8dbe2);border-radius:6px;padding:6px 8px;box-sizing:border-box}",
-  ".zgc-button{appearance:none;border:1px solid var(--dsw-alias-brand-primary,#2f6fed);color:var(--dsw-alias-brand-primary,#2f6fed);background:transparent;border-radius:6px;padding:5px 12px;font:inherit;font-size:13px;cursor:pointer}",
-  ".zgc-button:hover:not(:disabled){background:var(--dsw-alias-fill-secondary,rgba(0,0,0,.05))}",
-  ".zgc-button:disabled{opacity:.5;cursor:progress}",
-  ".zgc-output{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;background:var(--dsw-alias-fill-primary,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px}",
-  ".zgc-error{font-size:12px;color:var(--dsw-alias-text-danger,#d33)}",
-  // 保存条（改动先暂存，点「保存」才写入生效；「撤销」丢弃本地改动）
-  ".zgc-savebar{display:flex;gap:8px;align-items:center;padding:10px 0 2px;border-top:1px dashed var(--dsw-alias-border-l2);margin-top:6px;flex-wrap:wrap}",
-  ".zgc-btn-primary{appearance:none;border:1px solid var(--dsw-alias-brand-primary,#2f6fed);background:var(--dsw-alias-brand-primary,#2f6fed);color:var(--dsw-alias-label-primary-foreground,#fff);border-radius:6px;padding:5px 12px;font:inherit;font-size:13px;cursor:pointer}",
-  ".zgc-btn-plain{appearance:none;border:1px solid var(--dsw-alias-border-l2,#d8dbe2);background:transparent;color:var(--dsw-alias-label-primary,inherit);border-radius:6px;padding:5px 12px;font:inherit;font-size:13px;cursor:pointer}",
-  ".zgc-button:focus-visible,.zgc-btn-primary:focus-visible,.zgc-btn-plain:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#2f6fed);outline-offset:1px}",
-  ".zgc-btn-primary:hover:not(:disabled){filter:brightness(.96)}",
-  ".zgc-btn-plain:hover:not(:disabled){background:var(--dsw-alias-fill-secondary,rgba(0,0,0,.05))}",
-  ".zgc-btn-primary:disabled,.zgc-btn-plain:disabled{opacity:.5;cursor:not-allowed}",
-  ".zgc-dirty{font-size:12px;color:var(--dsw-alias-label-tertiary,#8a8f99)}",
-  ".zgc-saveerr{font-size:12px;color:var(--dsw-alias-text-danger,#d33)}",
+  ".zgc-rebuildInput{flex:1 1 240px;min-width:0}",
+  ".zgc-output{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;background:var(--dsw-alias-fill-primary,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px;margin-top:8px}",
+  ".zgc-error{font-size:12px;color:var(--dsw-alias-text-danger,#d33);margin-top:8px}",
 ].join("\n");
 
 const BACKENDS: readonly LocalEmbeddingBackend[] = ["llama-cpp", "transformers-js", "model2vec"];
-
-/** SVG path 的 data 属性键（id-length 豁免需经变量计算键表达，oxfmt 不解引号）。 */
-const PATH_DATA_KEY = "d";
 
 /** 重建 root 输入框的候选列表 id（与 <datalist> 配对）。 */
 const ROOT_OPTIONS_ID = "zgc-rebuild-root-options";
@@ -124,61 +109,6 @@ const BACKEND_LABEL_KEY: Record<LocalEmbeddingBackend, keyof UiMessages> = {
  *  独立函数保持字面量 `snap.value`（build-client.test 内容契约锁定该形态）。 */
 function snapshotValue(snap: CardSnapshot): Record<string, unknown> {
   return snap.value;
-}
-
-interface PluginCardProps {
-  title: string;
-  description: string;
-  children?: ReactNode;
-}
-
-function PluginCard(props: PluginCardProps): ReactNode {
-  const { title, description, children } = props;
-  const [open, setOpen] = useState(false);
-  const headInner = createElement(
-    "span",
-    { className: "zgc-card-head" },
-    createElement("span", { className: "zgc-card-name" }, title),
-    createElement("span", { className: "zgc-card-desc" }, description),
-  );
-  const chevron = createElement(
-    "svg",
-    {
-      width: 14,
-      height: 14,
-      viewBox: "0 0 14 14",
-      "aria-hidden": true,
-      className: open ? "zgc-card-chevron zgc-card-chevron-open" : "zgc-card-chevron",
-    },
-    createElement("path", {
-      [PATH_DATA_KEY]: "M3 5l4 4 4-4",
-      fill: "none",
-      stroke: "currentColor",
-      strokeWidth: 1.5,
-      strokeLinecap: "round",
-      strokeLinejoin: "round",
-    }),
-  );
-  const header = createElement(
-    "button",
-    {
-      type: "button",
-      className: "zgc-card-header",
-      "aria-expanded": open,
-      onClick: () => {
-        setOpen(!open);
-      },
-    },
-    headInner,
-    chevron,
-  );
-  const body = open ? createElement("div", { className: "zgc-card-body" }, children) : null;
-  return createElement(
-    "li",
-    { className: open ? "zgc-card zgc-card-open" : "zgc-card" },
-    header,
-    body,
-  );
 }
 
 interface RebuildState {
@@ -209,55 +139,6 @@ interface CardSlotProps {
   rebuildRemote: RebuildReader | undefined;
 }
 
-/** 保存条（全自研插件统一）。 */
-function SaveBar(props: {
-  dirty: boolean;
-  writable: boolean;
-  busy: boolean;
-  error: string | null;
-  t: Translate;
-  onSave: () => void;
-  onDiscard: () => void;
-}): ReactNode {
-  const { t } = props;
-  const disabled = !props.writable || props.busy;
-  const saveBtn = createElement(
-    "button",
-    {
-      type: "button",
-      className: "zgc-btn-primary",
-      "data-field": "save",
-      disabled: disabled || !props.dirty,
-      onClick: props.onSave,
-    },
-    props.busy ? t("saving") : t("save"),
-  );
-  const discardBtn = createElement(
-    "button",
-    {
-      type: "button",
-      className: "zgc-btn-plain",
-      "data-field": "discard",
-      disabled: disabled || !props.dirty,
-      onClick: props.onDiscard,
-    },
-    t("revert"),
-  );
-  let statusNode: ReactNode;
-  if (props.error !== null) {
-    statusNode = createElement("span", { className: "zgc-saveerr" }, props.error);
-  } else if (props.writable) {
-    statusNode = createElement(
-      "span",
-      { className: "zgc-dirty" },
-      props.dirty ? t("statusDirty") : t("statusClean"),
-    );
-  } else {
-    statusNode = createElement("span", { className: "zgc-dirty" }, t("statusReadOnly"));
-  }
-  return createElement("div", { className: "zgc-savebar" }, saveBtn, discardBtn, statusNode);
-}
-
 /** ZgCard 主体所依赖的派生值 + 回调（供 buildCardBody 使用，规避过大函数体）。 */
 interface CardDeps {
   /** 取文案（官方 ctx.locale.bind 的结果）。 */
@@ -277,6 +158,8 @@ interface CardDeps {
   root: string;
   rebuild: RebuildState;
   dirty: boolean;
+  /** 本次待保存的字段条数（保存条上的「已修改 N 项」）。 */
+  dirtyCount: number;
   busy: boolean;
   saveError: string | null;
   setField: (field: string, draft: unknown) => void;
@@ -303,212 +186,68 @@ function rebuildHintText(t: Translate, embedding: string, hasRoots: boolean): st
   });
 }
 
-/** 数值输入的合法区间文案（同上：t() 不进 onChange 的三层嵌套）。 */
-function rangeErrorText(t: Translate, key: "budgetInvalid" | "windowInvalid", max: number): string {
-  return t(key, { min: LIMIT_MIN, max });
-}
-
-/** embedding <select> 的分组候选（逐层构造，避免 createElement 深层嵌套）。 */
-function buildOptionGroups(
-  t: Translate,
-  embeddingValue: string,
-  editable: boolean,
-  setField: (field: string, draft: unknown) => void,
-): ReactNode[] {
-  const groups: ReactNode[] = [];
+/** embedding 候选的显示文本与分组（供共享 SelectField 的 options）。 */
+function embeddingOptions(t: Translate): SelectOption[] {
+  const options: SelectOption[] = [];
   for (const backend of BACKENDS) {
-    const options: ReactNode[] = [];
     for (const entry of LOCAL_EMBEDDINGS) {
       if (entry.backend === backend) {
-        const { reference, dimension } = entry;
-        options.push(
-          createElement(
-            "option",
-            { key: reference, value: reference },
-            modelOptionText(t, reference, dimension),
-          ),
-        );
+        options.push({
+          value: entry.reference,
+          label: modelOptionText(t, entry.reference, entry.dimension),
+          group: t(BACKEND_LABEL_KEY[backend]),
+        });
       }
     }
-    groups.push(
-      createElement("optgroup", { key: backend, label: t(BACKEND_LABEL_KEY[backend]) }, options),
-    );
   }
-  return [
-    createElement(
-      "select",
-      {
-        className: "zgc-select",
-        value: embeddingValue,
-        disabled: !editable,
-        onChange: (ev: { target: { value: string } }) => {
-          setField("defaultEmbedding", ev.target.value);
-        },
-      },
-      groups,
-    ),
-  ];
+  return options;
 }
 
-/** embedding 行：本地后端分组的 <select>（候选文本带维度插值）。 */
-function buildEmbeddingRow(deps: CardDeps): ReactNode {
+/** 数字草稿串 → 控件值：区间由 zod schema 判定；空串是「清空 = 恢复默认」，不是 0。 */
+function numberDisplay(display: string, schema: z.ZodNumber): number | undefined {
+  const parsed = schema.safeParse(display === "" ? Number.NaN : Number(display));
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** 检索模型小节：embedding 下拉（按本地后端分组）+ 每组结果数。 */
+function buildModelSection(deps: CardDeps): ReactNode {
   const { editable, fields, setField, t } = deps;
-  const embeddingLabel = createElement("div", { className: "zgc-label" }, t("embeddingLabel"));
-  const embeddingHint = createElement("div", { className: "zgc-hint" }, t("embeddingHint"));
-  const embeddingSelects = buildOptionGroups(t, fields.embedding, editable, setField);
-  return createElement(
-    "div",
-    { className: "zgc-row" },
-    embeddingLabel,
-    embeddingHint,
-    embeddingSelects[0],
-  );
-}
-
-/** defaultLimit 行：数字输入，区间判定在 lib/card-logic.ts 的 limitDraftOf。 */
-function buildLimitRow(deps: CardDeps): ReactNode {
-  const { editable, fields, setField, setSaveError, t } = deps;
-  const limitLabel = createElement(
-    "div",
-    { className: "zgc-label" },
-    t("limitLabel", { min: LIMIT_MIN, max: LIMIT_MAX }),
-  );
-  const limitInput = createElement("input", {
-    className: "zgc-input",
-    type: "number",
-    min: LIMIT_MIN,
-    max: LIMIT_MAX,
-    value: fields.limitDisplay,
+  const embedding = createElement(SelectField, {
+    label: t("embeddingLabel"),
+    ...splitHint(t("embeddingHint")),
+    field: "defaultEmbedding",
+    value: fields.embedding,
+    options: embeddingOptions(t),
     disabled: !editable,
-    onChange: (ev: { target: { value: string } }) => {
-      const draft = limitDraftOf(ev.target.value, t);
-      // 钳制提示走同一个保存条位：它不是失败（值已写入草稿），但「越界已被钳到区间」
-      // 不能静默；error 位（真正的失败）优先。
-      setSaveError(draft.error ?? draft.hint);
-      if (draft.error === null) {
-        setField("defaultLimit", draft.draft);
-      }
+    onChange: (next: string): void => {
+      setField("defaultEmbedding", next);
     },
   });
-  return createElement("div", { className: "zgc-row" }, limitLabel, limitInput);
-}
-
-/** hfEndpoint 行：镜像基地址（占位符即 schema 默认的那枚镜像，留空走官方 HF）。 */
-function buildEndpointRow(deps: CardDeps): ReactNode {
-  const { editable, fields, setField, t } = deps;
-  const endpointLabel = createElement("div", { className: "zgc-label" }, t("endpointLabel"));
-  const endpointHint = createElement("div", { className: "zgc-hint" }, t("endpointHint"));
-  const endpointInput = createElement("input", {
-    className: "zgc-input",
-    value: fields.hfEndpoint,
-    placeholder: "https://modelscope.cn/models",
+  const limit = createElement(NumberField, {
+    label: t("limitLabel"),
+    hint: t("limitInvalid", { min: LIMIT_MIN, max: LIMIT_MAX }),
+    field: "defaultLimit",
+    value: numberDisplay(fields.limitDisplay, LIMIT_SCHEMA),
+    min: LIMIT_SCHEMA.minValue ?? LIMIT_MIN,
+    max: LIMIT_SCHEMA.maxValue ?? LIMIT_MAX,
+    step: 1,
+    unit: t("unitResults"),
+    invalidHint: t("outOfRange"),
     disabled: !editable,
-    onChange: (ev: { target: { value: string } }) => {
-      setField("hfEndpoint", ev.target.value);
+    onChange: (next: number | undefined): void => {
+      setField("defaultLimit", next);
     },
   });
-  return createElement("div", { className: "zgc-row" }, endpointLabel, endpointHint, endpointInput);
-}
-
-/** enforceSearchFirst 行：整行可点的勾选（只读时光标退回 default，与禁用态一致）。 */
-function buildEnforceRow(deps: CardDeps): ReactNode {
-  const { editable, fields, setField, t } = deps;
-  const enforceCheckbox = createElement("input", {
-    type: "checkbox",
-    checked: fields.enforceSearchFirst,
-    disabled: !editable,
-    onChange: (ev: { target: { checked: boolean } }) => {
-      setField("enforceSearchFirst", ev.target.checked);
-    },
-  });
-  const enforceText = createElement("span", { className: "zgc-label" }, t("enforceLabel"));
-  const enforceInner = createElement(
-    "label",
-    {
-      style: {
-        display: "flex",
-        gap: "8px",
-        alignItems: "center",
-        cursor: editable ? "pointer" : "default",
-      },
-    },
-    enforceCheckbox,
-    enforceText,
-  );
-  const enforceHint = createElement("div", { className: "zgc-hint" }, t("enforceHint"));
-  return createElement("div", { className: "zgc-row" }, enforceInner, enforceHint);
-}
-
-/**
- * 数值区间行的差异面：解锁配额与解锁时效两行只差文案键、写入字段与上限，
- * 判定与错误口径完全一致 ⇒ 共用一个构造器，不再各写一份。
- */
-interface RangeRowSpec {
-  labelKey: keyof UiMessages;
-  hintKey: keyof UiMessages;
-  /** 草稿字段名：与 host Config 的 volatile 字段同名。 */
-  field: string;
-  invalidKey: "budgetInvalid" | "windowInvalid";
-  /** 合法上限（下限恒为 LIMIT_MIN，与 Config schema 的 min(1) 同一口径）。 */
-  max: number;
-  /** 清空后回退的默认值（文案插值用，与 Config schema 的 .default 同源）。 */
-  default: number;
-  /** 输入的显示值：草稿优先（见 draftFields）。 */
-  value: string;
-}
-
-/** 配额 / 时效行：区间内落草稿、清空即回「未填」、越界给区间文案并置保存条错误。 */
-function buildRangeRow(deps: CardDeps, spec: RangeRowSpec): ReactNode {
-  const { editable, setField, setSaveError, t } = deps;
-  const label = createElement(
-    "div",
-    { className: "zgc-label" },
-    t(spec.labelKey, { min: LIMIT_MIN, max: spec.max }),
-  );
-  const hint = createElement(
-    "div",
-    { className: "zgc-hint" },
-    t(spec.hintKey, { default: spec.default }),
-  );
-  const input = createElement("input", {
-    className: "zgc-input",
-    type: "number",
-    min: LIMIT_MIN,
-    max: spec.max,
-    value: spec.value,
-    disabled: !editable,
-    onChange: (ev: { target: { value: string } }) => {
-      const { value: raw } = ev.target;
-      if (raw === "") {
-        setSaveError(null);
-        setField(spec.field, undefined);
-        return;
-      }
-      const num = Number(raw);
-      if (Number.isSafeInteger(num) && num >= 1 && num <= spec.max) {
-        setSaveError(null);
-        setField(spec.field, num);
-      } else {
-        setSaveError(rangeErrorText(t, spec.invalidKey, spec.max));
-      }
-    },
-  });
-  return createElement("div", { className: "zgc-row" }, label, hint, input);
+  return createElement(Section, { title: t("modelSection") }, embedding, limit);
 }
 
 /** 重建行：root 输入（白名单候选进 <datalist>）+ 触发按钮（在跑时禁用）。 */
-function buildRebuildRow(deps: CardDeps): ReactNode {
+function buildRebuildField(deps: CardDeps): ReactNode {
   const { fields, rebuild, root, roots, setRoot, t } = deps;
-  const rebuildLabel = createElement("div", { className: "zgc-label" }, t("rebuildLabel"));
-  const rebuildHint = createElement(
-    "div",
-    { className: "zgc-hint" },
-    rebuildHintText(t, fields.embedding, roots.length > 0),
-  );
   const rootOptions = roots.map((entry) => createElement("option", { key: entry, value: entry }));
   const rootDatalist = createElement("datalist", { id: ROOT_OPTIONS_ID }, ...rootOptions);
   const rebuildInput = createElement("input", {
-    className: "zgc-input",
+    className: "dsu-input zgc-rebuildInput",
     value: root,
     list: ROOT_OPTIONS_ID,
     placeholder: "/absolute/path/to/workspace",
@@ -520,7 +259,7 @@ function buildRebuildRow(deps: CardDeps): ReactNode {
     "button",
     {
       type: "button",
-      className: "zgc-button",
+      className: "dsu-btn",
       "data-field": "rebuild",
       disabled: rebuild.phase === "running",
       onClick: deps.onRebuild,
@@ -528,10 +267,12 @@ function buildRebuildRow(deps: CardDeps): ReactNode {
     rebuild.phase === "running" ? t("rebuildRunning") : t("rebuildButton"),
   );
   return createElement(
-    "div",
-    { className: "zgc-row" },
-    rebuildLabel,
-    rebuildHint,
+    Field,
+    {
+      label: t("rebuildLabel"),
+      ...splitHint(rebuildHintText(t, fields.embedding, roots.length > 0)),
+      wide: true,
+    },
     rootDatalist,
     rebuildInput,
     rebuildButton,
@@ -552,8 +293,7 @@ function buildDaemonNote(deps: CardDeps): ReactNode | null {
   if (key === undefined) {
     return null;
   }
-  const note = createElement("div", { className: "zgc-hint" }, t(key));
-  return createElement("div", { className: "zgc-row" }, note);
+  return createElement("p", { className: "dsu-hint" }, t(key));
 }
 
 /** 重建状态节点：phase 非 idle 才出现；done 且无输出时给一句「已完成」。 */
@@ -572,52 +312,92 @@ function buildRebuildStatusRow(deps: CardDeps): ReactNode | null {
   return createElement("div", { className: displayClass }, displayText);
 }
 
-/**
- * 卡片主体所有行（含重建 status 节点），返回子元素数组。
- * 每行自己的构造器在上方按职责拆好，这里只负责顺序与两行区间行的差异面。
- */
-function buildCardBody(deps: CardDeps): ReactNode[] {
-  const { fields, t } = deps;
-  const rows: ReactNode[] = [
-    buildEmbeddingRow(deps),
-    buildLimitRow(deps),
-    buildEndpointRow(deps),
-    buildEnforceRow(deps),
-    buildRangeRow(deps, {
-      labelKey: "budgetLabel",
-      hintKey: "budgetHint",
-      field: "grepBudgetPerSearch",
-      invalidKey: "budgetInvalid",
-      max: BUDGET_MAX,
-      default: DEFAULT_GREP_BUDGET,
-      value: fields.grepBudget,
-    }),
-    buildRangeRow(deps, {
-      labelKey: "windowLabel",
-      hintKey: "windowHint",
-      field: "unlockWindowMin",
-      invalidKey: "windowInvalid",
-      max: WINDOW_MAX,
-      default: DEFAULT_UNLOCK_WINDOW_MIN,
-      value: fields.unlockWindow,
-    }),
-    createElement(SaveBar, {
-      t,
-      dirty: deps.dirty,
-      writable: deps.writable,
-      busy: deps.busy,
-      error: deps.saveError,
-      onSave: deps.onSave,
-      onDiscard: deps.onDiscard,
-    }),
+/** 网络与索引小节：镜像地址、search-first 开关、配额与时效、工作区重建与守护进程状态。 */
+function buildIndexSection(deps: CardDeps): ReactNode {
+  const { editable, fields, setField, t } = deps;
+  const endpoint = createElement(TextField, {
+    label: t("endpointLabel"),
+    ...splitHint(t("endpointHint")),
+    field: "hfEndpoint",
+    value: fields.hfEndpoint,
+    placeholder: "https://modelscope.cn/models",
+    monospace: true,
+    disabled: !editable,
+    onChange: (next: string): void => {
+      setField("hfEndpoint", next.trim() === "" ? undefined : next.trim());
+    },
+  });
+  const enforce = createElement(ToggleField, {
+    label: t("enforceLabel"),
+    ...splitHint(t("enforceHint")),
+    field: "enforceSearchFirst",
+    checked: fields.enforceSearchFirst,
+    disabled: !editable,
+    onChange: (next: boolean): void => {
+      setField("enforceSearchFirst", next);
+    },
+  });
+  const budget = createElement(NumberField, {
+    label: t("budgetLabel"),
+    ...splitHint(t("budgetHint", { default: DEFAULT_GREP_BUDGET })),
+    field: "grepBudgetPerSearch",
+    value: numberDisplay(fields.grepBudget, BUDGET_SCHEMA),
+    min: BUDGET_SCHEMA.minValue ?? LIMIT_MIN,
+    max: BUDGET_SCHEMA.maxValue ?? BUDGET_MAX,
+    step: 1,
+    unit: t("unitTimes"),
+    invalidHint: t("outOfRange"),
+    disabled: !editable,
+    onChange: (next: number | undefined): void => {
+      setField("grepBudgetPerSearch", next);
+    },
+  });
+  const window = createElement(NumberField, {
+    label: t("windowLabel"),
+    ...splitHint(t("windowHint", { default: DEFAULT_UNLOCK_WINDOW_MIN })),
+    field: "unlockWindowMin",
+    value: numberDisplay(fields.unlockWindow, WINDOW_SCHEMA),
+    min: WINDOW_SCHEMA.minValue ?? LIMIT_MIN,
+    max: WINDOW_SCHEMA.maxValue ?? WINDOW_MAX,
+    step: 1,
+    unit: t("unitMinutes"),
+    invalidHint: t("outOfRange"),
+    disabled: !editable,
+    onChange: (next: number | undefined): void => {
+      setField("unlockWindowMin", next);
+    },
+  });
+  return createElement(
+    Section,
+    { title: t("indexSection") },
+    endpoint,
+    enforce,
+    budget,
+    window,
     buildDaemonNote(deps),
-    buildRebuildRow(deps),
-  ];
-  const status = buildRebuildStatusRow(deps);
-  if (status !== null) {
-    rows.push(status);
-  }
-  return rows;
+    buildRebuildField(deps),
+    buildRebuildStatusRow(deps),
+  );
+}
+
+/** 卡片主体：检索模型 / 网络与索引两节 + 保存条。 */
+function buildCardBody(deps: CardDeps): ReactNode {
+  const { t } = deps;
+  const saveBar = createElement(SaveBar, {
+    dirty: deps.dirty,
+    busy: deps.busy,
+    writable: deps.writable,
+    error: deps.saveError,
+    saveLabel: t("save"),
+    savingLabel: t("saving"),
+    revertLabel: t("revert"),
+    dirtyLabel: t("dirtyCount", { count: deps.dirtyCount }),
+    cleanLabel: t("statusClean"),
+    readOnlyLabel: t("statusReadOnly"),
+    onSave: deps.onSave,
+    onDiscard: deps.onDiscard,
+  });
+  return createElement(CardForm, null, buildModelSection(deps), buildIndexSection(deps), saveBar);
 }
 
 /** 显式字段写入（schema-coverage 门禁按 set('字段名') 字面量识别绑定）。 */
@@ -768,10 +548,11 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
   /** 发起一次重建；成功后进入轮询。 */
   async function startOnce(): Promise<void> {
     const started = await requireReader(reader, t).rebuild(root.trim());
-    if (typeof started.jobId !== "string") {
+    const parsedStarted = z.object({ jobId: z.string() }).safeParse(started);
+    if (!parsedStarted.success) {
       throw new TypeError(t("rebuildMissingJobId"));
     }
-    const { jobId } = started;
+    const { jobId } = parsedStarted.data;
     pollRef.current = setInterval(() => {
       void pollStatus(jobId);
     }, REBUILD_POLL_MS);
@@ -823,7 +604,8 @@ function ZgCard(props: CardSlotProps): ReactNode {
   // 该字段的受控输入就会吞键击（select 弹回旧值、input 改不动），而旁边的字段却
   // 能改——同一张卡两种行为，用户只能理解为「这个设置改了没用」。
   const fields = draftFields(touched, value);
-  const dirty = diffTouched(touched, value).length > 0;
+  const dirtyCount = diffTouched(touched, value).length;
+  const dirty = dirtyCount > 0;
   const setField = (field: string, draft: unknown): void => {
     setTouched((prev) => ({ ...prev, [field]: draft }));
   };
@@ -882,6 +664,7 @@ function ZgCard(props: CardSlotProps): ReactNode {
     root: rebuildView.root,
     rebuild: rebuildView.state,
     dirty,
+    dirtyCount,
     busy,
     saveError,
     setField,
@@ -895,16 +678,7 @@ function ZgCard(props: CardSlotProps): ReactNode {
       void rebuildView.start();
     },
   };
-  const rows = buildCardBody(deps);
-  const body = createElement("div", { style: { padding: "2px 0" } }, rows);
-  return createElement(
-    PluginCard,
-    {
-      title: t("cardTitle"),
-      description: t("cardDescription"),
-    },
-    body,
-  );
+  return buildCardBody(deps);
 }
 
 /**
@@ -1014,7 +788,7 @@ function apply(ctx: ClientCtx): void {
   ctx.effect(() => {
     const tag = document.createElement("style");
     tag.id = "zvec-grep-card-css";
-    tag.textContent = CARD_CSS;
+    tag.textContent = `${CARD_CSS}\n${CARD_UI_CSS}`;
     document.head.append(tag);
     return () => {
       tag.remove();

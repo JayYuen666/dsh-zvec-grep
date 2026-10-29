@@ -396,7 +396,7 @@ describe("buildSearchCommand", () => {
     // 闭集大小**不是**条数上限：7 个各自合法的重复值应当照常构造出一条完整命令，
     // 而不是被「最多 6 项」这条指向错误方向的提示挡下。
     const repeated = buildSearchCommand(
-      { root: "/ws", query: "x", symbolTypes: Array.from({ length: 7 }, () => "class") },
+      { root: "/ws", query: "x", symbolTypes: Array.from({ length: 7 }).fill("class") },
       zhMessages,
     );
     assert.ok(repeated.command.includes(`--symbol-type 'class'`), "重复的合法取值不该被当成超限");

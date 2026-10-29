@@ -20,6 +20,9 @@ export const DAEMON_LEASE_CODE = "ZVEC_GREP.ENGINE.DAEMON_LEASE_ACTIVE";
 /** 索引重建与其它占用者分开：等与不等是两回事。 */
 export const REBUILD_OPERATION = "index.rebuild";
 
+/** 明细块的表头行（`Details:`）。 */
+const DETAILS_HEADER = /^\s*Details:\s*$/u;
+
 export interface LockBusyFailure {
   kind: "lock-busy";
   /** 占锁方自报的操作名；老版本或明细缺失时为 undefined。 */
@@ -48,7 +51,7 @@ export type ConcurrentZgFailure = LockBusyFailure | DaemonLeaseFailure;
  *     还能被认出来（值是否被消费由查表侧决定），不至于整块收集在此中断；
  *   - 值必须以非空白开头：把只含空白的行当成有效值没有意义。
  */
-const DETAIL_LINE = /^(?:\s+)(?<key>[A-Za-z][\w-]*):\s*(?<value>\S.*?)\s*$/u;
+const DETAIL_LINE = /^\s+(?<key>[A-Za-z][\w-]*):\s*(?<value>\S.*)$/u;
 
 /** 错误码行的**定位**形状（只认行首，不核内容）。 */
 const CODE_LINE_PREFIX = /^\s*Code:/u;
@@ -75,14 +78,14 @@ export function zgErrorCode(stderr: string): string | undefined {
 function zgErrorDetails(stderr: string): Map<string, string> {
   const details = new Map<string, string>();
   const lines = stderr.split("\n");
-  const start = lines.findIndex((line) => /^\s*Details:\s*$/u.test(line));
+  const start = lines.findIndex((line) => DETAILS_HEADER.test(line));
   if (start === -1) {
     return details;
   }
   for (const line of lines.slice(start + 1)) {
     const matched = DETAIL_LINE.exec(line);
     const key = matched?.groups?.["key"];
-    const value = matched?.groups?.["value"];
+    const value = matched?.groups?.["value"]?.trimEnd();
     if (key !== undefined && value !== undefined) {
       if (!details.has(key)) {
         details.set(key, value);

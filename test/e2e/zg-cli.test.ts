@@ -508,7 +508,7 @@ describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的�
     });
     const result = await run("zg server status --check-ready", dir);
     // 就绪与否由这台机器的事实决定，两种都合法；不合法的是「旗标不认识」。
-    const rejected = /unknown|unexpected|invalid|unrecognized|unexpected argument/iu;
+    const rejected = /unknown|unexpected|invalid|unrecognized/iu;
     assert.ok(!rejected.test(result.stderr + result.stdout), `${result.stderr}\n${result.stdout}`);
     if (result.status !== 0) {
       // 未就绪那一臂必须用退出码 + 那句原文表达（判据读的是退出码，文本只是给人的）。

@@ -11,17 +11,20 @@
 
 import type { ConfigPageForm } from "@deepseek-ai/dsh-client-ui-plugin-manager/client";
 import type { ConfigForm, ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-settings/client";
+import { z } from "zod";
 // 草稿优先的读判据（draftOf / numberText）住在 lib/card-draft.ts；本文件的 draftFields
 // 只管「六个字段各显示什么」。
 import { draftOf, numberText } from "./card-draft.ts";
 import { DEFAULT_EMBEDDING } from "./embedding-catalog.ts";
 // 数值区间单源：显示文案与钳制区间引同一份常量（host schema 与输入区间同源，见该文件头）。
 import {
+  BUDGET_MAX,
   DEFAULT_GREP_BUDGET,
   DEFAULT_LIMIT,
   DEFAULT_UNLOCK_WINDOW_MIN,
   LIMIT_MAX,
   LIMIT_MIN,
+  WINDOW_MAX,
 } from "./limits.ts";
 
 /**
@@ -191,6 +194,9 @@ function numericFieldDisplay(
   return numberText(draft, fallback);
 }
 
+/** 端点字段的 URL 形态：空串（= 恢复默认）与坏文本都显示成空，输入框只收 HTTP(S)。 */
+const HTTP_URL_SCHEMA = z.url({ protocol: /^https?$/u });
+
 /** 六个字段的草稿显示值（ZgCard 只渲染这里算出来的东西）。 */
 export function draftFields(
   touched: Record<string, unknown>,
@@ -203,7 +209,8 @@ export function draftFields(
     embedding:
       typeof embedding === "string" && embedding.length > 0 ? embedding : DEFAULT_EMBEDDING,
     limitDisplay: numericFieldDisplay(touched, value, "defaultLimit", String(DEFAULT_LIMIT)),
-    hfEndpoint: typeof endpoint === "string" ? endpoint : "",
+    hfEndpoint:
+      typeof endpoint === "string" && HTTP_URL_SCHEMA.safeParse(endpoint).success ? endpoint : "",
     enforceSearchFirst: enforce !== false,
     grepBudget: numericFieldDisplay(
       touched,
@@ -231,12 +238,21 @@ export type LimitResolution =
   | { kind: "clamped"; value: number; hint: string }
   | { kind: "invalid"; hint: string };
 
+/** 三个数值字段的 zod 域：输入校验与卡片显示共用，host schema 的区间是同一组常量。 */
+export const LIMIT_SCHEMA = z.int().min(LIMIT_MIN).max(LIMIT_MAX);
+export const BUDGET_SCHEMA = z.int().min(LIMIT_MIN).max(BUDGET_MAX);
+export const WINDOW_SCHEMA = z.int().min(LIMIT_MIN).max(WINDOW_MAX);
+
 export function resolveLimitInput(raw: string, t: CardText): LimitResolution {
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
     return { kind: "empty" };
   }
   const num = Number(trimmed);
+  const parsed = LIMIT_SCHEMA.safeParse(num);
+  if (parsed.success) {
+    return { kind: "valid", value: parsed.data };
+  }
   if (!Number.isSafeInteger(num)) {
     return { kind: "invalid", hint: t("limitInvalid", { min: LIMIT_MIN, max: LIMIT_MAX }) };
   }
@@ -247,14 +263,11 @@ export function resolveLimitInput(raw: string, t: CardText): LimitResolution {
       hint: t("limitClamped", { min: LIMIT_MIN, max: LIMIT_MAX, value: LIMIT_MIN }),
     };
   }
-  if (num > LIMIT_MAX) {
-    return {
-      kind: "clamped",
-      value: LIMIT_MAX,
-      hint: t("limitClamped", { min: LIMIT_MIN, max: LIMIT_MAX, value: LIMIT_MAX }),
-    };
-  }
-  return { kind: "valid", value: num };
+  return {
+    kind: "clamped",
+    value: LIMIT_MAX,
+    hint: t("limitClamped", { min: LIMIT_MIN, max: LIMIT_MAX, value: LIMIT_MAX }),
+  };
 }
 
 /**
@@ -294,6 +307,27 @@ export interface RebuildPoll {
   output: string;
 }
 
+/** 轮询应答的宽容形状：未知状态、非数字退出码、非字符串输出都折成缺位，
+ *  下游文案只按“缺位”兜底，不把坏类型带到渲染期。 */
+const REBUILD_STATUSES = ["running", "stopping", "completed", "killed", "failed"] as const;
+const REBUILD_POLL_SCHEMA = z.object({
+  status: z.preprocess(
+    (value) =>
+      typeof value === "string" && REBUILD_STATUSES.some((status) => status === value)
+        ? value
+        : undefined,
+    z.enum(REBUILD_STATUSES).optional(),
+  ),
+  exitCode: z.preprocess(
+    (value) => (typeof value === "number" && Number.isFinite(value) ? value : undefined),
+    z.number().optional(),
+  ),
+  output: z.preprocess(
+    (value) => (typeof value === "string" ? value : undefined),
+    z.string().optional(),
+  ),
+});
+
 /**
  * 轮询应答 → 卡片状态。
  * 关键：harness 的 bash-local 对**任何自然退出**都置 `status:'completed'`
@@ -305,8 +339,9 @@ export interface RebuildPoll {
  *  - `failed`：注册表侧判定失败（生产者的 done 被拒、或收尾抛错），此时没有退出码可读。
  */
 export function parseRebuildPoll(body: Record<string, unknown>, t: CardText): RebuildPoll {
-  const { status, exitCode, output } = body;
-  const outputText = typeof output === "string" ? output : "";
+  const parsed = REBUILD_POLL_SCHEMA.safeParse(body);
+  const { status, exitCode, output } = parsed.success ? parsed.data : {};
+  const outputText = output ?? "";
   if (status === "running" || status === "stopping") {
     return {
       phase: "running",

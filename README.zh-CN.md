@@ -77,9 +77,9 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-zvec-grep`。包在公共 npm registry 上，不需要凭据，也不需要 scoped-registry 配置行。
 
 - **Node.js `>= 22.12`**（纯 ESM；正是这个下限让 `require()` 一枚 ESM 入口成为可能，`engines.node` 因此声明）。
-- **宿主 `dsh` 在 `0.2.1-rc.3` 这条线上。** 宿主读 `engines.dsh`（`^0.2.1-rc.3`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.1-rc.3` 的都通过；`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。
-- **按契约，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`dsh-*` peer 一律精确钉在 `@deepseek-ai/dsh` peer 的版本上——这是防「第二份宿主类型面」的编译期纪律，不是宿主会去读的声明。
-- **值导入都是必需 peer。** `@deepseek-ai/schemastery` 是宿主 fork（只有它的 `resolve` 认 `.volatile()` 字段）；`@deepseek-ai/dsh-typert-protocol` 提供 `TypertRemoteService` 这个要 `extends` 的类；shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`。三者都落 peer 加同版精确钉的 devDependencies——缺一枚就是装载期 `ERR_MODULE_NOT_FOUND`，不是优雅降级。`dependencies` 里只有 `@jayyuen66/dsh-plugin-shared`。
+- **宿主 `dsh` 在 `0.2.1-rc.3` 这条线上。** 宿主读 `engines.dsh`（`^0.2.1-rc.3`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.1-rc.3` 的都通过；`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时最近的三个已发布宿主版本上逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **按契约，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.1-rc.3`），`devDependencies` 里的精确钉版才是防「第二份宿主类型面」的编译期纪律——那不是宿主会去读的声明。
+- **值导入都是必需 peer。** `@deepseek-ai/schemastery` 是宿主 fork（只有它的 `resolve` 认 `.volatile()` 字段）；`@deepseek-ai/dsh-typert-protocol` 提供 `TypertRemoteService` 这个要 `extends` 的类；`@deepseek-ai/dsh-scope` 提供步骤准入判定用的 `scopeOf`；shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`。四者都落 peer 加同版精确钉的 devDependencies——缺一枚就是装载期 `ERR_MODULE_NOT_FOUND`，不是优雅降级。`dependencies` 里是 `@jayyuen66/dsh-plugin-shared` 与 `zod`（后者版本走伞根 catalog，供设置卡的 strict codec 校验）。
 - **随包发什么**：`host.js`、`client.js`、`cordis.patch.yml`、`icon.svg`、两份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`。产物由 `prepack` 现产，不入库。
 
 ### <img src="https://api.iconify.design/lucide/arrow-down-to-line.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> shared 的版本下限
@@ -154,6 +154,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 - **什么算检索**：bash/pwsh 命令串经引号/注释感知切词后，命令位上的 grep/egrep/fgrep/rg 与原生 grep 工具。`--help` / `--version`、`echo "grep x"`、commit message 不算。
 - **配额按「会话 × 索引根」**：每次成功 zg_search 重新武装 grepBudgetPerSearch 次、unlockWindowMin 分钟有效；索引根是 root 自身或含索引的最近祖先（最多上溯 8 层）。
 - **分片用根会话**（沿 `header.parentSession` 上溯到顶）：主代理与子代理**共享一份额度**。上溯降级不抛错——查不到父就停在已知的最后一跳，成环就停在首次重复前。
+- **步骤准入让路**：宿主提供 `toolSet` 且本步骤的视图不含 `zg_search` 时（受限子代理或条件工具步骤），grep/rg 不被拦——强迫模型去调一个本步骤调不动的工具是死路。不提供步骤准入的宿主沿用原判据。
 - **「含索引」= `<root>/.zvec-grep/manifest.json` 在盘上，*并且*解析得开**：`manifestVersion` 严格等于 1、`rootPaths` 覆盖该目录（归一相等，macOS 两侧剥 `/private` 前缀）。只判目录名不够——它同时是 zg 的全局 home（`~/.zvec-grep`）；只判存在会把半截或外来的清单误判成有索引，把检索与门禁双向堵死。
 - 白名单/解锁表在内存里有界（64 根 / 256 分片），命中即触摸、先过期后 LRU 淘汰；白名单条目带一天有效期。
 - enforceSearchFirst=false 只关门禁；confirm 与 root 兜底照旧。

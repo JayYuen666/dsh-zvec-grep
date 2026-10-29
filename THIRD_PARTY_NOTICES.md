@@ -19,11 +19,13 @@
 - 数据边界：索引与向量库（`.zvec-grep/`、`manifest.json`）由上游读写，本包只判它是否存在、是否覆盖
   目标根，不解析也不改写其内部结构。
 
-## 编译期与运行期依赖：`@jayyuen66/dsh-plugin-shared`
+## 编译期与运行期依赖
 
-- 同作者的共享工具库（MIT），是本包 `dependencies` 里唯一一枚，随包从公共 npm 安装。
-- 它自己的宿主包 peer（含 `@deepseek-ai/dsh-output-retention`）由 dsh 运行时提供——本包必须把这
-  几枚也声明在 peer ∪ dev 上，否则装出去即 `ERR_MODULE_NOT_FOUND`（判据见
+- `@jayyuen66/dsh-plugin-shared`（MIT）：同作者的共享工具库，随包从公共 npm 安装。
+- `zod`（MIT）：设置卡 `src/rebuild-reader.ts` 的 strict codec 用它校验形状；版本走伞根 catalog，
+  client 产物按宿主 `PLATFORM_MODULES` 保持 `require("zod")` 外部化。
+- shared 自己的宿主包 peer（含 `@deepseek-ai/dsh-output-retention`）由 dsh 运行时提供——本包必须把
+  这几枚也声明在 peer ∪ dev 上，否则装出去即 `ERR_MODULE_NOT_FOUND`（判据见
   `test/publish-manifest.test.ts`）。
 
 ## 宿主：dsh 与 `@deepseek-ai/*`

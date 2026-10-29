@@ -13,16 +13,14 @@ import type { MessagesCatalog } from "@jayyuen66/dsh-plugin-shared/lib/locale";
 
 /** 本包设置卡产出的全部界面文案。 */
 export interface UiMessages {
-  /** 卡片标题（设置页插件列表里的那一行）。 */
-  readonly cardTitle: string;
-  /** 卡片副标题：一句话说明本包做什么。 */
-  readonly cardDescription: string;
   /** 作用域只读时的状态条文本。 */
   readonly statusReadOnly: string;
   /** 有未保存改动时的状态条文本。 */
   readonly statusDirty: string;
   /** 无未保存改动时的状态条文本。 */
   readonly statusClean: string;
+  /** 保存条上的改动条数（`{count}` 插值）。 */
+  readonly dirtyCount: string;
   /** 保存按钮（空闲态）。 */
   readonly save: string;
   /** 保存按钮（写入中）。 */
@@ -34,6 +32,15 @@ export interface UiMessages {
   /** 保存被宿主拒绝（受理位 false：校验未通过或写入被跳过），修改未生效。 */
   readonly saveRejected: string;
 
+  /** 小节标题：「检索模型」「网络与索引」。 */
+  readonly modelSection: string;
+  readonly indexSection: string;
+  /** 数字输入里的单位后缀。 */
+  readonly unitResults: string;
+  readonly unitTimes: string;
+  readonly unitMinutes: string;
+  /** 数字输入越界时的就地提示。 */
+  readonly outOfRange: string;
   /** 「默认本地 embedding」行标题。 */
   readonly embeddingLabel: string;
   /** 「默认本地 embedding」行说明。 */
@@ -56,14 +63,10 @@ export interface UiMessages {
   readonly budgetLabel: string;
   /** 解锁配额行说明。 */
   readonly budgetHint: string;
-  /** 解锁配额输入非法：`{min}`、`{max}`。 */
-  readonly budgetInvalid: string;
   /** 解锁时效行标题。 */
   readonly windowLabel: string;
   /** 解锁时效行说明。 */
   readonly windowHint: string;
-  /** 解锁时效输入非法：`{min}`、`{max}`。 */
-  readonly windowInvalid: string;
 
   /** 「工作区重建」行标题。 */
   readonly rebuildLabel: string;
@@ -155,34 +158,36 @@ export type Translate = OfficialTranslateNS<typeof LOCALE_NS_KEY>;
 
 export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
   zh: {
-    cardTitle: "zvec-grep（zg）",
-    cardDescription:
-      "工作区语义检索：zg_search / zg_index / zg_status；本地 embedding + BM25 + 向量 RRF",
     statusReadOnly: "当前作用域只读",
     statusDirty: "有未保存的修改，点「保存」生效",
     statusClean: "无未保存的修改",
+    dirtyCount: "已修改 {count} 项",
     save: "保存",
     saving: "保存中…",
     revert: "撤销",
     saveFailed: "保存失败：{reason}",
     saveRejected: "保存被宿主拒绝（配置校验未通过或写入被跳过），修改未生效",
+    modelSection: "检索模型",
+    indexSection: "网络与索引",
+    unitResults: "条",
+    unitTimes: "次",
+    unitMinutes: "分钟",
+    outOfRange: "超出允许范围，未保存",
     embeddingLabel: "默认本地 embedding",
     embeddingHint: "只影响「新建」索引；切换并保存后，已有索引需点下方「重建」重新 embedding",
-    limitLabel: "默认每组结果数（{min}-{max}）",
+    limitLabel: "默认每组结果数",
     limitInvalid: "请输入 {min}-{max} 的整数",
     limitClamped: "已钳到 {min}-{max} 范围：{value}",
-    endpointLabel: "HuggingFace 镜像地址（可选）",
+    endpointLabel: "HuggingFace 镜像地址",
     endpointHint:
       "留空走 huggingface.co；国内网络可填 https://modelscope.cn/models 等兼容镜像（仅 llama-cpp 后端生效，如 qwen3）",
     enforceLabel: "强制 search-first（先 zg_search 再 grep/rg）",
     enforceHint:
       "开启后，已建索引工作区内的 grep/rg 受配额门禁约束：每次成功 zg_search 解锁下方次数的 grep/rg（时效见下），用尽或过期后再次拦截（提高检索覆盖与准确性）",
-    budgetLabel: "每次 zg_search 解锁的 grep/rg 次数（{min}-{max}）",
+    budgetLabel: "每次 zg_search 解锁的 grep/rg 次数",
     budgetHint: "配额越小语义检索越频繁、准确性约束越强；清空恢复默认 {default}",
-    budgetInvalid: "解锁次数必须是 {min}-{max} 的整数",
-    windowLabel: "解锁时效（分钟，{min}-{max}）",
-    windowHint: "超过该时长未再次 zg_search，配额整体过期；清空恢复默认 {default}",
-    windowInvalid: "解锁时效必须是 {min}-{max} 的整数",
+    windowLabel: "解锁时效",
+    windowHint: "超过该时长未再次 zg_search，配额整体过期；清空恢复默认 {default}（单位：分钟）",
     rebuildLabel: "工作区重建（切换 embedding 并保存后执行）",
     daemonReadyNote: "守护进程：就绪（zg server 在跑）。",
     daemonOfflineNote:
@@ -207,38 +212,40 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     backendModel2Vec: "model2vec（纯 JS worker，最轻）",
   },
   en: {
-    cardTitle: "zvec-grep (zg)",
-    cardDescription:
-      "Workspace semantic search: zg_search / zg_index / zg_status; local embedding + BM25 + vector RRF",
     statusReadOnly: "This scope is read-only",
     statusDirty: "Unsaved changes — press Save to apply",
     statusClean: "No unsaved changes",
+    dirtyCount: "{count} changed",
     save: "Save",
     saving: "Saving…",
     revert: "Revert",
     saveFailed: "save failed: {reason}",
     saveRejected:
       "save rejected by host (validation failed or write skipped) — changes not applied",
+    modelSection: "Retrieval model",
+    indexSection: "Network and index",
+    unitResults: "hits",
+    unitTimes: "times",
+    unitMinutes: "minutes",
+    outOfRange: "Out of the allowed range — not saved",
     embeddingLabel: "Default local embedding",
     embeddingHint:
       "Affects newly built indexes only; after switching and saving, press Rebuild below to re-embed existing indexes",
-    limitLabel: "Default hits per group ({min}-{max})",
+    limitLabel: "Default hits per group",
     limitInvalid: "enter an integer between {min} and {max}",
     limitClamped: "clamped into the {min}-{max} range: {value}",
-    endpointLabel: "HuggingFace mirror URL (optional)",
+    endpointLabel: "HuggingFace mirror URL",
     endpointHint:
       "Leave empty for huggingface.co; on networks that cannot reach HF, fill a compatible mirror such as https://modelscope.cn/models (llama-cpp backends only, e.g. qwen3)",
     enforceLabel: "Enforce search-first (zg_search before grep/rg)",
     enforceHint:
       "When on, grep/rg inside indexed workspaces is quota-gated: each successful zg_search unlocks the number of grep/rg calls below (valid for the window below), and the gate blocks again once it is spent or expired (better coverage and relevance)",
-    budgetLabel: "grep/rg calls unlocked per zg_search ({min}-{max})",
+    budgetLabel: "grep/rg calls unlocked per zg_search",
     budgetHint:
       "A smaller quota means more semantic searches and a stronger relevance constraint; clear to restore the default {default}",
-    budgetInvalid: "the unlock quota must be an integer between {min} and {max}",
-    windowLabel: "Unlock window (minutes, {min}-{max})",
+    windowLabel: "Unlock window",
     windowHint:
-      "Without another zg_search inside this window the whole quota expires; clear to restore the default {default}",
-    windowInvalid: "the unlock window must be an integer between {min} and {max}",
+      "Without another zg_search inside this window the whole quota expires; clear to restore the default {default} (minutes)",
     rebuildLabel: "Workspace rebuild (run after switching embedding and saving)",
     daemonReadyNote: "Daemon: ready (zg server is running).",
     daemonOfflineNote:

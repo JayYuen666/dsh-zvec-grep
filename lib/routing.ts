@@ -13,6 +13,8 @@
 // 必须用同一套 root 判据，否则「guard 放行、execute 抛错」会把同一件事说两遍。
 
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
+import type { Context } from "@deepseek-ai/cordis";
+import { scopeOf } from "@deepseek-ai/dsh-scope";
 import { assertAbsoluteRoot, normalizeAbsolutePath } from "./cli.ts";
 import { fill } from "./messages.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
@@ -115,8 +117,28 @@ export interface GuardExecution {
   readonly name?: ToolExecution["name"] | undefined;
   /** 官方 `unknown`：模型产出的已解析参数，逐字段取值仍要 isRecord 收窄。 */
   readonly arguments?: ToolExecution["arguments"];
-  /** 官方 `agent?: Agent`；`| null` 保留既有容错（agent 交回 null 时按无会话工作区处理）。 */
-  readonly agent?: { readonly session?: SessionFace } | null;
+  /** 官方 `agent?: Agent`；`| null` 保留既有容错（agent 交回 null 时按无会话工作区处理）。
+   *  `ctx` 只用来把执行体换算成步骤准入的作用域键（见 `searchAdmitted`）。 */
+  readonly agent?: { readonly session?: SessionFace; readonly ctx?: Context } | null;
+  /** 步骤准入集合（alpha.2 起 `tools.guard` 的执行体带这一位；rc 线没有 ⇒ 判据不变）。 */
+  readonly toolSet?: ToolExecution["toolSet"] | undefined;
+}
+
+/** search-first 门禁要求先调用的工具名（与注册表里的名字同源）。 */
+const ZG_SEARCH_NAME = "zg_search";
+
+/**
+ * `zg_search` 在本步骤是否可执行。宿主不交步骤准入（rc 线）时按既有的「可执行」处理：
+ * 没有准入信息就不该凭空放行。有准入时按该 Agent 的作用域查视图——受限子代理的
+ * 拒绝与条件工具的未准入都在这里显形，门禁不再强迫模型去调一个本步骤调不动的工具。
+ */
+function searchAdmitted(execution: GuardExecution): boolean {
+  const { toolSet } = execution;
+  if (toolSet === undefined) {
+    return true;
+  }
+  const scope = execution.agent?.ctx === undefined ? undefined : scopeOf(execution.agent.ctx);
+  return toolSet.view(scope).has(ZG_SEARCH_NAME);
 }
 
 /** 会话工作区（官方 Agent.session.header.cwd；值按 unknown 读，理由见 SessionFace）。 */
@@ -494,8 +516,9 @@ export function searchFirstGuard(
   const args = isRecord(execution.arguments) ? execution.arguments : {};
   const cwd = sessionHeaderCwd(execution);
   let reason: string | undefined;
-  // 门禁关着、或执行体没有会话工作区（无从判「索引根之内」）→ 两个拦截面都无从谈起。
-  if (deps.enabled && cwd !== undefined) {
+  // 门禁关着、执行体没有会话工作区（无从判「索引根之内」）、或本步骤根本调不动
+  // `zg_search` → 两个拦截面都无从谈起（强迫先调一个不可执行的工具是死路）。
+  if (deps.enabled && cwd !== undefined && searchAdmitted(execution)) {
     if (name === "bash" || name === "pwsh") {
       reason = shellSearchProblem(args, cwd, deps, messages);
     } else if (name === "grep") {

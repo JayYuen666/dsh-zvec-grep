@@ -6,7 +6,7 @@
 // 为什么 descriptor 是**手写**的：宿主网关在源模式（SRC）下从方法签名推参数名，参数与
 // 结果都走 `{ mode: "src-json" }`，不需要生成器的 `typeSymbol` / `create()` 产物。但**客户端**
 // 的贡献校验（`$mount` → `requireStrictCodec`）要求每个入参都带 strict codec，非 strict 会
-// 拒绝整份贡献。于是这里的入参 codec 写成 strict 的手写 parser：它只在客户端做形状校验，
+// 拒绝整份贡献。于是这里的入参 codec 写成 strict 的 zod schema：它只在客户端做形状校验，
 // 从不跨网；宿主那边仍按源模式从签名取参数名。
 //
 // ⚠ **为什么走 `ctx.get("remote")` 而不是把 `remote` 写进 `inject`**：cordis 对**未 inject 的
@@ -22,6 +22,7 @@ import type {
   TypertCodec,
 } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { z } from "zod";
 
 import type {
   RebuildRoots,
@@ -42,16 +43,32 @@ const REBUILD_SERVICE_KEY = `remote.${REBUILD_NAMESPACE}`;
 /** 卡片所在 bundle 的包名（`$mount` 的 `package` 位与槽位键同源，见 client-entry.ts 的 BUNDLE_PKG）。 */
 const PACKAGE_NAME = "@jayyuen66/dsh-zvec-grep";
 
+/** strict codec 的统一出口：失败交给 zod 的 `prettifyError`，读到的是一份带字段路径的说明。 */
+function parseOrThrow<Result>(schema: z.ZodType<Result>, value: unknown): Result {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    throw new TypeError(z.prettifyError(parsed.error));
+  }
+  return parsed.data;
+}
+
+const START_SCHEMA = z.object(
+  { root: z.string({ error: "rebuild request requires a string root" }) },
+  { error: "rebuild request requires a string root" },
+);
+
+const STATUS_SCHEMA = z.object(
+  { jobId: z.string({ error: "rebuild status request requires a string jobId" }) },
+  { error: "rebuild status request requires a string jobId" },
+);
+
 /** 启动请求的客户端 parser：只核本方法真正读的那一位（`root` 是串）。 */
 const START_CODEC: TypertCodec<RebuildStartRequest> = {
   mode: "strict",
   typeSymbol: `${PACKAGE_NAME}#rebuild-request`,
   create: () => ({
     parse(value: unknown): RebuildStartRequest {
-      if (!isRecord(value) || typeof value["root"] !== "string") {
-        throw new TypeError("rebuild request requires a string root");
-      }
-      return { root: value["root"] };
+      return parseOrThrow(START_SCHEMA, value);
     },
   }),
 };
@@ -62,10 +79,7 @@ const STATUS_CODEC: TypertCodec<RebuildStatusRequest> = {
   typeSymbol: `${PACKAGE_NAME}#rebuild-status-request`,
   create: () => ({
     parse(value: unknown): RebuildStatusRequest {
-      if (!isRecord(value) || typeof value["jobId"] !== "string") {
-        throw new TypeError("rebuild status request requires a string jobId");
-      }
-      return { jobId: value["jobId"] };
+      return parseOrThrow(STATUS_SCHEMA, value);
     },
   }),
 };

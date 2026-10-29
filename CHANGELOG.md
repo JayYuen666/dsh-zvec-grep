@@ -2,6 +2,35 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.9
+
+这一版让 search-first 门禁认识宿主的步骤准入，并把设置卡与读面校验统一到 shared 组件和 zod；
+宿主开发线抬到 0.2.2-alpha.2。
+
+### Changed
+
+- **设置卡迁到 shared 组件与 zod**：字段版式、保存条与状态条改用 `@jayyuen66/dsh-plugin-shared/lib/card-ui`；
+  `defaultLimit` / `grepBudgetPerSearch` / `unlockWindowMin` 的输入与显示共用 zod 区间 schema，
+  `hfEndpoint` 只接受 http(s) URL。
+- **重建轮询回执改按 schema 容错投影**：未知状态、非数字退出码、非字符串输出都折成缺位，坏类型不再带到
+  渲染期；`src/rebuild-reader.ts` 的两个 strict codec 改由 zod 生成。
+- **client 产物按宿主 `PLATFORM_MODULES` 外置 zod**；`zod` 进入 `dependencies`。
+- **宿主开发线抬到 `0.2.2-alpha.2`**：devDependencies 与 catalog/overrides 同值；`@deepseek-ai/dsh*` 的 peer
+  改为同一条支持窗口范围（`^0.2.1-rc.3`，schemastery 仍钉宿主自带版本），精确钉版只留在 devDependencies。
+- **插件页展示面进包**：新增 `locale/en.json`、`locale/zh.json` 与 `docs/DETAIL.md`、`docs/DETAIL.zh.md`；
+  `exports` 增加 `./locale/*.json`，`files` 收进 locale 与 docs。
+- **正则常量提取**：错误明细解析、命中计数行等内联正则改为命名常量，行为不变。
+
+### Fixed
+
+- **单仓安装态下 lint 把 `ToolBatchInput["agent"]` 读成 error 类型**：`@deepseek-ai/dsh-agent`
+  只是 `@deepseek-ai/dsh-tools` 的 peer，单仓安装不会自动装它；补进 `devDependencies` 后
+  `typescript(no-unsafe-assignment)` 与 `no-unnecessary-type-assertion` 两族告警消失。
+- **受限子代理与条件工具步骤被 search-first 门禁拦死**：门禁原先只看 `zg_search` 在注册表里是否存在，
+  不看本步骤的准入视图；模型因此被迫调用一个本步骤调不动的工具。现在执行体带 `toolSet` 时按
+  `view(scope)` 判，`zg_search` 不在视图里就让路；没有步骤准入的宿主沿用原判据。为此新增
+  `@deepseek-ai/dsh-scope` 值导入（`scopeOf`），并列入 peer 与 devDependencies。
+
 ## 0.1.8
 
 ### Changed

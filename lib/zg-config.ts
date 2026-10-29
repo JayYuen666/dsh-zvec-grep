@@ -13,6 +13,9 @@ import { clientModeOf } from "./cli.ts";
 import type { ClientMode } from "./cli.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
 
+/** 端点末尾斜杠。 */
+const TRAILING_SLASHES = /\/+$/u;
+
 /** 本模块读的部署值面（宿主 Config 的结构子集）。 */
 export interface ZgDeployConfig {
   readonly defaultEmbedding: { get: () => string | undefined };
@@ -45,7 +48,7 @@ function hfEndpointEnv(config: ZgDeployConfig): Record<string, string> | undefin
   const endpoint = config.hfEndpoint.get();
   let env: Record<string, string> | undefined;
   if (typeof endpoint === "string") {
-    const normalized = endpoint.trim().replace(/\/+$/u, "");
+    const normalized = endpoint.trim().replace(TRAILING_SLASHES, "");
     if (normalized.length > 0 && isUsableBaseUrl(normalized)) {
       env = { HF_ENDPOINT: normalized };
     }
@@ -78,7 +81,7 @@ export function allowRemoteEmbedding(config: ZgDeployConfig): boolean {
  * 任意变量（含与 zg 无关的敏感值）转发给子进程；`__proto__` / `constructor` 这类键还会
  * 让 `process.env[name]` 读到对象而不是字符串。不匹配的名字按「没配」处理。
  */
-const ENV_NAME_SHAPE = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+const ENV_NAME_SHAPE = /^[A-Za-z_]\w*$/u;
 
 /**
  * zg 子进程的环境变量：HF 镜像 + （仅在部署开放远程 embedding 时的）远程端点与凭据。
