@@ -27,8 +27,13 @@
  */
 const MINIMUM: ZgVersion = { major: 0, minor: 2, patch: 2 };
 
+/** 版本号的字面形态（回显用：门槛文案要让用户看得见自己装的是哪个版本）。 */
+export function formatZgVersion(version: ZgVersion): string {
+  return `${version.major}.${version.minor}.${version.patch}`;
+}
+
 /** 本包按之书写的 zg 语义版本（字面形态，给文案回显）。低于它一律在命令构造前拒绝。 */
-export const MINIMUM_ZG_VERSION = `${MINIMUM.major}.${MINIMUM.minor}.${MINIMUM.patch}`;
+export const MINIMUM_ZG_VERSION = formatZgVersion(MINIMUM);
 
 /** 一个解析出来的语义版本号。只三段：zg 的 `--version` 不给 pre/build 段。 */
 export interface ZgVersion {
@@ -48,13 +53,16 @@ const VERSION_SHAPE = /^\s*v?(?<major>\d{1,9})\.(?<minor>\d{1,9})\.(?<patch>\d{1
 
 /**
  * 不是版本号时用的哨兵：版本分量恒非负，故负数只可能来自「没解析出来」。
- * 三个函数都收敛成**单一 return**（`return a` 与 `return undefined` 混排会被本仓的
- * consistent-return 判成两种返回形态），故用哨兵而不是提前 return。
+ * `parseZgVersion` 收敛成**单一 return**（`return a` 与 `return undefined` 混排会被本仓的
+ * consistent-return 判成两种返回形态），故用哨兵而不是提前 return；其它函数不受此约束。
  */
 const UNPARSED = -1;
 
+/** 版本分量名。收成字面量联合，组名写错在编译期就红，不会退化成「永远读不懂」。 */
+type VersionPart = "major" | "minor" | "patch";
+
 /** 取一段具名捕获组；组不存在时给哨兵。 */
-function segment(found: RegExpExecArray | null, name: string): number {
+function segment(found: RegExpExecArray | null, name: VersionPart): number {
   const raw = found?.groups?.[name];
   return raw === undefined ? UNPARSED : Number(raw);
 }
@@ -68,11 +76,6 @@ export function parseZgVersion(stdout: string): ZgVersion | undefined {
   const parsed: ZgVersion | undefined =
     major < 0 || minor < 0 || patch < 0 ? undefined : { major, minor, patch };
   return parsed;
-}
-
-/** 版本号的字面形态（回显用：门槛文案要让用户看得见自己装的是哪个版本）。 */
-export function formatZgVersion(version: ZgVersion): string {
-  return `${version.major}.${version.minor}.${version.patch}`;
 }
 
 /** actual 是否 >= minimum：逐段比数值（不是比字符串，否则 `0.10.0 < 0.9.0`）。 */

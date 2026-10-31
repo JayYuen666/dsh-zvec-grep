@@ -220,7 +220,7 @@ describe("buildSearchCommand", () => {
     assert.equal(workdir, "/ws");
     assert.equal(
       command,
-      "zg query 'hi' --hybrid 'q1' --hybrid 'q2' --fts 'Foo' --fts 'Bar' --vector 'sem' --fuse --limit 3 --preview short --refresh wait " +
+      "zg query 'hi' --hybrid='q1' --hybrid='q2' --fts='Foo' --fts='Bar' --vector='sem' --fuse --limit 3 --preview short --refresh wait " +
         "--glob 'src/**' --iglob 'DOC/**' --type 'ts' --type-not 'md' --symbol-type 'class' --prefer-symbol " +
         "--modified-after '2026-01-01' --modified-before '2026-12-31' --device 'auto' --mode auto",
     );
@@ -230,8 +230,17 @@ describe("buildSearchCommand", () => {
     const { command } = buildSearchCommand({ root: "/ws", fts: ["needle"] }, zhMessages);
     assert.equal(
       command,
-      "zg query --fts 'needle' --limit 10 --preview short --refresh wait --device 'auto' --mode auto",
+      "zg query --fts='needle' --limit 10 --preview short --refresh wait --device 'auto' --mode auto",
     );
+  });
+
+  it("以 '-' 开头的路由查询串仍按值传：写成 --opt=value，不给 clap 当成选项", () => {
+    const { command } = buildSearchCommand(
+      { root: "/ws", fts: ["-foo"], vector: ["-bar"] },
+      zhMessages,
+    );
+    assert.match(command, /--fts='-foo'/u);
+    assert.match(command, /--vector='-bar'/u);
   });
 
   it("显式 device 覆盖默认 auto", () => {
@@ -326,6 +335,26 @@ describe("buildSearchCommand", () => {
     }
     assert.match(pinned, /clientMode/u, "钉死 direct 的那句要点名是模式问题");
     assert.ok(!pinned.includes("zg server on"), "钉死 direct 的那句不该给出「去起守护进程」的出路");
+    // 两个判据传岔时以 mode 为准：direct 部署的根因是模式钉死，不是守护进程没起。
+    let inconsistent = "";
+    try {
+      buildSearchCommand(
+        { root: "/ws", query: "x", refresh: "background" },
+        zhMessages,
+        "direct",
+        false,
+        "daemon-down",
+      );
+      assert.fail("direct 模式下 background 必须被拒");
+    } catch (error) {
+      inconsistent = error instanceof Error ? error.message : String(error);
+    }
+    assert.match(
+      inconsistent,
+      /clientMode/u,
+      "mode=direct 时即便 support 传成 daemon-down 也按模式问题报",
+    );
+    assert.ok(!inconsistent.includes("zg server on"));
     // 可用时才落到命令行上。
     const ok = buildSearchCommand(
       { root: "/ws", query: "x", refresh: "background" },

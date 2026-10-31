@@ -19,7 +19,9 @@ const TRAILING_SLASHES = /\/+$/u;
 /** 本模块读的部署值面（宿主 Config 的结构子集）。 */
 export interface ZgDeployConfig {
   readonly defaultEmbedding: { get: () => string | undefined };
-  readonly clientMode: ClientMode;
+  /** 宿主退化时可能交回非域值；收窄由 clientModeOf 负责，故这里声明 unknown。 */
+  readonly clientMode: unknown;
+  /** 命令构造与重建超时也用同一份部署值；本模块不读，但类型面共用一个结构子集。 */
   readonly stdoutMaxBytes: number;
   readonly indexTimeoutMs: number;
   readonly hfEndpoint: { get: () => string | undefined };
@@ -44,16 +46,14 @@ function isUsableBaseUrl(value: string): boolean {
  *  规范化（剥尾斜杠）之后还要再验一次：`/`、`///` 会被剥成空串，`http://` 这类没有
  *  host 的值也不是基地址——发一个空的或畸形的 HF_ENDPOINT 只会把失败推迟到
  *  node-llama-cpp 的下载期，定位成本远高于这里的一次静默省略。 */
+function normalizedEndpoint(value: string | undefined): string | undefined {
+  const normalized = typeof value === "string" ? value.trim().replace(TRAILING_SLASHES, "") : "";
+  return normalized.length > 0 && isUsableBaseUrl(normalized) ? normalized : undefined;
+}
+
 function hfEndpointEnv(config: ZgDeployConfig): Record<string, string> | undefined {
-  const endpoint = config.hfEndpoint.get();
-  let env: Record<string, string> | undefined;
-  if (typeof endpoint === "string") {
-    const normalized = endpoint.trim().replace(TRAILING_SLASHES, "");
-    if (normalized.length > 0 && isUsableBaseUrl(normalized)) {
-      env = { HF_ENDPOINT: normalized };
-    }
-  }
-  return env;
+  const endpoint = normalizedEndpoint(config.hfEndpoint.get());
+  return endpoint === undefined ? undefined : { HF_ENDPOINT: endpoint };
 }
 
 /**
@@ -103,7 +103,9 @@ const ENV_NAME_SHAPE = /^[A-Za-z_]\w*$/u;
 export function zgEnv(config: ZgDeployConfig): Record<string, string> | undefined {
   const env = { ...hfEndpointEnv(config) };
   if (allowRemoteEmbedding(config)) {
-    const endpoint = trimmedConfigString(config.remoteEmbeddingEndpoint);
+    // 与 HF 镜像同一套规范化与校验：畸形的远程端点宁可不带，也不再原样递给 zg
+    // 把失败推迟到真正发请求时才暴露。
+    const endpoint = normalizedEndpoint(config.remoteEmbeddingEndpoint);
     if (endpoint !== undefined) {
       env["ZVEC_GREP_ENDPOINT"] = endpoint;
     }
@@ -123,7 +125,7 @@ export function zgEnv(config: ZgDeployConfig): Record<string, string> | undefine
 export function readDefaultEmbedding(config: ZgDeployConfig): string {
   const raw = config.defaultEmbedding.get();
   if (typeof raw === "string" && isLocalEmbedding(raw)) {
-    return raw;
+    return raw.trim();
   }
   return DEFAULT_EMBEDDING;
 }

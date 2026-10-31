@@ -19,7 +19,7 @@
 // 官方作业品牌串（type-only：产物里零运行时引用，本文件仍是纯逻辑模块）。
 import type { JobId } from "@deepseek-ai/dsh-jobs";
 // 覆盖判据复用门禁/授权那一个（同一份 pathInsideRoot），不另写一套路径前缀比较。
-import { pathInsideRoot } from "./search-predicates.ts";
+import { normalizeRoot, pathInsideRoot } from "./search-predicates.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
 
 /** 活跃重建的两个阶段：起进程前后由 attach 划界。 */
@@ -56,13 +56,32 @@ export interface ActiveRebuild {
 /** 一条等待者的结果：区分「等到落定」与「自己先到头了」。 */
 export type WaitOutcome = "settled" | "timeout" | "aborted";
 
+/** 「某条占位已落定」这条承诺的收口：只交回结论，把 promise 本身留在注册表内部。 */
+async function settledOutcome(target: ActiveRebuild): Promise<WaitOutcome> {
+  await target.settled;
+  return "settled";
+}
+
 export interface RebuildRegistry {
   /** 原子占位。已有活跃重建 ⇒ null（调用方据此复用而不是再起一条）。 */
   claim: (root: string, origin: RebuildOrigin, startedAt?: number) => ActiveRebuild | null;
-  /** 官方注册接纳后补作业 id（同时把阶段推进到 running）。条目已释放则安全空转。 */
-  attach: (root: string, jobId: JobId) => void;
-  /** 释放占位并唤醒全部等待者；幂等，返回是否确实释放了一条。 */
-  release: (root: string) => boolean;
+  /**
+   * 官方注册接纳后补作业 id（同时把阶段推进到 running）。条目已释放则安全空转。
+   *
+   * 调用方**必须**把 claim 拿到的那枚条目当凭据传进来（第三位）：只按 root 写的话，
+   * claim 与 attach 之间那次 await 里占位可能已被释放、同根的新 claim 可能已经顶上来，
+   * 旧作业的 id 就会被写进**别人的**条目，新条目回显一个不属于它的、甚至早已落定的
+   * 作业号。传了凭据而条目已换代时**不写**并返回 false（调用方据此收掉那条作业）。
+   */
+  attach: (root: string, jobId: JobId, claimed?: ActiveRebuild) => boolean;
+  /**
+   * 释放占位并唤醒全部等待者；幂等，返回是否确实释放了一条。
+   *
+   * 同 attach：传了 claim 的凭据时先校验代次，条目已被同根的新 claim 顶替时返回
+   * false 且**不删、不 settle**——否则一份迟到的收尾会把同根的新条目连同它的等待者
+   * 一起兑现，同根就能同时跑两条 zg。
+   */
+  release: (root: string, claimed?: ActiveRebuild) => boolean;
   /** 当前该根的活跃条目（**精确键**：写操作的互斥判据就是它）。 */
   active: (root: string) => ActiveRebuild | undefined;
   /**
@@ -81,7 +100,6 @@ export interface RebuildRegistry {
    */
   covering: (root: string, messages: ZvecGrepMessages) => ActiveRebuild | undefined;
   /** 该根是否有「官方已接纳、持有作业 id」的活跃重建。 */
-  hasPollable: (root: string) => boolean;
   /**
    * 在给定时限内等**覆盖该根**的那条重建落定（口径同 covering）；条目中途消失也算落定
    * （等待者不会悬挂）。没有覆盖的重建时立刻返回 settled，不空等。
@@ -184,12 +202,14 @@ export function createRebuildRegistry(
   const entries = new Map<string, ActiveRebuild>();
   let crowded = false;
 
-  const release = (root: string): boolean => {
-    const entry = entries.get(root);
-    if (entry === undefined) {
+  const release = (root: string, claimed?: ActiveRebuild): boolean => {
+    const key = normalizeRoot(root);
+    const entry = entries.get(key);
+    // 代次校验：传了凭据而当前条目不是它 ⇒ 这次释放属于上一代作业，不许碰新条目。
+    if (entry === undefined || (claimed !== undefined && claimed !== entry)) {
       return false;
     }
-    entries.delete(root);
+    entries.delete(key);
     entry.settle();
     // 回落到阈值以下就重新武装告警：下一次真越阈值还要再报一次。
     if (entries.size <= maxTracked) {
@@ -200,7 +220,8 @@ export function createRebuildRegistry(
 
   return {
     claim(root, origin, startedAt): ActiveRebuild | null {
-      if (entries.has(root)) {
+      const key = normalizeRoot(root);
+      if (entries.has(key)) {
         return null;
       }
       // 用 withResolvers 而不是先建空 Promise 再补兑现函数：条目一诞生就同时拿到
@@ -210,7 +231,7 @@ export function createRebuildRegistry(
         resolve(undefined);
       };
       const entry: ActiveRebuild = {
-        root,
+        root: key,
         origin,
         startedAt: startedAt ?? now(),
         phase: "starting",
@@ -218,33 +239,31 @@ export function createRebuildRegistry(
         settled,
         settle,
       };
-      entries.set(root, entry);
+      entries.set(key, entry);
       crowded = warnIfCrowded(entries, maxTracked, crowded);
       return entry;
     },
 
-    attach(root: string, jobId: JobId): void {
-      const entry = entries.get(root);
-      // 条目已释放时（超时/取消先到）空转：那次的 zg 已经在别处被收掉了。
-      if (entry === undefined) {
-        return;
+    attach(root: string, jobId: JobId, claimed?: ActiveRebuild): boolean {
+      const entry = entries.get(normalizeRoot(root));
+      // 条目已释放（超时/取消先到）或已被同根的新 claim 顶替时**不写**：那次的 zg 已经
+      // 没有归属，调用方拿到 false 才能把它收掉，而不是让一条作业挂在别人的投影上。
+      if (entry === undefined || (claimed !== undefined && claimed !== entry)) {
+        return false;
       }
       entry.jobId = jobId;
       entry.phase = "running";
+      return true;
     },
 
     release,
 
     active(root: string): ActiveRebuild | undefined {
-      return entries.get(root);
+      return entries.get(normalizeRoot(root));
     },
 
     covering(root: string, messages: ZvecGrepMessages): ActiveRebuild | undefined {
-      return coveringOf(entries, root, messages);
-    },
-
-    hasPollable(root: string): boolean {
-      return entries.get(root)?.jobId !== undefined;
+      return coveringOf(entries, normalizeRoot(root), messages);
     },
 
     async wait(
@@ -253,7 +272,7 @@ export function createRebuildRegistry(
       timeoutMs: number,
       signal?: AbortSignal,
     ): Promise<WaitOutcome> {
-      const entry = coveringOf(entries, root, messages);
+      const entry = coveringOf(entries, normalizeRoot(root), messages);
       if (entry === undefined) {
         return "settled";
       }
@@ -276,12 +295,20 @@ export function createRebuildRegistry(
         resolve("aborted");
       };
       signal?.addEventListener("abort", onAbort, { once: true });
-      const settledOutcome = async (): Promise<WaitOutcome> => {
-        await entry.settled;
-        return "settled";
+      // 等的是「这条根**不再被任何重建覆盖**」，不是「startedAt 最早的那条落定」：
+      // 祖先与后代两条同时覆盖时必须都等到，否则调用方按 settled 重试会再撞 LOCK.BUSY。
+      // 逐轮重算覆盖集（而不是并行等所有条目）：一轮的赢家决定下一轮等谁，这是递归不是循环。
+      const waitCovering = async (target: ActiveRebuild): Promise<WaitOutcome> => {
+        const outcome = await Promise.race([settledOutcome(target), promise]);
+        if (outcome !== "settled") {
+          return outcome;
+        }
+        const next = coveringOf(entries, root, messages);
+        return next === undefined ? "settled" : waitCovering(next);
       };
       try {
-        return await Promise.race([settledOutcome(), promise]);
+        const outcome = await waitCovering(entry);
+        return outcome;
       } finally {
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);

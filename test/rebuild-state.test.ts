@@ -46,6 +46,15 @@ describe("占位互斥", () => {
     assert.deepEqual(rebuilds.keys().toSorted(), ["/a", "/b"]);
   });
 
+  it("尾斜杠归一到同一个键：/ws/ 与 /ws 互相占位", () => {
+    const rebuilds = createRebuildRegistry();
+    assert.notEqual(rebuilds.claim("/ws/", "card"), null);
+    assert.equal(rebuilds.claim("/ws", "tool"), null, "同一物理根的另一种写法必须被拒");
+    assert.equal(rebuilds.active("/ws/")?.root, "/ws");
+    assert.equal(rebuilds.release("/ws"), true);
+    assert.notEqual(rebuilds.claim("/ws/", "card"), null);
+  });
+
   it("释放之后同一根可以再次占位", () => {
     const rebuilds = createRebuildRegistry();
     rebuilds.claim("/ws", "card");
@@ -56,11 +65,11 @@ describe("占位互斥", () => {
 });
 
 describe("占位不是可轮询记录", () => {
-  it("官方注册之前没有作业 id，hasPollable 为假", () => {
+  it("官方注册之前没有作业 id", () => {
     const rebuilds = createRebuildRegistry();
     rebuilds.claim("/ws", "card");
     assert.equal(rebuilds.active("/ws")?.jobId, undefined);
-    assert.equal(rebuilds.hasPollable("/ws"), false);
+    assert.equal(rebuilds.active("/ws")?.jobId, undefined);
   });
 
   it("attach 之后才有作业 id，阶段同步推进到运行", () => {
@@ -71,7 +80,7 @@ describe("占位不是可轮询记录", () => {
     assert.ok(entry !== undefined, "attach 之后条目仍在");
     assert.equal(entry.jobId, "job-1");
     assert.equal(entry.phase, "running");
-    assert.equal(rebuilds.hasPollable("/ws"), true);
+    assert.equal(rebuilds.active("/ws")?.jobId, "job-1");
   });
 
   it("条目已释放时 attach 安全空转，不复活一条占位", () => {
@@ -80,7 +89,7 @@ describe("占位不是可轮询记录", () => {
     rebuilds.release("/ws");
     rebuilds.attach("/ws", jobIdOf("job-1"));
     assert.equal(rebuilds.active("/ws"), undefined);
-    assert.equal(rebuilds.hasPollable("/ws"), false);
+    assert.equal(rebuilds.active("/ws")?.jobId, undefined);
   });
 });
 
@@ -269,18 +278,91 @@ describe("覆盖判据（covering）", () => {
 
   it("等待也走同一条覆盖判据：等的是覆盖查询根的那条，不是精确键", async () => {
     const rebuilds = createRebuildRegistry();
-    rebuilds.claim(REPO, "card");
-    const waiting = rebuilds.wait(PKG, zh, 5000);
-    rebuilds.release(REPO);
+    const entry = rebuilds.claim(REPO, "card");
+    // claim 必须真的登记了条目：不登记的话 wait 在没有覆盖条目时立刻返回 settled，
+    // 后面的断言照样成立，本用例就成了恒绿（不变量根本量不到）。
+    assert.ok(entry !== null, "占位应当成功");
+    let settled = false;
+    const waiting = (async () => {
+      const outcome = await rebuilds.wait(PKG, zh, 5000);
+      settled = true;
+      return outcome;
+    })();
+    // release 之前仍处于等待：用「过一段真实时间还没落定」证明，而不是只读到最终值。
+    await delay(10);
+    assert.equal(settled, false, "释放之前等待者必须仍然挂着");
+    rebuilds.release(REPO, entry);
     assert.equal(await waiting, "settled", "子目录的等待者应被祖先那条重建的释放唤醒");
   });
 
   it("子目录等待不会被无关根的释放唤醒（各等各的）", async () => {
     const rebuilds = createRebuildRegistry();
-    rebuilds.claim(PKG, "card");
-    // /other 不被 /repo/pkg 覆盖 ⇒ 立刻落定，不空等。
-    assert.equal(await rebuilds.wait("/other", zh, 5000), "settled");
-    assert.equal(rebuilds.active(PKG) !== undefined, true, "等待不得动别人的占位");
+    const pkgEntry = rebuilds.claim(PKG, "card");
+    const otherEntry = rebuilds.claim("/other", "tool");
+    assert.ok(pkgEntry !== null && otherEntry !== null);
+    let settled = false;
+    const waiting = (async () => {
+      const outcome = await rebuilds.wait(`${PKG}/src`, zh, 5000);
+      settled = true;
+      return outcome;
+    })();
+    await delay(10);
+    assert.equal(settled, false, "覆盖条目还在，等待不得提前落定");
+    // 释放一条**不覆盖**查询根的占位：它不许把仍在等的那条兑现（这正是本用例的标题）。
+    rebuilds.release("/other", otherEntry);
+    await delay(10);
+    assert.equal(settled, false, "无关根的 release 不得唤醒等待者");
+    assert.equal(rebuilds.active(PKG), pkgEntry, "等待期间那个占位不能被动过");
+    rebuilds.release(PKG, pkgEntry);
+    assert.equal(await waiting, "settled");
+  });
+
+  it("祖先与后代两条同时覆盖时必须都等到（不许第一条落定就报 settled）", async () => {
+    // 调用方按 settled 重试会再撞 zg 的写锁：只等 startedAt 最早那条等于骗它「可以重试了」。
+    const rebuilds = createRebuildRegistry();
+    const repoEntry = rebuilds.claim(REPO, "card", 100);
+    const pkgEntry = rebuilds.claim(PKG, "tool", 200);
+    assert.ok(repoEntry !== null && pkgEntry !== null);
+    let settled = false;
+    const waiting = (async () => {
+      const outcome = await rebuilds.wait(`${PKG}/src`, zh, 5000);
+      settled = true;
+      return outcome;
+    })();
+    await delay(10);
+    assert.equal(settled, false);
+    // startedAt 最早的那条（覆盖判据先返回它）落定之后，后代那条仍覆盖查询根。
+    rebuilds.release(REPO, repoEntry);
+    await delay(10);
+    assert.equal(settled, false, "还有一条覆盖该根的重建在跑，不得报 settled");
+    rebuilds.release(PKG, pkgEntry);
+    assert.equal(await waiting, "settled");
+  });
+
+  it("迟到的 release/attach 不会删改同根的新一代占位（代次校验）", async () => {
+    const rebuilds = createRebuildRegistry();
+    const stale = rebuilds.claim("/ws", "card");
+    assert.ok(stale !== null);
+    assert.equal(rebuilds.release("/ws", stale), true);
+    const fresh = rebuilds.claim("/ws", "tool");
+    assert.ok(fresh !== null);
+    // 上一代作业的收尾迟到：不许删掉新条目，也不许兑现新条目的等待者。
+    let settled = false;
+    void (async () => {
+      await rebuilds.wait("/ws", zh, 5000);
+      settled = true;
+    })();
+    await delay(5);
+    assert.equal(rebuilds.release("/ws", stale), false, "上一代的 release 必须被代次校验拒绝");
+    assert.equal(rebuilds.active("/ws"), fresh, "新条目必须还在");
+    assert.equal(settled, false, "被拒的 release 不得 settle 新条目的等待者");
+    // attach 同理：旧作业号不许写进新条目。
+    assert.equal(rebuilds.attach("/ws", jobIdOf("job-stale"), stale), false);
+    assert.equal(fresh.jobId, undefined, "新条目的 jobId 不得被旧作业写上");
+    assert.equal(rebuilds.attach("/ws", jobIdOf("job-fresh"), fresh), true);
+    assert.equal(rebuilds.active("/ws")?.jobId, "job-fresh");
+    rebuilds.release("/ws", fresh);
+    assert.equal(await rebuilds.wait("/ws", zh, 0), "settled");
   });
 });
 

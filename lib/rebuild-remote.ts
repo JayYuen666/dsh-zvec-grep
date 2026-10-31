@@ -47,7 +47,7 @@ import { assertIgnoreFilesExist } from "./index-preflight.ts";
 import { fill } from "./messages.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
 import { procSandboxNote } from "./sandbox-note.ts";
-import type { RebuildRegistry } from "./rebuild-state.ts";
+import type { ActiveRebuild, RebuildRegistry } from "./rebuild-state.ts";
 import { REBUILD_REMOTE_NAMESPACE } from "./rebuild-shape.ts";
 import type {
   RebuildRefusedStatus,
@@ -336,11 +336,16 @@ function killProc(proc: Pick<ShellExecution, "kill">): void {
 function pruneRebuildHistory(jobs: JobsService, records: Map<string, RebuildRecord>): void {
   const ours = jobs.list().filter((job) => job.kind === REBUILD_JOB_KIND);
   const settled = ours.filter((job) => !isLiveStatus(job.status));
-  for (const job of settled.slice(0, Math.max(settled.length - (REBUILD_HISTORY_MAX - 1), 0))) {
+  // list() 的返回顺序不属于契约；按官方签发的 startedAt 升序淘汰最老的几条。
+  const ordered = settled.toSorted((left, right) => left.startedAt - right.startedAt);
+  for (const job of ordered.slice(0, Math.max(ordered.length - (REBUILD_HISTORY_MAX - 1), 0))) {
     jobs.remove(job.id);
     records.delete(job.id);
   }
 }
+
+/** 远端容量上限的括号形态。 */
+const CAPACITY_LIMIT = /\(limit: (?<limit>\d+)\)/u;
 
 /**
  * 从官方容量闸的错误文本里取出上限（实测原文：`background job limit reached for this
@@ -348,9 +353,6 @@ function pruneRebuildHistory(jobs: JobsService, records: Map<string, RebuildReco
  * 为什么单独认这一条：它是本包唯一会把宿主英文原话插进中文卡片的错误，又恰恰最该翻成
  * 人话的那一条——用户此时要做的是去 job_list 里收掉不需要的作业，而不是读一句英文。
  */
-/** 远端容量上限的括号形态。 */
-const CAPACITY_LIMIT = /\(limit: (?<limit>\d+)\)/u;
-
 function capacityLimitOf(error: unknown): string | undefined {
   const matched = CAPACITY_LIMIT.exec(errorText(error));
   return matched?.groups?.["limit"];
@@ -460,19 +462,18 @@ function startUnderController(jobs: JobsService, spec: JobSpec): JobId {
 /**
  * 交给注册表的作业规格：输出源 + `run` 的两枚钩子（cancel / done）与那枚 kill 定时器。
  * 单独成一段是因为它只在 `start` 的那一拍被同步调用一次，与「登记进侧表」是两件事。
- * @param routes 本次注册的共享依赖（config 现读超时、host 挂 timer、jobsOf 现读注册表）
- * @param proc 已经起来的 zg 进程
- * @param state 这条重建的状态盒（与侧表记录共用）
- * @param command 实际执行的命令行（作业 label，模型在 job_list 里看见的那句）
+ * @param options 一次启动所需的全部输入：共享依赖、已起的进程、状态盒、命令、根与 claim 凭据
  * @returns 官方 JobSpec：kind / label / output / run
  */
-function rebuildJobSpec(
-  routes: IndexWriteRoutes,
-  proc: ShellExecution,
-  state: RebuildState,
-  command: string,
-  root: string,
-): JobSpec {
+function rebuildJobSpec(options: {
+  routes: IndexWriteRoutes;
+  proc: ShellExecution;
+  state: RebuildState;
+  command: string;
+  root: string;
+  claimed: ActiveRebuild | undefined;
+}): JobSpec {
+  const { routes, proc, state, command, root, claimed } = options;
   const { config, host, jobsOf, messages } = routes;
   return {
     kind: REBUILD_JOB_KIND,
@@ -507,7 +508,8 @@ function rebuildJobSpec(
         if (live !== null && live.status !== "running") {
           return;
         }
-        const minutes = Math.round(config.indexTimeoutMs / 60_000);
+        // 亚分钟超时向上取整到 1 分钟，文案才不会写成「超过 0 分钟」。
+        const minutes = Math.max(1, Math.ceil(config.indexTimeoutMs / 60_000));
         state.timeoutNote = fill(messages().rebuildTimeout, { minutes });
         if (live === null) {
           // 注册表已经不认这条了（服务被重载）⇒ 只剩我们手里的进程可收，直接杀。
@@ -517,7 +519,14 @@ function rebuildJobSpec(
         // 超时也经注册表收，而不是绕过它直接杀进程：官方件据此把记录推到 stopping，
         // 并把 reason 追加进模型可见的 detail（实测），模型因此分得清"超时回收"与
         // "用户手工 job_kill"；进程本身由它回调上来的 cancel() 终止。
-        live.jobs.kill(handle.id, undefined, fill(messages().jobReasonTimeout, { minutes }));
+        try {
+          live.jobs.kill(handle.id, undefined, fill(messages().jobReasonTimeout, { minutes }));
+        } catch {
+          // 注册表这一侧同样可能失效（不认识这条 id、controller 已被换掉、注册表已销毁）；
+          // 异常从 timer 回调里逃出去不会有任何人接手，而这条定时器存在的唯一理由就是
+          // 「zg 不能永远挂着」——退回手里这枚进程直接收，作业落定仍由 done 的 finally 负责。
+          killProc(proc);
+        }
       }, config.indexTimeoutMs);
       return {
         cancel: () => {
@@ -538,7 +547,9 @@ function rebuildJobSpec(
             return jobOutcomeOf(proc);
           } finally {
             cancelKillTimer();
-            routes.rebuilds.release(root);
+            // 带凭据释放：这份收尾可能比占位的释放/同根的新 claim 更晚到，
+            // 没有代次校验就会删掉新条目并兑现它的等待者（同根于是能跑两条 zg）。
+            routes.rebuilds.release(root, claimed);
           }
         })(),
       };
@@ -617,6 +628,8 @@ export async function spawnIndexWrite(
  * @param root 已过前置校验的工作区（写进侧表供卡片回显）
  * @param started 本次请求语言的文案表
  * @param spawned spawnIndexWrite 交回的进程与命令
+ * @param claimed claim 拿到的那枚占位（重建/后台路径必有）：收尾释放按它校验代次，
+ * 条目已被同根新 claim 顶替时那份迟到的释放不许删掉新条目
  * @returns 宿主签发的 `{ jobId }`；失败为 `{ error, status }`
  */
 export function attachIndexWrite(
@@ -624,6 +637,7 @@ export function attachIndexWrite(
   root: string,
   started: ZvecGrepMessages,
   spawned: { proc: ShellExecution; command: string },
+  claimed?: ActiveRebuild,
 ): { jobId: JobId } | { error: string; status: RebuildRefusedStatus } {
   const { jobsOf, records } = routes;
   const { proc, command } = spawned;
@@ -654,7 +668,10 @@ export function attachIndexWrite(
   };
   let jobId: JobId;
   try {
-    jobId = startUnderController(starting, rebuildJobSpec(routes, proc, state, command, root));
+    jobId = startUnderController(
+      starting,
+      rebuildJobSpec({ routes, proc, state, command, root, claimed }),
+    );
     // 登记进侧表与身份证都在 start **成功之后**：`run()` 里任何一步抛错（宿主 timer 面
     // 已拆就是这一档）都会被官方件按"不注册、序号作废"处理，那时侧表里不该留着这条。
     state.identity = identityOf(starting.get(jobId));
@@ -742,7 +759,13 @@ export class ZvecRebuildService extends TypertRemoteService {
   /** 引导读面：白名单里的工作区 + 守护进程就绪态（都是本插件自己的数据）。 */
   public async roots(): Promise<RebuildRoots> {
     // 守护进程就绪态走 TTL 缓存（与三条工具同一份），卡片每开一次不至于多起一次 zg。
-    const serverReady = await this.deps.serverGate.ready();
+    // 探测失败只说明守护进程没就绪，不该让白名单一起拿不到：读面保留，标 false。
+    let serverReady = false;
+    try {
+      serverReady = await this.deps.serverGate.ready();
+    } catch {
+      // 探测失败按未就绪处理，保留默认的 false。
+    }
     return { roots: this.deps.ledger.list(), serverReady };
   }
 
@@ -771,7 +794,8 @@ export class ZvecRebuildService extends TypertRemoteService {
       // 没有容量、也没有人能在 job_list 里看到它，起一条没人管的 zg 比不起更糟。
       return { ok: false, error: started.endpointJobsUnavailable, status: 503 };
     }
-    if (this.deps.rebuilds.claim(root, "card") === null) {
+    const claimed = this.deps.rebuilds.claim(root, "card");
+    if (claimed === null) {
       // 抢不到说明同根已有一条在跑：把那条的 id 回给这张面板跟随。
       // 跟不到（它正在落定、或注册表刚被换过）也要**答完**：这一支直接返回而不回答，
       // 卡片侧只会看到一次「查询状态失败」并停止轮询，而那条重建还在界面上凭空消失。
@@ -789,15 +813,20 @@ export class ZvecRebuildService extends TypertRemoteService {
     );
     if ("error" in spawned) {
       // spawn 抛错或被拒：占位必须交还，否则这棵树会被永久标记成「重建中」。
-      this.deps.rebuilds.release(root);
+      this.deps.rebuilds.release(root, claimed);
       return { ok: false, error: spawned.error, status: spawned.status };
     }
-    const attached = attachIndexWrite(this.deps, root, started, spawned);
+    const attached = attachIndexWrite(this.deps, root, started, spawned, claimed);
     if ("error" in attached) {
-      this.deps.rebuilds.release(root);
+      this.deps.rebuilds.release(root, claimed);
       return { ok: false, error: attached.error, status: attached.status };
     }
-    this.deps.rebuilds.attach(root, attached.jobId);
+    // 带凭据 attach：注册表只在占位仍是这一代时写入作业号（代次校验在 lib/rebuild-state.ts，
+    // 有它自己的用例）。从 claim 到这一行只有 spawnIndexWrite 里那一次 await，本方法自己的
+    // 失败出口都先 release，别的入口在占位存在时 claim 必返回 null（只跟随或答 409），所以
+    // 占位不可能在这段里被释放或顶替——那条「attach 失败就 kill 并答 409」的兜底永远走不到。
+    // 将来若在这行之前插进新的 await，必须把它加回来。
+    this.deps.rebuilds.attach(root, attached.jobId, claimed);
     return { ok: true, jobId: attached.jobId };
   }
 

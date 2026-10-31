@@ -10,14 +10,21 @@
 // 快照 value 是已提交层，两层的优先级只由这里决定。
 
 /** 草稿优先取值：touched 有该键（哪怕值是 undefined=待清空）即用草稿。
- *  只判**自有**属性：本函数收任意字段名，`in` 会沿原型链命中 `toString` /
- *  `constructor` 这类继承键，把 Object.prototype 的成员当成草稿交出去。 */
+ *  两层都只判**自有**属性：本函数收任意字段名，`in`/裸下标会沿原型链命中 `toString` /
+ *  `constructor` 这类继承键，把 Object.prototype 的成员当成已提交值交出去。 */
+export function hasDraft(touched: Record<string, unknown>, field: string): boolean {
+  return Object.hasOwn(touched, field);
+}
+
 export function draftOf(
   touched: Record<string, unknown>,
   value: Record<string, unknown>,
   field: string,
 ): unknown {
-  return Object.hasOwn(touched, field) ? touched[field] : value[field];
+  if (hasDraft(touched, field)) {
+    return touched[field];
+  }
+  return Object.hasOwn(value, field) ? value[field] : undefined;
 }
 
 /** 数值型输入的显示文本：非有限数（含 undefined）回落到默认文案。 */

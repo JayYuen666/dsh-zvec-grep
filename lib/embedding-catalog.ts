@@ -31,7 +31,7 @@ export const DEFAULT_EMBEDDING = "local/qwen3-embedding-0.6b";
 const TRANSFORMERS_JS_BACKEND: LocalEmbeddingBackend = "transformers-js";
 
 /**
- * 本地候选清单，按后端分三档（体积/语言口径，实测 zg v0.2.1）：
+ * 本地候选清单，按后端分三档（体积/语言口径，实测 zg v0.2.2）：
  *   - llama-cpp：qwen3-embedding-0.6b 约 640MB（本包默认）、
  *     embeddinggemma-300m 约 300MB（英文）——两档都要原生件，Metal 加速由 zg 侧 device=auto 试；
  *   - model2vec：potion-code-16m-v2 约 32MB（代码专用、最轻最快）、potion-multilingual-128m
@@ -39,7 +39,7 @@ const TRANSFORMERS_JS_BACKEND: LocalEmbeddingBackend = "transformers-js";
  *   - transformers-js：其余 ONNX 小模型，384 维那批是英文/多语言轻量档，768 维那批里
  *     jina 面向代码、gte/nomic 面向 8192 长文。
  */
-export const LOCAL_EMBEDDINGS: readonly LocalEmbeddingOption[] = [
+const EMBEDDINGS: LocalEmbeddingOption[] = [
   {
     reference: "local/qwen3-embedding-0.6b",
     backend: "llama-cpp",
@@ -97,6 +97,11 @@ export const LOCAL_EMBEDDINGS: readonly LocalEmbeddingOption[] = [
   },
 ];
 
+export const LOCAL_EMBEDDINGS: readonly LocalEmbeddingOption[] = Object.freeze(
+  EMBEDDINGS.map((entry) => Object.freeze(entry)),
+);
+
 export function isLocalEmbedding(reference: string): boolean {
-  return LOCAL_EMBEDDINGS.some((entry) => entry.reference === reference);
+  const normalized = reference.trim();
+  return LOCAL_EMBEDDINGS.some((entry) => entry.reference === normalized);
 }

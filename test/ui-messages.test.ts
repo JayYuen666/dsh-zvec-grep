@@ -42,11 +42,38 @@ describe("设置卡双语字典", () => {
     assert.doesNotMatch(JSON.stringify(UI_MESSAGES.en), /[\u4E00-\u9FFF]/u);
   });
 
-  it("带插值的条目确实是模板（渲染点靠 params 填，不靠字符串拼接）", () => {
-    for (const key of ["limitInvalid", "limitClamped", "modelOption", "rebuildHint"] as const) {
-      assert.ok(placeholders(UI_MESSAGES.zh[key]).size > 0, `${key} 应含占位符`);
+  it("带插值的条目是模板，且每个占位符都被独立登记（渲染点漏参数会红）", () => {
+    // 期望逐个键写死，不从字典自身派生。原先只断言「这四个键含占位符」，于是：
+    //   · 两语**同时**漏掉某个占位符时，上面那条「两语一致」照样绿（集合都是空/同小）；
+    //   · 渲染点 params 少传一位，模板留下一段 `{reason}` 字面量也没人发现。
+    const EXPECTED: Partial<Record<keyof UiMessages, readonly string[]>> = {
+      dirtyCount: ["count"],
+      saveFailed: ["reason"],
+      limitInvalid: ["min", "max"],
+      limitClamped: ["min", "max", "value"],
+      budgetHint: ["default"],
+      windowHint: ["default"],
+      rebuildHint: ["embedding", "roots"],
+      rebuildExitCode: ["exitCode"],
+      modelOption: ["reference", "dimension"],
+    };
+    for (const [key, expected] of Object.entries(EXPECTED) as [
+      keyof UiMessages,
+      readonly string[],
+    ][]) {
+      for (const locale of ["zh", "en"] as const) {
+        assert.deepEqual(
+          [...placeholders(UI_MESSAGES[locale][key])].toSorted(),
+          [...expected].toSorted(),
+          `${locale}.${key} 的占位符与登记不符`,
+        );
+      }
     }
-    assert.match(UI_MESSAGES.zh.modelOption, /\{dimension\}/u);
-    assert.match(UI_MESSAGES.en.modelOption, /\{dimension\}/u);
+    // 反向：字典里出现带花括号的模板却没登记，等于新增了一个没人守的插值面。
+    for (const key of KEYS) {
+      if (placeholders(UI_MESSAGES.zh[key]).size > 0) {
+        assert.ok(key in EXPECTED, `${key} 带占位符，却没登记到期望表`);
+      }
+    }
   });
 });

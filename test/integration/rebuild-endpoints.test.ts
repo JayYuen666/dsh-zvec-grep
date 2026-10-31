@@ -172,17 +172,18 @@ async function waitSettled(
   host: Host,
   jobId: string,
   deadlineAt: number,
-  timeoutMs = 60_000,
 ): Promise<RebuildSnapshot> {
   const done = settledSnapshot(readStatus(host, jobId));
   if (done !== undefined) {
     return done;
   }
+  // 递归时必须把**同一个**截止点传下去。原先每层重算 Date.now() + timeoutMs，等于没有截止：
+  // 作业一直不落定就轮询到 vitest 的用例超时，报出来的是「用例超时」而不是它等的那件事没发生。
   if (Date.now() > deadlineAt) {
     throw new Error(`rebuild ${jobId} did not settle`);
   }
   await sleep(200);
-  return waitSettled(host, jobId, Date.now() + timeoutMs, timeoutMs);
+  return waitSettled(host, jobId, deadlineAt);
 }
 
 describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", () => {
@@ -361,28 +362,33 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
     restoreFake?.();
     restoreFake = installFakeZg({ ms: 5000, pidFile });
     const host = await startHost({ indexTimeoutMs: 60_000 });
-    const ws = observedWorkspace();
-    await observe(ws, host);
-    const { jobId } = startedOf(await startRebuild(host, ws));
-    // 进程真的起来了（假 zg 把 pid 落地）。
-    const pid = await waitForPid();
-    assert.ok(Number.isInteger(pid) && pid > 0, pidFile);
-    expect(host.ctx.jobs.list().some((row) => row.id === jobId)).toBe(true);
+    // 这个用例故意造「卸载时还有活作业」：任何一条断言失败都必须把宿主收掉，否则那条
+    // 假 zg（ms:5000）与已绑定的端口会留给后面的用例，失败点从断言漂到污染。
+    try {
+      const ws = observedWorkspace();
+      await observe(ws, host);
+      const { jobId } = startedOf(await startRebuild(host, ws));
+      // 进程真的起来了（假 zg 把 pid 落地）。
+      const pid = await waitForPid();
+      assert.ok(Number.isInteger(pid) && pid > 0, pidFile);
+      expect(host.ctx.jobs.list().some((row) => row.id === jobId)).toBe(true);
 
-    // 旧 URL 在**装载态**就是 404：读面走的是官方网关，不是本包注册的 webServer 路由。
-    // 只在卸载之后测一次的话，将来谁把路由加回来也不会红。
-    const during = await fetch(`http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`);
-    assert.equal(during.status, 404);
+      // 旧 URL 在**装载态**就是 404：读面走的是官方网关，不是本包注册的 webServer 路由。
+      // 只在卸载之后测一次的话，将来谁把路由加回来也不会红。
+      const during = await fetch(`http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`);
+      assert.equal(during.status, 404);
 
-    await host.unload();
-    // 卸载效应收口：走**官方注册表** kill（不是绕过它直接杀进程）⇒ 名册里那条被推到
-    // stopping/killed，模型侧 job_list 看得见结局；环也由官方件收。
-    const terminal = await waitTerminal(host, jobId, Date.now() + 5000);
-    expect(terminal, "卸载后那条作业必须离开 running").not.toBe("running");
+      await host.unload();
+      // 卸载效应收口：走**官方注册表** kill（不是绕过它直接杀进程）⇒ 名册里那条被推到
+      // stopping/killed，模型侧 job_list 看得见结局；环也由官方件收。
+      const terminal = await waitTerminal(host, jobId, Date.now() + 5000);
+      expect(terminal, "卸载后那条作业必须离开 running").not.toBe("running");
 
-    const alive = await waitForExit(pid);
-    assert.equal(alive, false, `进程 ${pid} 必须被收掉`);
-    await host.dispose();
+      const alive = await waitForExit(pid);
+      assert.equal(alive, false, `进程 ${pid} 必须被收掉`);
+    } finally {
+      await host.dispose();
+    }
   }, 120_000);
 
   it("超过 indexTimeoutMs：kill 定时器收进程，轮询读面说明为什么没跑完", async () => {

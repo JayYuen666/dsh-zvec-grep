@@ -3,7 +3,7 @@
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import vm from "node:vm";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -27,6 +27,26 @@ const PKG_NAME = (
 
 /** 本包目录（绝对路径），用于核对 profile 的 link: 目标。 */
 const PKG_DIR = path.resolve(import.meta.dirname, "..");
+
+/**
+ * 判断 profile 里那枚依赖的落点是不是本目录。
+ *
+ * 判据是「剥掉 link:/file: 前缀后解析成绝对路径，再与 PKG_DIR 等值比较」，不是子串：
+ * 按包含关系判定时，相邻目录（dsh-zvec-grep-copy、dsh-zvec-grep2）会命中同一份断言，
+ * 于是测试对着另一份检出钉「清单里恰有一条 / link 指向本目录」，结果随目录命名漂移。
+ *
+ * @param target - profile 的 dependencies[本包] 值
+ * @returns 指向本目录时为 true
+ */
+function linksToThisCheckout(target: unknown): boolean {
+  if (typeof target !== "string") {
+    return false;
+  }
+  const resolved = path.resolve(target.replace(/^(?:link|file):/u, ""));
+  const real = existsSync(resolved) ? realpathSync(resolved) : resolved;
+  const here = existsSync(PKG_DIR) ? realpathSync(PKG_DIR) : PKG_DIR;
+  return real === here;
+}
 
 /**
  * profile 的 bundle 清单（`~/.dsh/profiles/web/package.json` → `dsh.profile.bundles`）
@@ -54,32 +74,32 @@ function profileBundleName(): string {
     dependencies?: Record<string, unknown>;
     dsh?: { profile?: { bundles?: unknown } };
   };
-  const bundles: unknown = profile.dsh?.profile?.bundles;
-  assert.ok(Array.isArray(bundles), `${profilePath} 的 dsh.profile.bundles 应是数组`);
-  // link 指向的是"哪一份检出"：本机 profile 装的就是这一份时，才顺手钉"清单里恰有一条、
-  // 且只指向本目录"这两道机器侧针（改名/残留副本没人拦就是真缺陷）。指向别处时（单包仓的
-  // 暂存副本、消费者自己的检出）这条针不适用 —— 拿别的机器的安装状态判红等于把开发机
-  // 状态写进包测试，故跳过而不是失败。
+  // link 指向的是"哪一份检出"：先判本机 profile 装的是不是这一份。指向别处时（单包仓的
+  // 暂存副本、消费者自己的检出）下面这些机器侧针不适用——拿别的机器的安装状态判红等于把
+  // 开发机状态写进包测试，故跳过而不是失败。**顺序**：形状检查必须排在这条判定之后，
+  // 否则别人机器上另一个版本的 profile（没有 dsh.profile.bundles）会让本包测试先炸。
   const installedHere: unknown = profile.dependencies?.[PKG_NAME];
-  if (!(typeof installedHere === "string" && installedHere.includes(PKG_DIR))) {
+  if (!linksToThisCheckout(installedHere)) {
     return PKG_NAME;
   }
+  const bundles: unknown = profile.dsh?.profile?.bundles;
+  assert.ok(Array.isArray(bundles), `${profilePath} 的 dsh.profile.bundles 应是数组`);
   const listed = (bundles as unknown[]).filter((item) => item === PKG_NAME);
   assert.deepEqual(listed, [PKG_NAME], "本包在 profile 的 bundles 清单里，且只列一次");
   const link: unknown = profile.dependencies?.[PKG_NAME];
   assert.equal(typeof link, "string", "profile 的 dependencies 指向本包");
-  assert.ok(
-    typeof link === "string" && link.includes(PKG_DIR),
-    `profile 的 link 目标应是本目录（实得 ${String(link)}）`,
-  );
+  assert.ok(linksToThisCheckout(link), `profile 的 link 目标应是本目录（实得 ${String(link)}）`);
   return PKG_NAME;
 }
 
 /** 本包 cordis.patch.yml 声明的裸条目 id（= 0.1.7 的 settings 命名空间）。 */
 function patchEntryIds(): string[] {
   const patch = readFileSync(path.join(PKG_DIR, "cordis.patch.yml"), "utf8");
+  // 条目层级是结构性的：顶层 `- insert:` 之下，每条条目是 4 空格缩进的 `- id: <裸条目 id>`。
+  // 不用 `^\s*`：它在 m 标志下会把任意缩进层级（乃至嵌套子项的 id）都当成条目，
+  // patch 结构一加嵌套，bareIds 就会多出条目而误红。
   return Array.from(
-    patch.matchAll(/^\s*(?:-\s+)?id:\s*(?<id>\S+)\s*$/gmu),
+    patch.matchAll(/^ {4}- id:\s+(?<id>\S+)\s*$/gmu),
     (row) => row.groups?.["id"] ?? "",
   );
 }
@@ -357,19 +377,21 @@ describe("buildClient()", () => {
     const out = await buildClient();
     assert.ok(out.includes(UI_MESSAGES.zh.embeddingHint), "中文那份在产物里");
     assert.ok(out.includes(UI_MESSAGES.en.embeddingHint), "英文那份在产物里");
-    assert.ok(
-      out.includes("locale.register") || out.includes(".register("),
-      "官方 locale 注册面在产物里",
-    );
+    // 只认官方的 locale.register 调用点：`.register(` 这个兜底会让 slots.register /
+    // effects.register 之类无关调用也满足「locale 注册面在产物里」。
+    assert.ok(out.includes("locale.register("), "官方 locale 注册面在产物里");
   });
 
   it("ZgCard 的配置值取自 snap.value 那一层，不是整枚快照", async () => {
     const out = await buildClient();
     // 快照契约是 {status, writable, value: {...}}：把 snap 整个当 value 用时配置读不到，
     // 卡片只会恒显示默认值，而且一声不响。
+    // 单一判据：只认 snap.value 这一层。三选一兜底几乎恒绿——`.value ?? {}` 与
+    // `[snap.value` 这种片段在无关代码里也很容易命中，卡片改回「整枚快照当 value」时
+    // 只要产物别处恰好有一个 `.value ?? {}` 就仍然通过。
     assert.ok(
-      out.includes("snap.value") || out.includes(".value ?? {}") || out.includes("[snap.value"),
-      "产物应含 snap.value 解构（快照契约 {status, writable, value:{...}}）",
+      out.includes("snap.value"),
+      "产物应含 snap.value 取用（快照契约 {status, writable, value:{...}}）",
     );
   });
 });
@@ -394,7 +416,9 @@ async function loadClientExports(): Promise<{
     console,
   };
   vm.createContext(sandbox);
-  vm.runInContext(out, sandbox);
+  // 给求值设上限：产物里出现死循环（构建器或外壳拼接回归）时应当得到一条失败用例，
+  // 而不是把整个 vitest worker 挂死。
+  vm.runInContext(out, sandbox, { timeout: 5000 });
   const loaded = sandbox.loadedDef;
   assert.ok(
     loaded && typeof loaded === "object" && typeof loaded.factory === "function",
@@ -426,9 +450,15 @@ async function loadClientExports(): Promise<{
   });
   const exports = mod as { apply?: unknown; inject?: unknown };
   assert.equal(typeof exports.apply, "function");
+  // 运行时校验，不是纯编译期强转：产物把 inject 换成对象/字符串/undefined 时，
+  // `...undefined` 只会抛「not iterable」这类看不出契约变化的低信息 TypeError。
+  assert.ok(Array.isArray(exports.inject), "产物应导出 inject 数组（服务名清单）");
+  for (const name of exports.inject) {
+    assert.equal(typeof name, "string", `inject 里应是服务名，实得 ${String(name)}`);
+  }
   return {
     apply: exports.apply as (ctx: unknown) => void,
-    inject: [...(exports.inject as unknown[])] as string[],
+    inject: [...(exports.inject as string[])],
   };
 }
 
@@ -479,6 +509,8 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
       "槽 key 与本包 package.json 的 name 同源（改名不再两边抄）",
     );
     const payload = trace.payload as CardPayload;
+    assert.equal(typeof payload.set, "function", "payload 应带 set（产物契约变了）");
+    assert.equal(typeof payload.unset, "function", "payload 应带 unset（产物契约变了）");
     // 写通道受理位 Promise<boolean> **原样透传**给卡片（消费在 save()：false →
     // saveRejected 文案且整批保留 touched；reject → saveFailed）——旧版在此 await 后
     // 刻意不消费（"消费=改行为"），一次合规修复即是那次行为变更。

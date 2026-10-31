@@ -24,6 +24,11 @@ describe("fill（host 侧 {name} 插值）", () => {
     assert.equal(fill("exit={exit}", { exit: null }), "exit=null");
   });
 
+  it("原型链上的键不当作参数：constructor/toString 渲染成空串", () => {
+    assert.equal(fill("{constructor}-{toString}", {}), "-");
+    assert.equal(fill("{constructor}", { constructor: "own" }), "own");
+  });
+
   it("缺键替成空串：文案不该因一个占位符打断工具调用", () => {
     assert.equal(fill("a{missing}b", { other: 1 }), "ab");
   });

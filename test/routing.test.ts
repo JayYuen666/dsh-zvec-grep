@@ -170,7 +170,14 @@ describe("isGrepRgCommand", () => {
     assert.equal(isGrepRgCommand("/opt/homebrew/bin/rg foo src"), true);
     assert.equal(isGrepRgCommand("git grep foo"), true);
     assert.equal(isGrepRgCommand('find . -name "*.ts" | xargs grep TODO'), true);
-    assert.equal(isGrepRgCommand('rg "foo|bar" && echo done'), true);
+    assert.equal(isGrepRgCommand('rg "foo|bar" && done'), true);
+  });
+
+  it("管道下游带重定向：I/O 落点不是路径操作数，仍按流过滤判（hasPathOperand 的 redirect 分支）", () => {
+    // 回归用例：`grep foo > /tmp/out` 里那个绝对路径是输出落点，不是被检索的目录。
+    // 它若被当成路径操作数，纯流过滤就会被误判成「检索」而拦下。
+    assert.equal(isGrepRgCommand("cat a | grep foo > /tmp/out"), false);
+    assert.equal(isGrepRgCommand("cat a | grep foo src/ > /tmp/out"), true);
   });
 
   it("包装命令自己的选项、取值、裸数值与壳层赋值都不断开命令位链", () => {
@@ -185,6 +192,26 @@ describe("isGrepRgCommand", () => {
     // 反向：这些形态之后没有检索调用，仍旧不命中（不能因为放宽而误拦）
     assert.equal(isGrepRgCommand("git log"), false);
     assert.equal(isGrepRgCommand("nice -n 10 echo hi"), false);
+  });
+
+  it("包装选项与检索侧同名但语义相反：不吃取值（漏判回归）", () => {
+    // 共用一张跨包装的取值表时，下面每条里 grep 前面那枚旗标会把 grep 当取值吞掉
+    // （sudo -n 是 non-interactive、time -p 是 POSIX 输出、git -p 是 --paginate、
+    // xargs -r 是 no-run-if-empty），命令位链断在旗标处 ⇒ 整条被判「不是检索」而放行。
+    assert.equal(isGrepRgCommand("sudo -n grep foo"), true);
+    assert.equal(isGrepRgCommand("sudo -E grep foo"), true);
+    assert.equal(isGrepRgCommand("git -p grep foo"), true);
+    assert.equal(isGrepRgCommand("time -p grep x"), true);
+    assert.equal(isGrepRgCommand("find . -type f | xargs -r grep TODO"), true);
+    assert.equal(isGrepRgCommand("env -i grep x"), true);
+    // 吃取值的一侧不能因此放宽：这些值之后仍是命令位
+    assert.equal(isGrepRgCommand("sudo -u root grep foo"), true);
+    assert.equal(isGrepRgCommand("xargs -n 5 grep TODO"), true);
+    assert.equal(isGrepRgCommand("xargs -I {} grep foo {}"), true);
+    assert.equal(isGrepRgCommand("git -c core.pager=cat grep foo"), true);
+    // 包装名不出这一段：`;` 之后是全新命令，前一行的旗标不再是包装旗标
+    assert.equal(isGrepRgCommand("sudo -n; grep foo"), true);
+    assert.equal(isGrepRgCommand("sudo -n; echo hi"), false);
   });
 
   it("非检索命令不命中", () => {
@@ -312,6 +339,38 @@ describe("hasExternalTarget", () => {
     assert.equal(hasExternalTarget(root, "cd /outside && grep foo .", zhMessages), true);
     assert.equal(hasExternalTarget(root, "cd /repo && grep foo .", zhMessages), false);
   });
+
+  it("命令位 token（程序路径）不是检索目标", () => {
+    // 绝对路径写法让 grep 自己成了「根外路径证据」⇒ 任何绝对路径 grep 都被放行
+    assert.equal(hasExternalTarget(root, "/usr/bin/grep -r foo .", zhMessages), false);
+    assert.equal(hasExternalTarget(root, "/opt/homebrew/bin/rg foo src", zhMessages), false);
+    // 反向：真外部目标仍要认得出来
+    assert.equal(hasExternalTarget(root, "/usr/bin/grep -r foo /etc", zhMessages), true);
+  });
+
+  it("检索侧取值旗标的值不是目标", () => {
+    assert.equal(hasExternalTarget(root, "grep -f /tmp/patterns .", zhMessages), false);
+    assert.equal(hasExternalTarget(root, "rg --glob /tmp/x foo .", zhMessages), false);
+    assert.equal(hasExternalTarget(root, "rg -g '*.ts' foo /repo", zhMessages), false);
+    assert.equal(hasExternalTarget(root, "grep -e /tmp/p src/a.ts", zhMessages), false);
+    // 反向：取值之后出现的真外部目标不被吞
+    assert.equal(hasExternalTarget(root, "grep -f /tmp/patterns /tmp/data", zhMessages), true);
+  });
+
+  it("重定向目标是 I/O 落点，不是检索操作数", () => {
+    assert.equal(hasExternalTarget(root, "grep foo src >/tmp/out", zhMessages), false);
+    assert.equal(hasExternalTarget(root, "rg foo < /tmp/in", zhMessages), false);
+    assert.equal(hasExternalTarget(root, "grep foo src 2>/tmp/err", zhMessages), false);
+  });
+
+  it("参数展开/命令替换里的组字符不切断目标", () => {
+    // `${DIR}` 是**被测的 shell 字面量**（不是模板插值），故单独收成常量并豁免那一条规则。
+    // oxlint-disable-next-line eslint/no-template-curly-in-string -- 被测的 shell 字面量，不是模板插值
+    const dirVar = "${DIR}";
+    assert.equal(hasExternalTarget(root, `grep foo ${dirVar}/src`, zhMessages), false);
+    assert.equal(hasExternalTarget(root, "grep foo $(pwd)/src", zhMessages), false);
+    assert.equal(hasExternalTarget(root, `grep foo ${dirVar}/../../../etc`, zhMessages), true);
+  });
 });
 
 /** 索引探测工厂（模块作用域：纯参数派生，unicorn/consistent-function-scoping）。 */
@@ -370,7 +429,7 @@ describe("searchFirstGuard", () => {
   const NOW = 1_000_000_000;
   // looked = 查表用到的索引根；consumed = 每次扣减后的余量（宿主同款副作用）。
   const makeDeps = (
-    opts: { enabled?: boolean; unlock?: SearchUnlock } = {},
+    opts: { enabled?: boolean; unlock?: SearchUnlock; rebuilding?: boolean } = {},
   ): { looked: string[]; consumed: number[]; deps: SearchFirstDeps } => {
     const looked: string[] = [];
     const consumed: number[] = [];
@@ -391,9 +450,47 @@ describe("searchFirstGuard", () => {
           unlock.grepsLeft -= 1;
           consumed.push(unlock.grepsLeft);
         },
+        // 缺席（undefined）与在位（true/false）两种都是真实宿主形态：只有装了重建台账的
+        // 部署才交回这个读法，所以判据要按「显式 true 才放行」写。
+        ...(opts.rebuilding === undefined
+          ? {}
+          : {
+              rebuildBypass: (indexRoot: string) =>
+                opts.rebuilding === true && indexRoot === INDEXED,
+            }),
       },
     };
   };
+
+  it("该树正在重建：放行、不查配额也不扣额度", () => {
+    // 重建占着索引根的写锁，语义检索读不到索引；把它算成「从未检索过」或扣掉一次
+    // 用户额度，都是让等待记到用户头上。
+    const { deps, looked, consumed } = makeDeps({ rebuilding: true });
+    assert.equal(
+      searchFirstGuard(
+        { name: "bash", arguments: { command: RG_SRC }, agent: agent("s1", INDEXED) },
+        deps,
+        zhMessages,
+      ),
+      undefined,
+    );
+    assert.deepEqual(looked, [], "重建放行排在配额判定之前，不该去查解锁记录");
+    assert.deepEqual(consumed, []);
+  });
+
+  it("重建读法交回 false 时照常走配额判定", () => {
+    const { deps, looked } = makeDeps({ rebuilding: false });
+    assert.equal(
+      searchFirstGuard(
+        { name: "bash", arguments: { command: RG_SRC }, agent: agent("s1", INDEXED) },
+        deps,
+        zhMessages,
+      ) !== undefined,
+      true,
+      "没有重建在位时仍按「从未检索过」拒绝",
+    );
+    assert.deepEqual(looked, [INDEXED]);
+  });
 
   it("开关关闭一律放行", () => {
     const { deps } = makeDeps({ enabled: false });

@@ -37,6 +37,7 @@ import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import { MESSAGES, fill } from "../lib/messages.ts";
 import { MINIMUM_ZG_VERSION } from "../lib/zg-version.ts";
 import { SECRET_EXCLUDE_GLOBS } from "../lib/argv-guard.ts";
+import { LOCK_BUSY_CODE } from "../lib/zg-errors.ts";
 import type {
   RebuildRoots,
   RebuildSnapshot,
@@ -46,9 +47,12 @@ import type {
   RebuildStatusResult,
 } from "../lib/rebuild-shape.ts";
 
+/** 未配置索引时 zg 的 stdout 首句：多处用例共同引用同一份事实源。 */
+const UNCONFIGURED_REPORT = "? Workspace index is not configured";
+
 /** 「索引未就绪」那份 stdout 报告：多档用例共用，且不捕获任何外层变量。 */
 const freshReport = (): { text: string; truncated: boolean } => ({
-  text: "? Workspace index is not configured",
+  text: UNCONFIGURED_REPORT,
   truncated: false,
 });
 
@@ -2729,9 +2733,7 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
     const root = ws("ready");
     // 照抄真实 zg：stdout 是「? Workspace index is not configured …」那份报告，
     // stderr 是「Error: Workspace index is not ready (state: undecided)」。
-    const notReady = okRun(
-      "? Workspace index is not configured\n\n  Next        zg index or zg query --rg",
-    );
+    const notReady = okRun(`${UNCONFIGURED_REPORT}\n\n  Next        zg index or zg query --rg`);
     notReady.exitCode = 1;
     notReady.stderr.text = NOT_READY_STDERR;
     ctx.shell.runResults.push(notReady);
@@ -2739,7 +2741,7 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
       { root, checkReady: true },
       execOf(root),
     )) as { text: string };
-    assert.ok(out.text.startsWith("? Workspace index is not configured"), "报告必须交回");
+    assert.ok(out.text.startsWith(UNCONFIGURED_REPORT), "报告必须交回");
     assert.ok(out.text.includes(root), "注脚要带上根");
     assert.ok(out.text.includes("未就绪"), "要明说未就绪");
     assert.ok(out.text.includes("这不是执行失败"), "要区分「未就绪」与「执行失败」");
@@ -2815,6 +2817,36 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
     );
   });
 
+  it("锁忙不被吸收：那半截 stdout 不是「未就绪」的答案", async () => {
+    // 锁忙要走重建等待重试（RebuildLockBusyError），不是终局结论。这里用「别的操作占锁」
+    // 这一档（重建占锁那一档由重建等待用例覆盖）：若 resolveFailure 先把失败吸收成
+    // 「索引未就绪」，runForeground 的分类分支就永远拿不到 stderr，等待臂整个失效。
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("ready");
+    const busy = okRun(UNCONFIGURED_REPORT);
+    busy.exitCode = 1;
+    busy.stderr.text = [
+      "Error: Index lock is busy",
+      `Code: ${LOCK_BUSY_CODE}`,
+      "Details:",
+      "  ownerOperation: index.refresh",
+      "  ownerPid: 4321",
+      `  lock: ${root}/.zvec-grep/index.lock`,
+      "",
+    ].join("\n");
+    ctx.shell.runResults.push(busy);
+    await assert.rejects(
+      () => toolOf(ctx, "zg_status").execute({ root, checkReady: true }, execOf(root)),
+      (error: unknown) => {
+        assert.ok(error instanceof Error, "锁忙必须是执行失败，而不是一份「未就绪」报告");
+        assert.ok(!error.message.includes("未就绪"), "不许把锁忙讲成「索引未就绪」");
+        assert.match(error.message, /锁/u, "要按锁忙的文案交回，模型才知道该等/重试");
+        return true;
+      },
+    );
+  });
+
   it("重建进行中：就绪判定让位给重建投影（此刻「是否就绪」的答案本就是否定的）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -2886,7 +2918,7 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
     await settledTick();
     const body = await pollBody(ctx, jobId);
     assert.ok(body.output.includes("runner 启动失败"));
-    assert.equal((body.sandbox as { runnerFailed?: boolean } | undefined)?.runnerFailed, true);
+    assert.equal(body.sandbox?.runnerFailed, true);
   });
 
   it("沙箱策略拒绝：输出里给不完整警告（read-only 下写不了 .zvec-grep）", async () => {
@@ -4974,26 +5006,32 @@ describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
     assert.equal(reason, undefined, "覆盖不到本目录就不算有索引");
   });
 
-  it("清单写的是解析过的 /private 前缀、调用方给的是未解析形式", () => {
-    const dir = bareWs("private");
-    mkdirSync(path.join(dir, ZG_INDEX_DIR), { recursive: true });
-    // 实测上游清单里的 absolutePath 是**未解析**那一支，而调用方完全可能交来解析过的形式。
-    // 两边都再剥一次 /private 前缀再比，故两种写法都能对上。
-    writeFileSync(
-      path.join(dir, ZG_INDEX_DIR, ZG_MANIFEST_FILE),
-      JSON.stringify({
-        manifestVersion: 1,
-        rootPaths: [{ absolutePath: `/private${dir}`, recursive: true }],
-      }),
-    );
-    const ctx = makeApplied();
-    const reason = guardOf(ctx)({
-      name: "grep",
-      arguments: { path: dir },
-      agent: { session: { id: "probe", header: { cwd: dir } } },
-    });
-    assert.notEqual(reason, undefined, "两种写法指同一处，不该判成无索引");
-  });
+  // /private 前缀是 macOS realpath 的产物：这个「两种拼写指同一目录」的场景只在 darwin
+  // 成立，Linux 上 /private/X 是无关目录，判「无索引」才是对的；平台语义由 platform 层
+  // 的注入用例钉住（test/platform/platform.test.ts）。
+  it.runIf(process.platform === "darwin")(
+    "清单写的是解析过的 /private 前缀、调用方给的是未解析形式",
+    () => {
+      const dir = bareWs("private");
+      mkdirSync(path.join(dir, ZG_INDEX_DIR), { recursive: true });
+      // 实测上游清单里的 absolutePath 是**未解析**那一支，而调用方完全可能交来解析过的形式。
+      // 两边都再剥一次 /private 前缀再比，故两种写法都能对上。
+      writeFileSync(
+        path.join(dir, ZG_INDEX_DIR, ZG_MANIFEST_FILE),
+        JSON.stringify({
+          manifestVersion: 1,
+          rootPaths: [{ absolutePath: `/private${dir}`, recursive: true }],
+        }),
+      );
+      const ctx = makeApplied();
+      const reason = guardOf(ctx)({
+        name: "grep",
+        arguments: { path: dir },
+        agent: { session: { id: "probe", header: { cwd: dir } } },
+      });
+      assert.notEqual(reason, undefined, "两种写法指同一处，不该判成无索引");
+    },
+  );
 
   it("清单在但缺 manifestVersion → 判为无索引", () => {
     const dir = withManifest(

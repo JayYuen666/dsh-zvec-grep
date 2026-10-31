@@ -15,10 +15,12 @@ import type { ZvecGrepMessages } from "./messages.ts";
  */
 export function sandboxFacts(info: ShellSandboxInfo, messages: ZvecGrepMessages): string {
   const enforcement =
-    info.enforcement === undefined || info.enforcement.length === 0
+    info.enforcement === undefined || info.enforcement.trim().length === 0
       ? ""
       : fill(messages.sandboxEnforcement, { value: info.enforcement });
-  return fill(messages.sandboxFacts, { mode: info.mode, enforcement });
+  const mode =
+    typeof info.mode === "string" && info.mode.trim().length > 0 ? info.mode.trim() : "unknown";
+  return fill(messages.sandboxFacts, { mode, enforcement });
 }
 
 /**
@@ -55,6 +57,8 @@ export function procSandboxNote(proc: ShellExecution, messages: ZvecGrepMessages
   if (info.runnerFailed === true) {
     return noteWithFacts(messages.rebuildRunnerFailed, info, messages);
   }
+  // `denied` 与 `runnerFailed` 在宿主类型里都是 boolean（`=== true` 会被 lint 判成
+  // 不必要的比较），真值判断与显式比较在这一位等价；次序仍然按注释：runnerFailed 优先。
   if (info.denied) {
     return fill(messages.rebuildDenied, { denied: deniedNote(info, messages) });
   }

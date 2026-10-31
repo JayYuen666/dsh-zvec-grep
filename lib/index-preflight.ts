@@ -24,7 +24,13 @@ import type { ZvecGrepMessages } from "./messages.ts";
  * 与用户给的路径无关，原样上抛——把 EMFILE 说成「请给一个真实存在的文件」会把排查
  * 引向错误的方向。
  */
-const UNUSABLE_FILE_CODES: ReadonlySet<string> = new Set(["ENOENT", "EACCES", "EISDIR", "ENOTDIR"]);
+const UNUSABLE_FILE_CODES: ReadonlySet<string> = new Set([
+  "ENOENT",
+  "EACCES",
+  "EISDIR",
+  "ENOTDIR",
+  "ENAMETOOLONG",
+]);
 
 /** node:fs 的失败一律是带 string code 的 Error 实例；形状不合（非对象、无 code、码非串）
  *  一律按环境故障处理。导出只为把非 Error 形状的判别面钉进单测（真 fs 抛不出这些）。 */

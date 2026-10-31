@@ -103,8 +103,8 @@ export function stringList(
       out.push(trimmed);
     }
   }
-  if (value.length > maxItems) {
-    throw new TypeError(fill(messages.tooManyItems, { name, maxItems, actual: value.length }));
+  if (out.length > maxItems) {
+    throw new TypeError(fill(messages.tooManyItems, { name, maxItems, actual: out.length }));
   }
   return out;
 }

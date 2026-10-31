@@ -128,98 +128,135 @@ export async function startHost(
       ctx as unknown as { plugin: (impl: unknown, config?: unknown) => Promise<unknown> }
     ).plugin(impl, config);
   };
-  await load(SystemPrompt);
-  await load(ToolRuntime);
-  // alpha.2 起批次交给组合里显式提供的执行器；不装这一枚，`tools.execute` 直接以
-  // TOOL_EXECUTOR_UNAVAILABLE 拒绝。用的是官方原生执行器，不在台架里复述它的实现。
-  await load({ inject: nativeExecutorInject, apply: applyNativeExecutor });
   const settings = new StubSettings(ctx);
-  if (options.locale !== undefined) {
-    // 官方 locale 偏好（host.ts 的 createLocaleMessages 跨命名空间读的那一行）。
-    settings.rows.push({ ns: "locale", value: options.locale });
-  }
-  if (options.settings !== false) {
-    ctx.provide("settings", settings);
-  }
-  // 官方 ApprovalService 的 `static inject = ["sessionProjections"]`：alpha.2 起它要把
-  // 每次问/答写进会话日志，投影注册表不在位时整条 fiber 不激活，`ctx.get("approval")`
-  // 读不到 ⇒ 管线的 ask 静默降级成拒绝。会话与投影都用官方件，不在台架里造替身。
-  await load(SessionStore);
-  await load(SessionProjectionRegistry);
-  if (options.approval === true) {
-    await load(ApprovalService, { policy: "never" });
-  }
-  await load(LocalJobRegistry);
-  await load(LocalSubprocessRuntime);
-  (ctx.subprocess as LocalSubprocessRuntime).internals = { spillDir };
-  await load(LocalBashExecutor, { timeoutMs: 20_000, graceMs: 300 });
-  await load(TimerService);
-  await load(WebServer, { host: "127.0.0.1", port: 0 });
-  const { port } = ctx.webServer as unknown as { port: number };
+  // 装载期的任何一步失败都必须把已经付出的资源收回去（见下面 catch）：临时目录、已绑定的
+  // 监听端口、已激活的官方服务 fiber。否则失败点会从「插件装不上」漂成下一条用例的端口冲突。
+  let pluginFiber!: { dispose: () => Promise<unknown> };
+  try {
+    await load(SystemPrompt);
+    await load(ToolRuntime);
+    // alpha.2 起批次交给组合里显式提供的执行器；不装这一枚，`tools.execute` 直接以
+    // TOOL_EXECUTOR_UNAVAILABLE 拒绝。用的是官方原生执行器，不在台架里复述它的实现。
+    await load({ inject: nativeExecutorInject, apply: applyNativeExecutor });
+    if (options.locale !== undefined) {
+      // 官方 locale 偏好（host.ts 的 createLocaleMessages 跨命名空间读的那一行）。
+      settings.rows.push({ ns: "locale", value: options.locale });
+    }
+    if (options.settings !== false) {
+      ctx.provide("settings", settings);
+    }
+    // 官方 ApprovalService 的 `static inject = ["sessionProjections"]`：alpha.2 起它要把
+    // 每次问/答写进会话日志，投影注册表不在位时整条 fiber 不激活，`ctx.get("approval")`
+    // 读不到 ⇒ 管线的 ask 静默降级成拒绝。会话与投影都用官方件，不在台架里造替身。
+    await load(SessionStore);
+    await load(SessionProjectionRegistry);
+    if (options.approval === true) {
+      await load(ApprovalService, { policy: "never" });
+    }
+    await load(LocalJobRegistry);
+    await load(LocalSubprocessRuntime);
+    (ctx.subprocess as LocalSubprocessRuntime).internals = { spillDir };
+    await load(LocalBashExecutor, { timeoutMs: 20_000, graceMs: 300 });
+    await load(TimerService);
+    await load(WebServer, { host: "127.0.0.1", port: 0 });
 
-  // 行 config：显式 config 覆盖台架选项推导出来的部署值，经真实 cordis 装载期
-  // （schema 校验 + 填默认 + volatile 包引用）之后才递进 apply。
-  const rowConfig: Record<string, unknown> = { ...options.config };
-  if (options.indexTimeoutMs !== undefined) {
-    rowConfig["indexTimeoutMs"] = options.indexTimeoutMs;
-  }
-  if (options.requireApprovalForExplicitRoot !== undefined) {
-    rowConfig["requireApprovalForExplicitRoot"] = options.requireApprovalForExplicitRoot;
-  }
-  // 返回的是 Fiber 的 thenable 包装：await 等装载完成，同时拿到 dispose（卸载本插件）。
-  const loader = ctx as unknown as {
-    plugin: (
-      impl: unknown,
-      config?: unknown,
-    ) => {
-      then: PromiseLike<unknown>["then"];
-      dispose: () => Promise<unknown>;
+    // 行 config：显式 config 覆盖台架选项推导出来的部署值，经真实 cordis 装载期
+    // （schema 校验 + 填默认 + volatile 包引用）之后才递进 apply。
+    // **顺序即语义**：台架推导值先落，显式 config 最后展开。反过来写会让调用方在 config
+    // 里给的同名项被 options 静默覆盖——那正是注释承诺的反面。
+    const rowConfig: Record<string, unknown> = {};
+    if (options.indexTimeoutMs !== undefined) {
+      rowConfig["indexTimeoutMs"] = options.indexTimeoutMs;
+    }
+    if (options.requireApprovalForExplicitRoot !== undefined) {
+      rowConfig["requireApprovalForExplicitRoot"] = options.requireApprovalForExplicitRoot;
+    }
+    Object.assign(rowConfig, options.config);
+    // 返回的是 Fiber 的 thenable 包装：await 等装载完成，同时拿到 dispose（卸载本插件）。
+    const loader = ctx as unknown as {
+      plugin: (
+        impl: unknown,
+        config?: unknown,
+      ) => {
+        then: PromiseLike<unknown>["then"];
+        dispose: () => Promise<unknown>;
+      };
     };
-  };
-  const pluginFiber = loader.plugin(plugin, rowConfig);
-  await pluginFiber;
+    pluginFiber = loader.plugin(plugin, rowConfig);
+    // 返回的 thenable 包装：await 等装载完成（Promise.resolve 只为让「等待完成」这件事显式）。
+    await Promise.resolve(pluginFiber);
+  } catch (error) {
+    // 装载失败不是「没有副作用」：临时目录已经建了，WebServer 可能已经绑上端口，先装好的
+    // 官方服务 fiber 也已激活。全部收回再抛，否则真正的原因会被下一条用例的端口/残留作业盖掉。
+    try {
+      await (ctx as unknown as { fiber: { dispose: () => Promise<void> } }).fiber.dispose();
+    } catch {
+      // 装载半途失败时部分 fiber 可能根本没激活：dispose 再抛也不许盖住原始错误。
+    }
+    rmSync(spillDir, { recursive: true, force: true });
+    throw error;
+  }
+  const { port } = ctx.webServer as unknown as { port: number };
+  const fiber = pluginFiber;
 
   // shell 请求记录：monkey-patch 官方执行器的 resolve（转发给原实现），于是「本包递了什么
   // 命令/超时/stdout 上限给官方件」成为可观测事实，而不是又一次复述。
   const shellCalls: ShellCall[] = [];
+  // 对官方件的每一处 monkey-patch 都登记撤回：unload/dispose 之后同一 ctx 上的官方件必须
+  // 回到原实现。否则同进程内多次 startHost 会叠加补丁——同一次 shell 调用被历史补丁重复
+  // 记录、审批被上一台台架的桩劫持，测试之间串味且症状看不出原因。
+  const restorers: (() => void)[] = [];
+  const restorePatches = (): void => {
+    for (const restore of restorers.splice(0).toReversed()) {
+      restore();
+    }
+  };
   const executor: { resolve: (request: ShellExecRequest) => ShellExecSpec } = ctx.shell;
-  const originalResolve = executor.resolve.bind(executor);
+  const ownResolve = executor.resolve;
+  const originalResolve = ownResolve.bind(executor);
   executor.resolve = (request: ShellExecRequest): ShellExecSpec => {
     const spec = originalResolve(request);
     shellCalls.push({ request, spec });
     return spec;
   };
+  restorers.push(() => {
+    executor.resolve = ownResolve;
+  });
 
-  // 每次调用一个 controller，并把它留在册上：宿主真跑起来时 signal 是取消通道
-  // （卸载/tool 超时都会 abort）。就地解构丢弃 controller 会让这条通道永远是死线，
-  // 于是「卸载后仍在飞的那一发被取消」这件事在台架里根本测不出来。
-  const callSignals: AbortController[] = [];
+  // 每次调用一个 controller：宿主真跑起来时 signal 是取消通道（卸载/tool 超时都会 abort）。
+  // 只留**在飞**的那几个——调用一结束就从册上摘掉，否则已完成的 controller（连同 signal
+  // 上的监听器）会一直累积，也分不出「仍在飞」与「早就跑完」。
+  const callSignals = new Set<AbortController>();
   const call = async (name: string, args: unknown, agent?: BatchAgent): Promise<ToolOutcome> => {
     const controller = new AbortController();
-    callSignals.push(controller);
+    callSignals.add(controller);
     const { signal } = controller;
-    // alpha.2 的 `tools.execute` 吃批次：单发也包成一条 `calls`，再把唯一那条结果拆回来。
-    // `arguments` 是模型产出的原始 JSON 串，不是已解析对象。
-    const batch = await ctx.tools.execute({
-      calls: [
-        {
-          type: "tool-call",
-          id: brandToolCallId(`call-${Math.random().toString(36).slice(2, 8)}`),
-          name,
-          arguments: JSON.stringify(args),
-        },
-      ],
-      signal,
-      ...(agent === undefined ? {} : { agent }),
-    });
-    const [only] = batch.results;
-    if (only === undefined) {
-      throw new Error(`tools.execute 对单发调用没有交回结果：${name}`);
+    try {
+      // alpha.2 的 `tools.execute` 吃批次：单发也包成一条 `calls`，再把唯一那条结果拆回来。
+      // `arguments` 是模型产出的原始 JSON 串，不是已解析对象。
+      const batch = await ctx.tools.execute({
+        calls: [
+          {
+            type: "tool-call",
+            id: brandToolCallId(`call-${Math.random().toString(36).slice(2, 8)}`),
+            name,
+            arguments: JSON.stringify(args),
+          },
+        ],
+        signal,
+        ...(agent === undefined ? {} : { agent }),
+      });
+      const [only] = batch.results;
+      if (only === undefined) {
+        throw new Error(`tools.execute 对单发调用没有交回结果：${name}`);
+      }
+      return only.result;
+    } finally {
+      callSignals.delete(controller);
     }
-    return only.result;
   };
   const abortAll = (): void => {
-    for (const controller of callSignals.splice(0)) {
+    for (const controller of callSignals) {
       controller.abort();
     }
   };
@@ -231,10 +268,14 @@ export async function startHost(
     if (service === undefined) {
       return asked;
     }
+    const ownRequest = service.request;
     service.request = async (request: unknown) => {
       asked.push(request);
       return outcome;
     };
+    restorers.push(() => {
+      service.request = ownRequest;
+    });
     return asked;
   };
   return {
@@ -249,12 +290,19 @@ export async function startHost(
     patchApproval,
     unload: async () => {
       abortAll();
-      await pluginFiber.dispose();
+      restorePatches();
+      await fiber.dispose();
     },
     dispose: async () => {
       abortAll();
-      await (ctx as unknown as { fiber: { dispose: () => Promise<void> } }).fiber.dispose();
-      rmSync(spillDir, { recursive: true, force: true });
+      restorePatches();
+      try {
+        await (ctx as unknown as { fiber: { dispose: () => Promise<void> } }).fiber.dispose();
+      } finally {
+        // 临时目录必须在 finally 里清：dispose 抛错时它才是唯一会泄漏的那种资源
+        // （spillDir 只有台架知道，宿主不会替你收）。
+        rmSync(spillDir, { recursive: true, force: true });
+      }
     },
   };
 }
@@ -337,11 +385,16 @@ export async function sleep(ms: number): Promise<void> {
 export async function inOrder<TResult>(
   steps: readonly (() => Promise<TResult>)[],
 ): Promise<TResult[]> {
-  const [first, ...rest] = steps;
-  if (first === undefined) {
-    return [];
+  // 迭代而不是「递归 + 数组展开」：后者每一步都复制一次累积数组（O(n²)），栈深还随步骤数
+  // 线性增长；而语义就是「必须等上一步结束再起下一步」，循环是最直白的写法。
+  const results: TResult[] = [];
+  for (const step of steps) {
+    // 顺序等待就是本函数的语义（额度按序消费，见上方注释），没有可并行的重复工作——
+    // 规则在这里给的是错误的替代方案（Promise.all 会把结论变成并发并账）。
+    // oxlint-disable-next-line eslint/no-await-in-loop -- 语义要求逐步等待：Promise.all 会把结论变成并发并账
+    results.push(await step());
   }
-  return [await first(), ...(await inOrder(rest))];
+  return results;
 }
 
 /**
@@ -378,8 +431,36 @@ export function registerDummyTools(host: Host, names: readonly string[]): void {
  * 它按 zg 的命令面回应（`--version` / `index` / `status`），时长由 `ms` 调，pid 落地到
  * `pidFile` 供测试断言进程真的死了。
  */
-export function installFakeZg(options: { ms?: number; pidFile: string }): () => void {
+/**
+ * 把一段 node 脚本装成临时目录里的假 zg，并把该目录前置到 PATH；返回卸载函数。
+ *
+ * **PATH 必须用 path.delimiter 拼**：CI 矩阵含 windows-latest（.github/workflows/ci.yml 的
+ * gate job），`:` 在 win32 上不是分隔符，拼出来的整条 PATH 是一条不存在的路径，假 zg 根本
+ * 找不到。win32 也没有 shebang 执行面：同一份脚本另存成 .js，再放一枚 .cmd 垫片，让命令行
+ * 按 PATHEXT 解析得到（zgAvailable() 的 win32 名单正是 zg.cmd/.exe/zg）。
+ */
+function installFakeBin(script: string): { cleanup: () => void } {
   const dir = mkdtempSync(path.join(tmpdir(), "zg-fake-bin-"));
+  writeFileSync(path.join(dir, "zg"), script, { mode: 0o755 });
+  if (process.platform === "win32") {
+    writeFileSync(path.join(dir, "zg.js"), script, { mode: 0o755 });
+    writeFileSync(path.join(dir, "zg.cmd"), `@echo off\r\nnode "%~dp0zg.js" %*\r\n`);
+  }
+  const previous = process.env["PATH"];
+  process.env["PATH"] = previous === undefined ? dir : `${dir}${path.delimiter}${previous}`;
+  return {
+    cleanup: () => {
+      if (previous === undefined) {
+        delete process.env["PATH"];
+      } else {
+        process.env["PATH"] = previous;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+export function installFakeZg(options: { ms?: number; pidFile: string }): () => void {
   const script = `#!/usr/bin/env node
 import { writeFileSync } from "node:fs";
 const argv = process.argv.slice(2);
@@ -407,18 +488,17 @@ if (argv[0] === "index") {
   process.exit(0);
 }
 `;
-  writeFileSync(path.join(dir, "zg"), script, { mode: 0o755 });
-  const previous = process.env["PATH"];
-  process.env["PATH"] = `${dir}:${previous ?? ""}`;
+  const bin = installFakeBin(script);
+  // 记旧值而不是无条件 delete：嵌套两层假 zg 时，内层卸载不能把外层设定的时长抹掉。
+  const previousMs = process.env["ZG_FAKE_MS"];
   process.env["ZG_FAKE_MS"] = String(options.ms ?? 400);
   return () => {
-    if (previous === undefined) {
-      delete process.env["PATH"];
+    if (previousMs === undefined) {
+      delete process.env["ZG_FAKE_MS"];
     } else {
-      process.env["PATH"] = previous;
+      process.env["ZG_FAKE_MS"] = previousMs;
     }
-    delete process.env["ZG_FAKE_MS"];
-    rmSync(dir, { recursive: true, force: true });
+    bin.cleanup();
   };
 }
 
@@ -429,7 +509,6 @@ if (argv[0] === "index") {
  * **显式转发**才到得了子进程。这一条只能在真执行器上验。
  */
 export function installEnvDumpZg(dumpFile: string): () => void {
-  const dir = mkdtempSync(path.join(tmpdir(), "zg-env-bin-"));
   const script = `#!/usr/bin/env node
 import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({
@@ -441,15 +520,5 @@ writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({
 }));
 process.stdout.write("0.2.2\\n");
 `;
-  writeFileSync(path.join(dir, "zg"), script, { mode: 0o755 });
-  const previous = process.env["PATH"];
-  process.env["PATH"] = `${dir}:${previous ?? ""}`;
-  return () => {
-    if (previous === undefined) {
-      delete process.env["PATH"];
-    } else {
-      process.env["PATH"] = previous;
-    }
-    rmSync(dir, { recursive: true, force: true });
-  };
+  return installFakeBin(script).cleanup;
 }

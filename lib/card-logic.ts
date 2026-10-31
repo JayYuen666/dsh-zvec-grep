@@ -14,7 +14,7 @@ import type { ConfigForm, ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-
 import { z } from "zod";
 // 草稿优先的读判据（draftOf / numberText）住在 lib/card-draft.ts；本文件的 draftFields
 // 只管「六个字段各显示什么」。
-import { draftOf, numberText } from "./card-draft.ts";
+import { draftOf, hasDraft, numberText } from "./card-draft.ts";
 import { DEFAULT_EMBEDDING } from "./embedding-catalog.ts";
 // 数值区间单源：显示文案与钳制区间引同一份常量（host schema 与输入区间同源，见该文件头）。
 import {
@@ -178,8 +178,8 @@ export interface CardFields {
 /**
  * 三个数值字段的显示值都是「草稿优先 + 默认文案」，且共享同一条清空语义：
  * touched 里显式写了 undefined（用户清空输入）= 待 unset，显示空串；「从没动过、
- * 快照里也没有」不是清空，显示默认文案。判据统一收在这里，与 buildRangeRow /
- * limitDraftOf 的「清空即回『未填』」对齐。
+ * 快照里也没有」不是清空，显示默认文案。判据统一收在这里，与卡片数值控件
+ * （numberDisplay / NumberField）的「清空即回『未填』」对齐。
  */
 function numericFieldDisplay(
   touched: Record<string, unknown>,
@@ -189,13 +189,35 @@ function numericFieldDisplay(
 ): string {
   const draft = draftOf(touched, value, field);
   if (draft === undefined) {
-    return Object.hasOwn(touched, field) ? "" : fallback;
+    return hasDraft(touched, field) ? "" : fallback;
   }
   return numberText(draft, fallback);
 }
 
-/** 端点字段的 URL 形态：空串（= 恢复默认）与坏文本都显示成空，输入框只收 HTTP(S)。 */
+/** 已提交端点值只收 HTTP(S)；坏文本显示成空（输入框里键入的草稿不走这条过滤）。 */
 const HTTP_URL_SCHEMA = z.url({ protocol: /^https?$/u });
+
+/**
+ * 端点字段的显示值：**草稿优先**，与三个数值字段同一条清空语义。
+ *
+ * 用户正在逐字键入时，草稿是「这一格此刻的文本」而不是待校验的值——半截 URL
+ * 必须原样回显，否则输入第一个字符就被过滤成空串、删掉已提交 URL 的一个字符就整格清空。
+ * 只有「这一格没动过、显示的是已提交快照」时才过 HTTP(S) 形态过滤：脏快照不该显示成
+ * 一个看起来能保存的地址。
+ */
+function endpointFieldDisplay(
+  touched: Record<string, unknown>,
+  value: Record<string, unknown>,
+): string {
+  if (Object.hasOwn(touched, "hfEndpoint")) {
+    const draft: unknown = touched["hfEndpoint"];
+    return typeof draft === "string" ? draft : "";
+  }
+  const committed: unknown = value["hfEndpoint"];
+  return typeof committed === "string" && HTTP_URL_SCHEMA.safeParse(committed).success
+    ? committed
+    : "";
+}
 
 /** 六个字段的草稿显示值（ZgCard 只渲染这里算出来的东西）。 */
 export function draftFields(
@@ -203,14 +225,12 @@ export function draftFields(
   value: Record<string, unknown>,
 ): CardFields {
   const embedding = draftOf(touched, value, "defaultEmbedding");
-  const endpoint = draftOf(touched, value, "hfEndpoint");
   const enforce = draftOf(touched, value, "enforceSearchFirst");
   return {
     embedding:
       typeof embedding === "string" && embedding.length > 0 ? embedding : DEFAULT_EMBEDDING,
     limitDisplay: numericFieldDisplay(touched, value, "defaultLimit", String(DEFAULT_LIMIT)),
-    hfEndpoint:
-      typeof endpoint === "string" && HTTP_URL_SCHEMA.safeParse(endpoint).success ? endpoint : "",
+    hfEndpoint: endpointFieldDisplay(touched, value),
     enforceSearchFirst: enforce !== false,
     grepBudget: numericFieldDisplay(
       touched,
@@ -227,76 +247,12 @@ export function draftFields(
   };
 }
 
-// ── limit 输入校验 ─────────────────────────────────────────────────────────
-// type=number 的受控 input：非法/清空的击键若静默丢弃，用户得不到任何反馈。
-// 空 → empty（草稿写 undefined，保存时 unset 回 base 默认）；
-// 越界整数 → clamped（钳到区间并提示）；其它 → invalid（提示，不写草稿）。
+// ── 数值字段的 zod 域 ──────────────────────────────────────────────────────
+// 三个数值字段的区间与默认值同源在 lib/limits.ts；host schema 与卡片显示共用这三个域。
 
-export type LimitResolution =
-  | { kind: "valid"; value: number }
-  | { kind: "empty" }
-  | { kind: "clamped"; value: number; hint: string }
-  | { kind: "invalid"; hint: string };
-
-/** 三个数值字段的 zod 域：输入校验与卡片显示共用，host schema 的区间是同一组常量。 */
 export const LIMIT_SCHEMA = z.int().min(LIMIT_MIN).max(LIMIT_MAX);
 export const BUDGET_SCHEMA = z.int().min(LIMIT_MIN).max(BUDGET_MAX);
 export const WINDOW_SCHEMA = z.int().min(LIMIT_MIN).max(WINDOW_MAX);
-
-export function resolveLimitInput(raw: string, t: CardText): LimitResolution {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) {
-    return { kind: "empty" };
-  }
-  const num = Number(trimmed);
-  const parsed = LIMIT_SCHEMA.safeParse(num);
-  if (parsed.success) {
-    return { kind: "valid", value: parsed.data };
-  }
-  if (!Number.isSafeInteger(num)) {
-    return { kind: "invalid", hint: t("limitInvalid", { min: LIMIT_MIN, max: LIMIT_MAX }) };
-  }
-  if (num < LIMIT_MIN) {
-    return {
-      kind: "clamped",
-      value: LIMIT_MIN,
-      hint: t("limitClamped", { min: LIMIT_MIN, max: LIMIT_MAX, value: LIMIT_MIN }),
-    };
-  }
-  return {
-    kind: "clamped",
-    value: LIMIT_MAX,
-    hint: t("limitClamped", { min: LIMIT_MIN, max: LIMIT_MAX, value: LIMIT_MAX }),
-  };
-}
-
-/**
- * limit 击键 → 草稿层该写什么（保存仍由保存条统一驱动）。
- * invalid 不改草稿、只回提示（error 位）；empty 写 undefined（=待 unset）；
- * valid/clamped 写数值——clamped 另带 hint：越界已被钳制这件事对用户不能静默，
- * 但它不是失败（值已写入），故走独立的 hint 位而不是 error 位。
- */
-export interface LimitDraft {
-  draft: unknown;
-  error: string | null;
-  /** clamped 那一臂的「已钳到区间」提示；其余分支恒为 null。 */
-  hint: string | null;
-}
-
-export function limitDraftOf(raw: string, t: CardText): LimitDraft {
-  const resolution = resolveLimitInput(raw, t);
-  if (resolution.kind === "invalid") {
-    return { draft: undefined, error: resolution.hint, hint: null };
-  }
-  if (resolution.kind === "empty") {
-    return { draft: undefined, error: null, hint: null };
-  }
-  return {
-    draft: resolution.value,
-    error: null,
-    hint: resolution.kind === "clamped" ? resolution.hint : null,
-  };
-}
 
 // ── 重建端点应答解析 ───────────────────────────────────────────────────────
 

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   classifyConcurrentFailure,
   zgErrorCode,
+  zgErrorDetails,
   DAEMON_LEASE_CODE,
   LOCK_BUSY_CODE,
 } from "../lib/zg-errors.ts";
@@ -174,6 +175,31 @@ describe("并发类失败识别", () => {
     const failure = asLockBusy(classifyConcurrentFailure(twoBlocks));
     assert.equal(failure.lockPath, INDEX_LOCK_PATH);
     assert.equal(zgErrorCode(twoBlocks), LOCK_BUSY_CODE, "错误码仍取第一处");
+  });
+
+  it("第一个错误块没有明细：不顺延捡第二个块的键值", () => {
+    const twoBlocks = [
+      CODE_LINE,
+      "Error: another failure",
+      CODE_LINE,
+      DETAILS,
+      "  ownerOperation: another.operation",
+      "  ownerPid: 777",
+    ].join("\n");
+    const failure = asLockBusy(classifyConcurrentFailure(twoBlocks));
+    assert.equal(failure.ownerOperation, undefined, "明细不属于第一个错误块");
+    assert.equal(failure.ownerPid, undefined);
+    assert.equal(failure.rebuild, false);
+  });
+
+  it("没有 Code 行时不捡任何明细块", () => {
+    assert.equal(zgErrorDetails([DETAILS, "  ownerPid: 1"].join("\n")).size, 0);
+  });
+
+  it("明细前允许出现空行：表头仍属于同一个错误块", () => {
+    const spaced = [CODE_LINE, "", DETAILS, "  ownerPid: 42"].join("\n");
+    const failure = asLockBusy(classifyConcurrentFailure(spaced));
+    assert.equal(failure.ownerPid, "42");
   });
 
   it("非驼峰拼写（owner_operation）的明细行不再中断整块收集", () => {

@@ -55,13 +55,26 @@ export interface RebuildStatusRequest {
   readonly jobId: string;
 }
 
+/**
+ * 沙箱事实的跨网结构声明：这份叶子文件同时被宿主与卡片读，而 `ShellSandboxInfo` 属
+ * dsh-shell（客户端类型图里不该出现它），所以这里按两侧真正读到的位重复声明一次。
+ * 全部可选：dsh-shell 只在带沙箱的执行器下填它，`mode` 的两名枚举值本包不复制。
+ */
+export interface RebuildSandbox {
+  readonly mode?: string;
+  readonly denied?: boolean;
+  readonly enforcement?: string;
+  readonly runnerFailed?: boolean;
+}
+
 /** 一次成对读数：官方状态投影 + 本包侧表里注册表给不出的事实。 */
 export interface RebuildSnapshot {
   readonly ok: true;
   readonly status: RebuildJobStatus;
   readonly exitCode: number | null;
   readonly root: string;
-  readonly sandbox?: unknown;
+  /** 执行器交回的沙箱事实；`runnerFailed` 为真时这次重建根本没跑起来，不是「完成」。 */
+  readonly sandbox?: RebuildSandbox;
   readonly output: string;
 }
 

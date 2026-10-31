@@ -18,6 +18,9 @@ import { describe, expect, it } from "vitest";
 
 const pkgDir = path.join(import.meta.dirname, "..");
 
+/** manifest 文件名：三处引用共用同一份事实源（files 清单、readSurface、产物扫描的负例）。 */
+const MANIFEST_FILE = "package.json";
+
 /**
  * 只在注释与文档里禁的指涉：日期，以及**本机绝对路径**。
  *
@@ -43,9 +46,28 @@ const FORBIDDEN_IN_COMMENTS: readonly RegExp[] = [
  */
 const FORBIDDEN_IN_ARTIFACTS: readonly RegExp[] = [
   /\/(?:Users|home)\/[\w.-]+/u,
+  // 这一条同时覆盖 node_modules/.pnpm/…：含后者的串必然也含 .pnpm/，所以不必再写一条
+  // node_modules[\\/]\.pnpm 的死规则（它永不产生额外判定，只会让人误以为两条各管一类形态）。
   /\.pnpm[\\/]/u,
-  /node_modules[\\/]\.pnpm/u,
 ];
+
+/**
+ * 随包发布的产物文件后缀（声明文件与产物同等对待）。
+ *
+ * 只认 .js 会漏掉 .mjs/.cjs，尤其漏掉最重要的 .d.ts：本组门禁的意图明写「落进声明或产物
+ * 都不允许」，而声明面正是消费方 tsc 直接读的那批文件，一旦入口补上 types 就落在扫描之外。
+ */
+const ARTIFACT_EXTENSIONS: readonly string[] = [".js", ".mjs", ".cjs", ".d.ts", ".mts", ".cts"];
+
+/**
+ * 该文件是否属于「随包发布的产物面」。
+ *
+ * @param file - 相对包根的路径
+ * @returns 命中产物后缀时为 true
+ */
+function isArtifactFile(file: string): boolean {
+  return ARTIFACT_EXTENSIONS.some((extension) => file.endsWith(extension));
+}
 
 /** `publishConfig` 里唯一允许出现的字段：可见性与源，都不是入口面。 */
 const ALLOWED_PUBLISH_CONFIG = new Set(["access", "registry"]);
@@ -79,7 +101,8 @@ interface Manifest {
   readonly description?: string;
   readonly keywords?: readonly string[];
   readonly license?: string;
-  readonly author?: string;
+  /** npm 允许字符串或 `{name, url, email}` 对象：八仓现用对象形态，name 与 url 分开写。 */
+  readonly author?: string | { readonly name?: string; readonly url?: string };
   readonly homepage?: string;
   readonly repository?: string | { readonly url?: string };
   readonly bugs?: { readonly url?: string };
@@ -87,8 +110,17 @@ interface Manifest {
 
 /** 一条 `files` 模式的两种形态。 */
 type PatternShape =
-  /** 目录或后缀模式：列该目录（可递归）下以 `extension` 结尾的文件。 */
-  | { readonly kind: "glob"; readonly dir: string; readonly extension: string }
+  /**
+   * 目录或后缀模式：列该目录下以 `extension` 结尾的文件（空 = 不过滤后缀）。
+   * `recursive` 由模式里有没有 `**` 决定：`dir` / `lib/**` 连子目录一起算，
+   * `dist/*` 只算该层——递归判据若跟「dir 不是 .」挂钩，`dist/*` 会被整棵子树撑大。
+   */
+  | {
+      readonly kind: "glob";
+      readonly dir: string;
+      readonly extension: string;
+      readonly recursive: boolean;
+    }
   /** 精确文件名：带点号又无通配的条目是**文件名**（`host.js`），不是后缀过滤。 */
   | { readonly kind: "exact"; readonly file: string };
 
@@ -103,17 +135,23 @@ type PatternShape =
  * @returns 该模式要列的目录与后缀过滤，或一个精确文件名
  */
 function shapeOf(entry: string): PatternShape {
-  const dot = entry.lastIndexOf(".");
   const star = entry.indexOf("*");
   if (star !== -1) {
+    // 扩展名只认 * 之后的点号：dist/*、lib/** 这类无后缀模式要的是「该目录下的全部文件」。
+    // 按 entry 的最后一个点号取会把 * 本身当扩展名（* 处点号值为 -1，slice(-1) 得 "*"），
+    // 于是 endsWith("*") 恒 false、整条模式静默展开成空集。
+    const afterStar = entry.slice(star);
+    const dot = afterStar.lastIndexOf(".");
+    const dir = entry.slice(0, star).replace(/\/$/u, "");
     return {
       kind: "glob",
-      dir: entry.slice(0, star).replace(/\/$/u, ""),
-      extension: entry.slice(dot),
+      dir: dir === "" ? "." : dir,
+      extension: dot === -1 ? "" : afterStar.slice(dot),
+      recursive: entry.includes("**"),
     };
   }
   if (!entry.includes(".")) {
-    return { kind: "glob", dir: entry, extension: "" };
+    return { kind: "glob", dir: entry, extension: "", recursive: true };
   }
   return { kind: "exact", file: entry };
 }
@@ -126,13 +164,29 @@ function shapeOf(entry: string): PatternShape {
  */
 async function expand(shape: PatternShape): Promise<string[]> {
   if (shape.kind === "exact") {
-    return existsSync(path.join(pkgDir, shape.file)) ? [shape.file] : [];
+    const file = path.join(pkgDir, shape.file);
+    if (!existsSync(file)) {
+      throw new Error(
+        `files 的精确条目 ${shape.file} 在包内不存在：先跑 node build-host.mjs（或该条目名写错）`,
+      );
+    }
+    return [shape.file];
   }
-  const names = await readdir(path.join(pkgDir, shape.dir), { recursive: shape.dir !== "." });
-  return names
-    .map((name) => name.split(path.sep).join("/"))
-    .filter((name) => shape.extension === "" || name.endsWith(shape.extension))
-    .map((name) => path.posix.join(shape.dir, name));
+  const dir = path.join(pkgDir, shape.dir);
+  if (!existsSync(dir)) {
+    throw new Error(
+      `files 的目录条目 ${shape.dir} 在包内不存在：先跑 node build-host.mjs（或该目录名写错）`,
+    );
+  }
+  const names = await readdir(dir, { recursive: shape.recursive });
+  return (
+    names
+      .map((name) => name.split(path.sep).join("/"))
+      .filter((name) => shape.extension === "" || name.endsWith(shape.extension))
+      // dir/* 只取该层：readdir 非递归本就不会给嵌套项，这条过滤是防实现改回去。
+      .filter((name) => shape.recursive || !name.includes("/"))
+      .map((name) => path.posix.join(shape.dir, name))
+  );
 }
 
 /**
@@ -184,7 +238,7 @@ function entryFiles(manifest: Manifest): readonly { label: string; file: string 
  * 把没被无条件附带的文件列进本清单，会让「入口都在 files 覆盖内」那道断言的集合**虚高**——
  * 门禁比 npm 的真实语义更宽松，于是门禁自己先失效。
  */
-const ALWAYS_SHIPPED = ["package.json", "README.md", "README.zh-CN.md", "LICENSE"];
+const ALWAYS_SHIPPED = [MANIFEST_FILE, "README.md", "README.zh-CN.md", "LICENSE"];
 
 /**
  * 读 manifest 与它应当发出去的文件清单。
@@ -193,7 +247,7 @@ const ALWAYS_SHIPPED = ["package.json", "README.md", "README.zh-CN.md", "LICENSE
  */
 async function readSurface(): Promise<{ manifest: Manifest; shipped: Set<string> }> {
   const manifest = JSON.parse(
-    await readFile(path.join(pkgDir, "package.json"), "utf8"),
+    await readFile(path.join(pkgDir, MANIFEST_FILE), "utf8"),
   ) as unknown as Manifest;
   const groups = await Promise.all((manifest.files ?? []).map((entry) => expand(shapeOf(entry))));
   const attached = ALWAYS_SHIPPED.filter((name) => existsSync(path.join(pkgDir, name)));
@@ -241,7 +295,32 @@ function commentLines(file: string, text: string): string[] {
   if (file.endsWith(".md")) {
     return text.split("\n");
   }
-  return text.split("\n").filter((line) => /^\s*(?:\/\/|\/\*|\*|#)/u.test(line));
+  // YAML 没有行尾注释以外的形态，但它的注释符是 #，与代码两侧不同口径。
+  if (/\.ya?ml$/u.test(file)) {
+    return text.split("\n").filter((line) => /^\s*#/u.test(line));
+  }
+  // 代码侧只认注释区间，不用「行首是注释符」的行过滤：那样会漏掉行尾注释
+  // （const x = 1; // 日期）、单行块注释（/* 日期 */）与 JSDoc 中间不以 * 开头的行。
+  // 先把字符串/模板字面量抹成空串，避免把 "https://…" 这类内容当成注释起点。
+  const withoutStrings = text.replaceAll(
+    /"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`/gu,
+    '""',
+  );
+  const lines: string[] = [];
+  for (const match of withoutStrings.matchAll(/\/\/[^\n]*|\/\*[\s\S]*?\*\//gu)) {
+    lines.push(...match[0].split("\n"));
+  }
+  return lines;
+}
+
+/**
+ * 入口目标是不是「源码」：只看 src 目录或非声明的 TS 后缀。
+ * 声明文件 dist/host.d.ts 也以 .ts 结尾，补上 types 入口时会被错判成指源码。
+ */
+function isSourceEntry(file: string): boolean {
+  return (
+    file.startsWith("src/") || (/\.(?:[cm]?ts|tsx)$/u.test(file) && !/\.d\.[cm]?ts$/u.test(file))
+  );
 }
 
 describe("发布形态", () => {
@@ -259,9 +338,11 @@ describe("发布形态", () => {
 
   it("入口一律指向构建产物，源码目录不参与发布", async () => {
     const { manifest } = await readSurface();
-    for (const target of entryFiles(manifest)) {
-      expect(target.file, `${target.label} 不该指源码`).not.toMatch(/\.tsx?$/u);
-    }
+    // 收集式断言：失败时报告能直接指认「哪个入口指向了源码文件」。
+    const offenders = entryFiles(manifest)
+      .filter((target) => isSourceEntry(target.file))
+      .map((target) => `${target.label}: ${target.file}`);
+    expect(offenders).toStrictEqual([]);
   });
 
   it("publishConfig 只留可见性与源，不留入口覆盖", async () => {
@@ -269,6 +350,42 @@ describe("发布形态", () => {
     for (const key of Object.keys(manifest.publishConfig ?? {})) {
       expect(ALLOWED_PUBLISH_CONFIG.has(key), `publishConfig.${key} 会被 npm 忽略`).toBe(true);
     }
+  });
+
+  it("通配条目的形状由模式本身决定（shapeOf/expand 的第二道回归防线）", async () => {
+    // 期望独立写死，不从实现派生：扩展名与递归这两位错一位就当场红。
+    // 坏形态的两条具体后果：`dist/*` 的扩展名被错认成 "*" → 展开成空集（发布面虚低）；
+    // 「dir 是 . 才递归，否则只算一层」→ `lib/**` 漏掉整棵子树（发布面同样虚低）。
+    expect(shapeOf("*")).toStrictEqual({ kind: "glob", dir: ".", extension: "", recursive: false });
+    expect(shapeOf("dist/*")).toStrictEqual({
+      kind: "glob",
+      dir: "dist",
+      extension: "",
+      recursive: false,
+    });
+    expect(shapeOf("lib/**")).toStrictEqual({
+      kind: "glob",
+      dir: "lib",
+      extension: "",
+      recursive: true,
+    });
+    expect(shapeOf("locale/*.json")).toStrictEqual({
+      kind: "glob",
+      dir: "locale",
+      extension: ".json",
+      recursive: false,
+    });
+    expect(shapeOf("docs")).toStrictEqual({
+      kind: "glob",
+      dir: "docs",
+      extension: "",
+      recursive: true,
+    });
+    expect(shapeOf("host.js")).toStrictEqual({ kind: "exact", file: "host.js" });
+    // 展开侧的负例：docs 是无后缀的目录条目，必须把目录里的 .md 一起算进来。
+    await expect(
+      expand({ kind: "glob", dir: "docs", extension: "", recursive: true }),
+    ).resolves.toContain("docs/DETAIL.md");
   });
 
   it("files 里的精确文件名条目确实被算进发布集合（shapeOf/expand 的回归防线）", async () => {
@@ -303,13 +420,22 @@ describe("发布形态", () => {
     }
   });
 
+  it("产物面扫描覆盖 .js/.mjs/.cjs 与声明文件（只认 .js 会漏掉 tsc 读的那批）", () => {
+    // 期望独立写死：入口一旦补上 types，声明文件就是消费方 tsc 直接读的面。
+    const artifacts = ["host.js", "dist/x.mjs", "dist/x.cjs", "dist/host.d.ts", "dist/x.d.mts"];
+    const notArtifacts = ["host.ts", "dist/host.d.ts.map", MANIFEST_FILE, "README.md"];
+    // 收集式断言：失败时报告的是「哪几个文件判错」，而不是一句没有对象的 toBe(false)。
+    expect(artifacts.filter((file) => !isArtifactFile(file))).toStrictEqual([]);
+    expect(notArtifacts.filter((file) => isArtifactFile(file))).toStrictEqual([]);
+  });
+
   it("产物面没有本机指涉（绝对路径、pnpm store 布局）", async () => {
     // 注释门读不到产物：rolldown 构建时剥掉源码注释，而 `//#region` 标记里的路径、字符串字面量
     // 里的本机路径会原样进 tarball。client 半必须把 shared 的产物**内联**（浏览器解析不了裸
     // 说明符），所以它的标记里一度烙着 `node_modules/.pnpm/<名>@<版>_<哈希>/`——那既是安装布局
     // 外泄，也让同一份源码在不同机器上产出不同字节。
     const { shipped } = await readSurface();
-    const artifacts = [...shipped].filter((file) => file.endsWith(".js")).toSorted();
+    const artifacts = [...shipped].filter((file) => isArtifactFile(file)).toSorted();
     expect(artifacts.length, "至少要扫到一枚产物，否则这道门是空转的").toBeGreaterThan(0);
     const texts = await Promise.all(
       artifacts.map(async (file) => ({
@@ -327,6 +453,18 @@ describe("发布形态", () => {
     }
   });
 });
+
+/**
+ * 该范围串是否就是「整串一个版本号」（精确钉），不含任何范围算子。
+ *
+ * 刻意不要求预发布后缀：`0.3.0` 与 `0.2.2-alpha.2` 同样是精确钉，判据是「没有算子」。
+ *
+ * @param range - package.json 里的版本串
+ * @returns 整串是一个版本号时为 true
+ */
+function isExactVersion(range: string): boolean {
+  return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(range);
+}
 
 /**
  * 宿主包在 peer 与 dev 两张表里的并集。`dependencies` 是禁区（见下面那条门禁）：peer 记录
@@ -373,9 +511,30 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     // 过滤出违规项再一次性断言，而不是在循环里按条件 expect：失败时 diff 直接列出
     // 「哪个包钉成了什么」，比逐条抛错更好读。
     const ranged = Object.entries(manifest.devDependencies ?? {}).filter(
-      ([name, range]) => name.startsWith(DSH_PREFIX) && !/^\d+\.\d+\.\d+-/u.test(range),
+      ([name, range]) => name.startsWith(DSH_PREFIX) && !isExactVersion(range),
     );
     expect(ranged, "这些 dsh-* 开发依赖没有精确钉住版本").toStrictEqual([]);
+  });
+
+  it("精确钉的判据是「整串一个版本号」，与有没有预发布后缀无关", () => {
+    // 期望独立写死。旧判据 /^\d+\.\d+\.\d+-/u 要求必须有 - 后缀：本包当前全都落在
+    // 0.2.2-alpha.2 所以恰好通过，宿主一旦发稳定版（0.3.0）就会被判成「没有精确钉住」，
+    // 诱使维护者去放宽版本或删掉门禁——门禁的语义是「不带范围算子」，不是「带 - 后缀」。
+    for (const exact of ["0.3.0", "0.2.2-alpha.2", "0.2.1-rc.3", "1.0.0-beta.1+build.7"]) {
+      expect(isExactVersion(exact), `${exact} 是精确钉`).toBe(true);
+    }
+    for (const ranged of [
+      "^0.3.0",
+      "~0.3.0",
+      ">=0.3.0",
+      "0.3.0 - 0.4.0",
+      "0.3.x",
+      "*",
+      "",
+      "latest",
+    ]) {
+      expect(isExactVersion(ranged), `${ranged} 不是精确钉`).toBe(false);
+    }
   });
 
   it("devDependencies 里的 dsh-* 全部同版本（不许装出第二份宿主类型）", async () => {
@@ -407,6 +566,25 @@ describe("宿主依赖的版本形状（升级防线）", () => {
 });
 
 describe("注释与文档没有内部指涉", () => {
+  it("注释行的取法覆盖行尾注释、单行块注释与 JSDoc 中间行（形态本身是判据的一部分）", () => {
+    // 期望独立写死：只认「行首是注释符」的行会漏掉这三类，而它们恰恰最容易藏日期与路径。
+    expect(commentLines("a.ts", "const x = 1; // 2024-01-01\nconst y = 2;")).toStrictEqual([
+      "// 2024-01-01",
+    ]);
+    expect(commentLines("a.ts", "const x = 1; /* 2024-01-01 */ const y = 2;")).toStrictEqual([
+      "/* 2024-01-01 */",
+    ]);
+    expect(
+      commentLines("a.ts", "/**\n * 说明\n 2024-01-01 这一行不以星号开头\n */\nconst x = 1;"),
+    ).toContain(" 2024-01-01 这一行不以星号开头");
+    // 负例：字符串字面量里的 // 与 /* 不是注释（否则把 URL、示例路径当成注释噪音）。
+    expect(commentLines("a.ts", 'const url = "https://example.com/x";')).toStrictEqual([]);
+    // YAML 的注释符是 #。
+    expect(commentLines("a.yml", "key: 1 # 2024-01-01\n# 2024-01-02")).toStrictEqual([
+      "# 2024-01-02",
+    ]);
+  });
+
   it("源码与文档的注释里没有日期", async () => {
     const collected = await collectSources(pkgDir, "");
     const sources = collected.toSorted();
@@ -457,6 +635,8 @@ function valueImportedHostPackages(text: string): Set<string> {
   const names = new Set<string>();
   const patterns: readonly RegExp[] = [
     /from\s*["'](?<spec>@deepseek-ai\/[^"']+)["']/gu,
+    // 纯副作用导入 import "@deepseek-ai/x"：没有 from / 括号，同样会在消费方解析失败。
+    /(?:^|[;\s])import\s*["'](?<spec>@deepseek-ai\/[^"']+)["']/gu,
     /import\s*\(\s*["'](?<spec>@deepseek-ai\/[^"']+)["']\s*\)/gu,
     /require\s*\(\s*["'](?<spec>@deepseek-ai\/[^"']+)["']\s*\)/gu,
   ];
@@ -479,11 +659,29 @@ function valueImportedHostPackages(text: string): Set<string> {
  * @returns 产物绝对路径
  */
 async function sharedArtifacts(): Promise<string[]> {
-  const sharedRoot = path.dirname(
-    createRequire(import.meta.url).resolve("@jayyuen66/dsh-plugin-shared/package.json"),
-  );
-  const dist = path.join(sharedRoot, "dist");
-  const listed = await readdir(dist, { recursive: true });
+  let sharedManifest: string;
+  try {
+    sharedManifest = createRequire(import.meta.url).resolve(
+      "@jayyuen66/dsh-plugin-shared/package.json",
+    );
+  } catch (error) {
+    // MODULE_NOT_FOUND / ERR_PACKAGE_PATH_NOT_EXPORTED 都是「环境未就绪」，不是被测代码的缺陷：
+    // 裸堆栈会让人把它和「本包依赖面漏了一条」混在一起读。
+    throw new Error(
+      `解析 @jayyuen66/dsh-plugin-shared/package.json 失败：先在本仓安装依赖（pnpm install --ignore-scripts）。原因：${String(error)}`,
+      { cause: error },
+    );
+  }
+  const dist = path.join(path.dirname(sharedManifest), "dist");
+  let listed: string[];
+  try {
+    listed = await readdir(dist, { recursive: true });
+  } catch (error) {
+    throw new Error(
+      `读不到 shared 的产物目录 ${dist}：先构建 shared（node build-host.mjs 或该仓的 build 链）。原因：${String(error)}`,
+      { cause: error },
+    );
+  }
   return listed
     .map((name) => name.split(path.sep).join("/"))
     .filter((name) => name.endsWith(".js"))
@@ -491,6 +689,31 @@ async function sharedArtifacts(): Promise<string[]> {
 }
 
 describe("发布态运行期依赖面（装出去之后才炸的那一类）", () => {
+  it("值导入的识别覆盖四种写法（漏一种就是给这道门留盲区）", () => {
+    const cases: readonly (readonly [string, readonly string[]])[] = [
+      [
+        'import { truncateEnd } from "@deepseek-ai/dsh-output-retention";',
+        ["@deepseek-ai/dsh-output-retention"],
+      ],
+      ['import "@deepseek-ai/dsh-output-retention";', ["@deepseek-ai/dsh-output-retention"]],
+      ['await import("@deepseek-ai/dsh-scope/lib/x.js");', ["@deepseek-ai/dsh-scope"]],
+      [
+        'const m = require("@deepseek-ai/dsh-typert-protocol");',
+        ["@deepseek-ai/dsh-typert-protocol"],
+      ],
+    ];
+    for (const [text, expected] of cases) {
+      // 把「喂进去的那句」一并放进被比对象：失败时报告能直接指认是哪条写法错了。
+      expect({ text, imports: [...valueImportedHostPackages(text)] }).toStrictEqual({
+        text,
+        imports: [...expected],
+      });
+    }
+    // 负例：普通第三方与相对路径都不属于宿主包面。
+    expect([...valueImportedHostPackages('import { z } from "zod";')]).toStrictEqual([]);
+    expect([...valueImportedHostPackages('import x from "./local.js";')]).toStrictEqual([]);
+  });
+
   it("shared 产物值导入的宿主包，本包一律在 peer ∪ dev 里提供", async () => {
     // 这一条是被真实故障逼出来的：shared 0.1.4 的 `dist/text.js` 值导入
     // `@deepseek-ai/dsh-output-retention`（本包用它的 `truncateEnd` / `truncateStart`，但从不
@@ -555,7 +778,10 @@ describe("发布元数据面（npm 页面与搜索读的是这些）", () => {
       "description 不能是空的：那是 npm 搜索结果里的一行",
     ).not.toBe("");
     expect(manifest.license, "license 字段必须写着 MIT：LICENSE 本体是 MIT").toBe("MIT");
-    expect(manifest.author?.trim(), "author 不能是空的：LICENSE 的版权行指着它").not.toBe("");
+    // 两种合法形态都收：字符串，或 npm 的 `{name, url}` 对象（本仓现用后者）。
+    const author =
+      typeof manifest.author === "string" ? manifest.author : (manifest.author?.name ?? "");
+    expect(author.trim(), "author 不能是空的：LICENSE 的版权行指着它").not.toBe("");
     const keywords = manifest.keywords ?? [];
     expect(keywords.length, "keywords 不能是空的：npm 的分类与检索按它索引").toBeGreaterThan(0);
     const blank = keywords.filter((word) => word.trim() === "");

@@ -22,6 +22,8 @@ export const REBUILD_OPERATION = "index.rebuild";
 
 /** 明细块的表头行（`Details:`）。 */
 const DETAILS_HEADER = /^\s*Details:\s*$/u;
+/** 行首空白：明细键值行以缩进起始，零缩进内容属于下一段。 */
+const INDENTED_LINE = /^\s/u;
 
 export interface LockBusyFailure {
   kind: "lock-busy";
@@ -71,14 +73,46 @@ export function zgErrorCode(stderr: string): string | undefined {
 }
 
 /**
+ * 在第一个错误块的码行之后找明细表头。明细必须属于第一个错误块：码行之后遇到下一条
+ * 无缩进内容（第二个块的 Error:/Code: 或散文）就说明这一块没有明细，不能顺延去捡后面
+ * 块的键值。找不到返回 -1。
+ */
+function detailsStartAfter(lines: readonly string[], codeIndex: number): number {
+  const rest = lines.slice(codeIndex + 1);
+  for (const [offset, line] of rest.entries()) {
+    if (DETAILS_HEADER.test(line)) {
+      return codeIndex + 1 + offset;
+    }
+    if (line.trim().length > 0 && !INDENTED_LINE.test(line)) {
+      return -1;
+    }
+  }
+  return -1;
+}
+
+/**
  * 明细块的键值表。`Details:` 之后的缩进行才是明细，标题与错误码行不参与。
  * 重复键取首次出现（zg 不会重复输出同一个键，重复即形状异常，不覆盖）。
  * 明细块遇到非键值行即终止：其后多半是尾部截断的散文，继续收只会捡到假键值。
+ * 导出只为把「没有 Code 行时不捡明细」这一支钉进单测；生产侧只经
+ * `classifyConcurrentFailure` 调用（那里已先确认有码）。
  */
-function zgErrorDetails(stderr: string): Map<string, string> {
+/** 明细块的协议键：查表侧只许从这里取值，键名改名不会漏改一条。 */
+const DETAIL_KEY = {
+  ownerOperation: "ownerOperation",
+  ownerPid: "ownerPid",
+  lock: "lock",
+  pid: "pid",
+} as const;
+
+export function zgErrorDetails(stderr: string): Map<string, string> {
   const details = new Map<string, string>();
   const lines = stderr.split("\n");
-  const start = lines.findIndex((line) => DETAILS_HEADER.test(line));
+  const codeIndex = lines.findIndex((line) => CODE_LINE_PREFIX.test(line));
+  if (codeIndex === -1) {
+    return details;
+  }
+  const start = detailsStartAfter(lines, codeIndex);
   if (start === -1) {
     return details;
   }
@@ -109,18 +143,18 @@ export function classifyConcurrentFailure(stderr: string): ConcurrentZgFailure |
     return null;
   }
   const details = zgErrorDetails(stderr);
-  const ownerOperation = details.get("ownerOperation");
+  const ownerOperation = details.get(DETAIL_KEY.ownerOperation);
   if (code === LOCK_BUSY_CODE) {
     return {
       kind: "lock-busy",
       ownerOperation,
-      ownerPid: details.get("ownerPid"),
-      lockPath: details.get("lock"),
+      ownerPid: details.get(DETAIL_KEY.ownerPid),
+      lockPath: details.get(DETAIL_KEY.lock),
       rebuild: ownerOperation === REBUILD_OPERATION,
     };
   }
   if (code === DAEMON_LEASE_CODE) {
-    return { kind: "daemon-lease", pid: details.get("pid") };
+    return { kind: "daemon-lease", pid: details.get(DETAIL_KEY.pid) };
   }
   return null;
 }

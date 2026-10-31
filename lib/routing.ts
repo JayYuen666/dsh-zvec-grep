@@ -422,6 +422,51 @@ function nativeTargetInsideRoot(
   return pathInsideRoot(absolute, indexRoot, messages);
 }
 
+/** 索引根已定且这棵树的范围判定要走门禁时的那句拒绝理由；交回 undefined 即放行。 */
+function gateReasonAt(
+  indexRoot: string,
+  cwd: string,
+  scope: SearchScope,
+  deps: SearchFirstDeps,
+  messages: ZvecGrepMessages,
+): string | undefined {
+  const inScope =
+    scope.kind === "shell"
+      ? !hasExternalTarget(indexRoot, scope.command, messages)
+      : nativeTargetInsideRoot(cwd, indexRoot, scope.target, messages);
+  let reason: string | undefined;
+  if (inScope) {
+    // 重建占着这棵树的写锁，此刻语义检索读不到索引，所以直接放行；放行不消耗既有配额——
+    // 重建造成的等待不该记在用户的检索额度上。配额判定整体收在 !rebuilding 里，
+    // 不放行时才去查解锁记录。
+    const rebuilding = deps.rebuildBypass?.(indexRoot) === true;
+    if (!rebuilding) {
+      const unlock = deps.lookupUnlock(indexRoot);
+      if (unlock !== undefined && unlockActive(unlock, deps.now())) {
+        // 有解锁额度：放行并把这份记录扣减一次（同一对象，无需二次查表）。
+        deps.consumeGrep(unlock);
+      } else {
+        let state: string;
+        if (unlock === undefined) {
+          state = messages.gateNeverSearched;
+        } else if (unlock.grepsLeft <= 0) {
+          state = messages.gateQuotaExhausted;
+        } else {
+          state = messages.gateUnlockExpired;
+        }
+        reason = fill(messages.gateReason, {
+          state,
+          indexRoot,
+          indexDir: INDEX_DIR_NAME,
+          budget: deps.grepBudget,
+          windowMin: deps.windowMin,
+        });
+      }
+    }
+  }
+  return reason;
+}
+
 function buildSearchFirstReason(
   cwd: string,
   scope: SearchScope,
@@ -429,44 +474,7 @@ function buildSearchFirstReason(
   messages: ZvecGrepMessages,
 ): string | undefined {
   const indexRoot = findIndexRoot(cwd, deps.indexProbe, deps.findIndexDepth);
-  let reason: string | undefined;
-  const inScope =
-    indexRoot !== undefined &&
-    (scope.kind === "shell"
-      ? !hasExternalTarget(indexRoot, scope.command, messages)
-      : nativeTargetInsideRoot(cwd, indexRoot, scope.target, messages));
-  if (inScope) {
-    // 重建期放行先于配额判定：那条重建占着这棵树的写锁，此刻无论有没有配额都该放行，
-    // 因为语义检索根本读不到索引。且这一放行**不消耗**既有配额——重建造成的等待不该
-    // 记在用户的检索额度上。
-    const rebuilding = deps.rebuildBypass?.(indexRoot) === true;
-    const unlock = rebuilding ? undefined : deps.lookupUnlock(indexRoot);
-    if (rebuilding) {
-      // 这一支**必须是一个空 if**：把 unlock 置空并不会「不扣额度」，而是让它落进下面的
-      // else —— 那里 `unlock === undefined` 会被译成「从未检索过」并**拒绝**。真正让这次调用
-      // 放行的就是这个空分支本身。写成注释说明，是为了不让下一个人把它当冗余删掉。
-    } else if (unlock !== undefined && unlockActive(unlock, deps.now())) {
-      // 有解锁额度：放行并把这份记录扣减一次（同一对象，无需二次查表）。
-      deps.consumeGrep(unlock);
-    } else {
-      let state: string;
-      if (unlock === undefined) {
-        state = messages.gateNeverSearched;
-      } else if (unlock.grepsLeft <= 0) {
-        state = messages.gateQuotaExhausted;
-      } else {
-        state = messages.gateUnlockExpired;
-      }
-      reason = fill(messages.gateReason, {
-        state,
-        indexRoot,
-        indexDir: INDEX_DIR_NAME,
-        budget: deps.grepBudget,
-        windowMin: deps.windowMin,
-      });
-    }
-  }
-  return reason;
+  return indexRoot === undefined ? undefined : gateReasonAt(indexRoot, cwd, scope, deps, messages);
 }
 
 /**

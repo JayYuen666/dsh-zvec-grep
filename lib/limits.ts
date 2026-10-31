@@ -8,6 +8,8 @@ export const LIMIT_MIN = 1;
 export const LIMIT_MAX = 50;
 export const DEFAULT_LIMIT = 10;
 export const BUDGET_MAX = 20;
+/** 解锁窗口上限（分钟）。 */
 export const WINDOW_MAX = 240;
 export const DEFAULT_GREP_BUDGET = 3;
+/** 解锁窗口默认值（分钟）。 */
 export const DEFAULT_UNLOCK_WINDOW_MIN = 10;

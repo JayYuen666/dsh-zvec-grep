@@ -1,15 +1,16 @@
 // 生产源码的同步写盘 API 守卫（README 承诺「The package itself writes no files」）。
 //
-// 为什么要有：oxlint 的 node/no-sync 经包级 syncWrites 豁免了写盘那一组（mkdirSync /
-// mkdtempSync / rmSync / writeFileSync / chmodSync），豁免是**包级**的——lib/、src/、host.ts
-// 里的生产代码今后调用这些 API 不会有任何 lint 信号。这道门把「包内不写盘」的承诺落到
-// 可复跑的判据上：生产源码出现调用形状即红（测试文件豁免——夹具要在临时目录造文件）。
+// 为什么要有：oxlint 的 node/no-sync 把写盘那一组（mkdirSync / mkdtempSync / rmSync /
+// writeFileSync / chmodSync）只在本仓 oxlint.config.ts 点名的文件里豁免，因此这道门与 lint
+// 有一条重叠。它仍然独立存在，因为期望值写死在这里、不从 scope 表派生：将来谁把某枚写侧 API
+// 的豁免扩进 lib/ 或 host.ts，lint 会安静下来，这道门照样红。README 承诺「The package itself
+// writes no files」，判据就落在这份名单上（测试文件豁免——夹具要在临时目录造文件）。
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 
-/** 写盘/改元数据的同步 API：与 oxlint.config.ts 的 syncWrites 里那组写侧条目同源。 */
+/** 写盘/改元数据的同步 API：期望值独立写死，不从 oxlint.config.ts 的 scope 表派生。 */
 const WRITE_APIS: readonly string[] = [
   "mkdirSync",
   "mkdtempSync",
@@ -42,7 +43,7 @@ function writeCallHits(source: string): string[] {
   return WRITE_APIS.filter((api) => new RegExp(`(?<![\\w$])${api}\\s*\\(`, "u").test(source));
 }
 
-describe("生产源码不写盘（包级 syncWrites 豁免的边界）", () => {
+describe("生产源码不写盘（写侧豁免只落在本仓点名的文件里）", () => {
   it("lib/、src/ 与 host.ts 里不出现写盘 API 的调用形状", async () => {
     const pkgDir = path.resolve(import.meta.dirname, "..");
     const collected = await Promise.all(
@@ -61,7 +62,7 @@ describe("生产源码不写盘（包级 syncWrites 豁免的边界）", () => {
     assert.deepEqual(
       offenders,
       [],
-      "生产源码不得调用写盘同步 API（README 承诺包内不写盘）；确有需要请先收窄 syncWrites 豁免并说明理由",
+      "生产源码不得调用写盘同步 API（README 承诺包内不写盘）；确有需要先在 oxlint.config.ts 的 syncIoScopes 里按文件登记并说明理由",
     );
   });
 });

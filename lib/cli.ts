@@ -436,15 +436,18 @@ function pushQueryArgs(
     routeCount += 1;
   }
   for (const query of queryList(args.queries, "queries", messages)) {
-    parts.push("--hybrid", shq(query));
+    // 选项与值写成同一个 argv 词（`--opt=value`）：以 `-` 开头的查询串作为**独立**词交给
+    // clap 时会被当成另一个选项（`--hybrid -foo` → 缺值/unknown flag），而 `=` 之后的内容
+    // 一定按值读。单引号仍由 shq 负责，交给 shell 拆词后正好是这一整个词。
+    parts.push(`--hybrid=${shq(query)}`);
     routeCount += 1;
   }
   for (const query of queryList(args.fts, "fts", messages)) {
-    parts.push("--fts", shq(query));
+    parts.push(`--fts=${shq(query)}`);
     routeCount += 1;
   }
   for (const query of queryList(args.vector, "vector", messages)) {
-    parts.push("--vector", shq(query));
+    parts.push(`--vector=${shq(query)}`);
     routeCount += 1;
   }
   if (routeCount > MAX_QUERY_ROUTES) {
@@ -522,11 +525,16 @@ function buildIndexedCommand(
   // 宿主算（它同时握着传输模式与探测能力），这里只把它折成一次构造期拒绝：命令照发的话 zg
   // 会把刷新关掉、只留一行 stderr warning，而模型读到的是「后台刷新已启用」这个假结论。
   // 两种不可用各有各的文案——叫用户去 `zg server on` 对「部署钉死 direct」那档是指错方向。
+  //
+  // `mode` 先判：它就在本函数手上，`backgroundSupport` 是调用方另算的一位。宿主在 direct
+  // 模式下返回的正是 `mode-direct`（先于探测结果），两者本来一致；以 `mode` 为准的好处是
+  // 真传岔时落在「部署钉死 direct」这句根因上，不会把用户引去起守护进程。因此
+  // `backgroundSupport === "mode-direct"` 不必再单独判——它在 mode 非 direct 时不可达。
+  if (refresh === "background" && mode === "direct") {
+    throw new Error(fill(messages.refreshBackgroundPinnedDirect, { root }));
+  }
   if (refresh === "background" && backgroundSupport === "daemon-down") {
     throw new Error(fill(messages.refreshBackgroundNeedsServer, { root }));
-  }
-  if (refresh === "background" && backgroundSupport === "mode-direct") {
-    throw new Error(fill(messages.refreshBackgroundPinnedDirect, { root }));
   }
   parts.push(
     "--limit",
@@ -855,7 +863,7 @@ function indexEmbedding(
     return defaultEmbedding;
   }
   if (isLocalEmbedding(given) || allowRemote) {
-    return given;
+    return given.trim();
   }
   throw new Error(
     fill(messages.embeddingNotAllowed, {

@@ -39,56 +39,185 @@ const SEARCH_PREFIX_WORDS = new Set([
   "parallel",
 ]);
 /**
- * 包装命令里「带一个取值」的选项：其后那一个 token 是它的值，不是被执行的命令
- * （`sudo -u root grep`、`nice -n 10 rg`、`timeout -s 9 5 rg`）。
+ * 包装命令里「带一个取值」的选项，按包装命令分表（键 = 包装命令的 basename）。
+ * 其后那一个 token 是它的值，不是被执行的命令（`sudo -u root grep`、`nice -n 10 rg`、
+ * `timeout -s 9 5 rg`）。
  *
- * 跨包装命令共用一张表：这些短选项在 git/xargs/env/sudo/time/nice/timeout 里
- * 语义一致，逐个包装登记一份只会让「加了新包装却忘了登记」多一处可能。
+ * **必须分表**：同一枚短选项在不同包装下语义不同——`nice -n 10`、`xargs -n 5` 的 `-n`
+ * 吃取值，而 `sudo -n`（non-interactive）、`time -p`（POSIX 输出）、`git -p`（--paginate）、
+ * `xargs -r/-t/-p` 都不吃。共用一张表会把紧随其后的真命令当成取值吞掉，命令位链断开，
+ * 于是 `sudo -n grep foo`、`time -p grep x`、`find … | xargs -r grep TODO` 全部判成
+ * 「不是检索」——漏判的方向就是门禁放行。
+ * 未登记的包装（nohup 没有取值旗标）落空表，无需登记。
  */
-const VALUE_TAKING_FLAGS = new Set([
-  "-a",
-  "-c",
-  "-C",
-  "-d",
-  "-E",
+const VALUE_TAKING_FLAGS = new Map<string, ReadonlySet<string>>([
+  [
+    "git",
+    new Set([
+      "-c",
+      "-C",
+      "--git-dir",
+      "--work-tree",
+      "--namespace",
+      "--super-prefix",
+      "--config-env",
+    ]),
+  ],
+  [
+    "xargs",
+    new Set([
+      "-a",
+      "-d",
+      "-E",
+      "-I",
+      "-L",
+      "-n",
+      "-P",
+      "-s",
+      "--arg-file",
+      "--delimiter",
+      "--eof",
+      "--max-args",
+      "--max-chars",
+      "--max-lines",
+      "--max-procs",
+      "--process-slot-var",
+      "--replace",
+    ]),
+  ],
+  ["env", new Set(["-u", "-C", "-S", "--unset", "--chdir", "--split-string"])],
+  [
+    "sudo",
+    new Set([
+      "-u",
+      "-g",
+      "-C",
+      "-D",
+      "-h",
+      "-p",
+      "-r",
+      "-t",
+      "-T",
+      "-U",
+      "-R",
+      "--user",
+      "--group",
+      "--close-from",
+      "--chdir",
+      "--host",
+      "--prompt",
+      "--role",
+      "--type",
+      "--command-timeout",
+      "--other-user",
+      "--chroot",
+    ]),
+  ],
+  ["time", new Set(["-f", "-o", "--format", "--output"])],
+  ["timeout", new Set(["-s", "-k", "--signal", "--kill-after"])],
+  ["nice", new Set(["-n", "--adjustment"])],
+  [
+    "parallel",
+    new Set([
+      "-j",
+      "-S",
+      "-n",
+      "--jobs",
+      "--sshlogin",
+      "--sshloginfile",
+      "--joblog",
+      "--results",
+      "--tmpdir",
+      "--delay",
+      "--max-args",
+    ]),
+  ],
+]);
+/**
+ * grep/rg 自己的「带一个取值」选项：其后那个 token 是模式（`-e foo`）、glob（`-g *.ts`）、
+ * 编码名（`-E utf-8`）……不是检索目标。判「目标是否在根外」时要跳过它——否则
+ * `grep -f /tmp/patterns .`、`rg --glob /tmp/x foo .` 里的取值会被当成根外证据，
+ * 门禁直接放行（实测过的绕过形态）。
+ * 取 grep 与 rg 的并集：多跳一枚在本函数里只可能导致「少认一个目标」，方向是**多拦**，
+ * 不构成放行。
+ */
+const SEARCH_VALUE_FLAGS = new Set([
+  "-e",
   "-f",
   "-g",
-  "-I",
-  "-k",
-  "-L",
-  "-n",
-  "-o",
-  "-p",
-  "-P",
+  "-m",
+  "-A",
+  "-B",
+  "-C",
+  "-d",
+  "-D",
+  "-E",
+  "-j",
+  "-M",
   "-r",
-  "-s",
   "-t",
   "-T",
-  "-u",
-  "-U",
-  "--adjustment",
-  "--group",
-  "--kill-after",
-  "--signal",
-  "--user",
+  "--regexp",
+  "--file",
+  "--glob",
+  "--iglob",
+  "--type",
+  "--type-not",
+  "--max-count",
+  "--after-context",
+  "--before-context",
+  "--context",
+  "--directories",
+  "--devices",
+  "--encoding",
+  "--threads",
+  "--max-columns",
+  "--max-depth",
+  "--max-filesize",
+  "--replace",
+  "--sort",
+  "--sortr",
+  "--include",
+  "--exclude",
+  "--exclude-from",
+  "--exclude-dir",
+  "--include-dir",
+  "--label",
+  "--pre",
+  "--pre-glob",
+  "--ignore-file",
 ]);
 /** 命令前的壳层赋值（`VAR=1 grep x` 里的 `VAR=1`）：它自己不是命令，其后仍是命令位。 */
 const SHELL_ASSIGNMENT = /^[A-Za-z_]\w*=/u;
 /** 包装命令的裸数值参数（`timeout 5 rg` 的 `5`）：也不是被执行的命令。 */
 const BARE_NUMBER = /^\d+$/u;
-/** 结束一个 token、但**不**开启新命令位的字符（空白、右括号、重定向）。 */
-const TOKEN_BREAK_CHARS = new Set([" ", "\t", "\v", "\f", ")", "<", ">"]);
-/** 结束一个 token 并让紧随其后的 token 处于命令位（控制符 / 换行 / 反引号 / 组）。 */
-const COMMAND_BREAK_CHARS = new Set(["|", ";", "&", "(", "\n", "\r", "`", "{", "}"]);
+/** 结束一个 token、但**不**开启新命令位的字符（空白）。 */
+const TOKEN_BREAK_CHARS = new Set([" ", "\t", "\v", "\f"]);
+/** 结束一个 token 并让紧随其后的 token 处于命令位（控制符 / 换行 / 反引号）。 */
+const COMMAND_BREAK_CHARS = new Set(["|", ";", "&", "\n", "\r", "`"]);
+/**
+ * 重定向符：其后那一个 token 是 I/O 目标（`> /tmp/out`、`< /tmp/in`），不是检索操作数。
+ * 判「目标是否在根外」时必须跳过它——否则 `grep foo src > /tmp/out` 会凭一个输出文件
+ * 被判成「检索根外目标」而放行。
+ */
+const REDIRECT_CHARS = new Set(["<", ">"]);
+/**
+ * 组字符：只有在**独立成词**（buffer 为空）时才是分隔——`(subshell)`、`{ group; }`
+ * 之后是新的命令位。词中的它们属参数展开 / 命令替换（`${DIR}/src`、`$(pwd)/src`），
+ * 必须并进当前 token：切成独立伪 token 会让 `/src` 这类片段被当成绝对路径证据而放行。
+ */
+const GROUP_CHARS = new Set(["(", ")", "{", "}"]);
 /** 引号字符：词首开引号、词尾闭引号都只有这两个，用集合而不是逐字符比较。 */
 const QUOTE_CHARS = new Set(["'", '"']);
 
-/** 一个 shell token：文本（引号已剥除）+ 是否落在命令位 + 是否由管道喂入。 */
+/** 一个 shell token：文本（引号已剥除）+ 是否落在命令位 + 是否由管道喂入 + 是否重定向目标。 */
 interface ShellToken {
   text: string;
   atCommand: boolean;
   /** 该 token 紧跟在管道 `|` 之后：它的 stdin 是上一段命令的 stdout。 */
   piped: boolean;
+  /** 该 token 紧跟在重定向符之后（`> /tmp/out`）：它是 I/O 落点，不是检索操作数。 */
+  redirect: boolean;
 }
 
 /**
@@ -110,25 +239,159 @@ function indexAfterComment(command: string, from: number): number {
 }
 
 /**
+ * 控制符（`|` `;` `&` 换行 反引号）之后：新命令位开始，并记下「下一段是否吃上一段的 stdout」。
+ *
+ * 只有单个 `|` 把上一段的 stdout 接进下一段的 stdin；`;`、`&&`、`||` 之后的命令不是
+ * （`||` 的后半段恰恰是「前半段没产出时才跑」的那条，输入不是 stdout）。`||` 由两个竖线
+ * 字符分别进来，前一枚与后一枚都必须判成「不是管道」。
+ */
+function markCommandBreak(
+  command: string,
+  index: number,
+  char: string,
+  state: { atCommand: boolean; pipedNext: boolean },
+): void {
+  state.atCommand = true;
+  const neighbourIsPipe =
+    command.slice(index + 1, index + 2) === "|" || command.slice(index - 1, index) === "|";
+  state.pipedNext = char === "|" && !neighbourIsPipe;
+}
+
+/**
+ * 独立成词的组字符才分隔（`(subshell)` / `{ group; }`）：`(` 与 `{` 之后是新命令位；
+ * 词中的它们是展开的一部分（`${DIR}/src`、`$(pwd)/src`），并进当前 token。
+ */
+function consumeGroupChar(char: string, state: { buffer: string; atCommand: boolean }): void {
+  if (state.buffer.length > 0) {
+    state.buffer += char;
+  } else if (char === "(" || char === "{") {
+    // 只有开括号开启命令位。闭括号若也写 atCommand，`xargs -I {}` 里那个占位 `{}` 的 `}`
+    // 会把标记再次清掉，紧随其后的真命令就丢了命令位。
+    state.atCommand = true;
+  }
+}
+
+/** 引号外、词首的 `#` 起为注释（整段跳到行尾）。 */
+function isCommentStart(char: string, state: { quote: string; buffer: string }): boolean {
+  return state.quote === "" && char === "#" && state.buffer.length === 0;
+}
+
+/**
+ * 词中开/闭引号（grep'rg'）合并进同一 token：混淆写法照拦。
+ * 走到这里的 char 只可能是「空」或「与 quote 同种」（异种引号在更上面的分支已被当作
+ * 字面量吃进 buffer），故一个三元即覆盖开/闭两种情形。
+ */
+function toggleQuote(char: string, quote: string): string {
+  return quote === char ? "" : char;
+}
+
+/** 包装命令的旗标、裸数值、壳层赋值：都不是被执行的命令，也不结束命令位链。 */
+function isWrapperNoiseText(isCommand: boolean, text: string): boolean {
+  return (
+    isCommand && (text.startsWith("-") || BARE_NUMBER.test(text) || SHELL_ASSIGNMENT.test(text))
+  );
+}
+
+/**
+ * 明确的路径形状：绝对路径、含 `/` 的相对路径、裸 `.` 与 `..`（模式词与文件名不算）。
+ * `.` 与 `..` 都算：`grep foo .` 检索的就是当前工作区。
+ */
+function isPathShape(text: string): boolean {
+  return text.startsWith("/") || text.includes("/") || text === "." || text === "..";
+}
+
+/**
+ * token 的命令名（basename，小写）。
+ * 两个调用点都只喂命令位 token，而命令位判据已经把 `-` 开头的选项排除了
+ * （见 `commandPositionIndexes`），所以这里不再重复判一次前缀：那会是一条
+ * 永远走不到的分支。
+ */
+function baseName(text: string): string {
+  return text.slice(text.lastIndexOf("/") + 1).toLowerCase();
+}
+
+/** 命令位链的滚动状态：包装命令名 / 等取值 / 上一枚是跳过但不断链的噪声。 */
+interface ChainState {
+  wrapper: string;
+  pendingValue: boolean;
+  afterPrefix: boolean;
+}
+
+/** 一枚 token 吃进去之后的新链状态 + 它是否站在被执行位置上。 */
+interface ChainStep {
+  state: ChainState;
+  command: boolean;
+}
+
+/**
+ * 把一枚 token 推进命令位链（纯函数：不改入参，返回下一状态与「这枚是不是命令」）。
+ *
+ * 单独成函数不为复用，只为把这条含 3 层嵌套的判定链从循环里挪出来——循环里只剩
+ * 「推进一步、命中就记下标」两件事。
+ */
+function advanceCommandChain(token: ShellToken, state: ChainState): ChainStep {
+  const { text } = token;
+  const consumingValue = state.pendingValue;
+  const next: ChainState = { ...state, pendingValue: false };
+  if (consumingValue) {
+    // 取值旗标之后的第一枚：`sudo -u root` 的 root（值本身）或 `xargs -I {} grep` 的
+    // grep（`{}` 是组字符占位、不落 token）。两种都在命令位链上，但只有后者是命令。
+    next.afterPrefix = true;
+  } else if (token.atCommand) {
+    // 新命令位：上一段的包装名与「跳过但不断链」状态都不属于这一段（`sudo -n; grep foo`）。
+    next.wrapper = "";
+    next.afterPrefix = false;
+  }
+  const isCommand = token.atCommand || next.afterPrefix || next.wrapper !== "";
+  const takesValue = isCommand && VALUE_TAKING_FLAGS.get(next.wrapper)?.has(text) === true;
+  if (consumingValue && !token.atCommand) {
+    // 这一枚就是选项的取值本身（`sudo -u root` 的 root、`xargs -n 5` 的 5）：不是命令。
+    return { state: next, command: false };
+  }
+  if (takesValue) {
+    next.pendingValue = true;
+    return { state: next, command: false };
+  }
+  if (isWrapperNoiseText(isCommand, text)) {
+    // 壳层赋值（`VAR=1 grep`）在段首没有任何包装名可记，只能靠这一位把命令位带过去
+    next.afterPrefix = true;
+    return { state: next, command: false };
+  }
+  if (isCommand) {
+    next.wrapper = SEARCH_PREFIX_WORDS.has(baseName(text)) ? baseName(text) : "";
+  }
+  next.afterPrefix = false;
+  return { state: next, command: isCommand };
+}
+
+/**
  * 手写 shell 切词（只为「找出命令位上的命令名」服务，不做完整求值）：
  *   - 单/双引号与反斜杠转义**内部**的字符不参与分隔 → `echo "grep x"`、
  *     `printf 'grep'`、`git commit -m "use rg"` 里的字面量不再被当成命令
  *     （旧实现把引号当分隔符，故这三种全被判为检索 → 过度拦截）；
  *   - 引号外、词首的 `#` 起为注释，整段跳到行尾；
- *   - 控制符（`|` `;` `&` `(` 换行 反引号 `{` `}`）之后的 token 记为命令位。
+ *   - 控制符（`|` `;` `&` 换行 反引号）与**独立成词**的 `(` / `{` 之后的 token 记为
+ *     命令位；词中的组字符属参数展开 / 命令替换（`${DIR}/src`、`$(pwd)/src`），并进当前 token；
+ *   - 重定向符（`<` `>`）之后的那一个 token 标记为 `redirect`：它是 I/O 落点，不是检索操作数。
  * 双引号内保留字面内容（含空格），故 `"/usr/bin/rg foo"` 是一个非命令位 token。
  */
 function tokenizeShell(command: string): ShellToken[] {
   const tokens: ShellToken[] = [];
-  const state = { buffer: "", atCommand: true, pipedNext: false, quote: "" };
+  const state = { buffer: "", atCommand: true, pipedNext: false, redirectNext: false, quote: "" };
   const flush = (): void => {
     if (state.buffer.length > 0) {
-      tokens.push({ text: state.buffer, atCommand: state.atCommand, piped: state.pipedNext });
+      tokens.push({
+        text: state.buffer,
+        atCommand: state.atCommand,
+        piped: state.pipedNext,
+        redirect: state.redirectNext,
+      });
       state.buffer = "";
       // 只有真吐出 token 才消费掉命令位：`cat a | grep x` 里 `|` 与 `grep` 之间的
       // 那个空格也必须让位（空 flush 若清位，控制符后的第一个词就丢了命令位）。
       state.atCommand = false;
       state.pipedNext = false;
+      state.redirectNext = false;
     }
   };
   let index = 0;
@@ -141,25 +404,21 @@ function tokenizeShell(command: string): ShellToken[] {
       escaped = false;
     } else if (isQuotedLiteral(char, state.quote)) {
       state.buffer += char;
-    } else if (state.quote === "" && char === "#" && state.buffer.length === 0) {
+    } else if (isCommentStart(char, state)) {
       // 注释跳到行尾（见 indexAfterComment：必须停在换行前一步）
       index = indexAfterComment(command, index);
     } else if (char === "\\") {
       escaped = true;
     } else if (QUOTE_CHARS.has(char)) {
-      // 词中开/闭引号（grep'rg'）合并进同一 token：混淆写法照拦。
-      // 走到这里 quote 只可能是「空」或「与 char 同种」（异种引号在更上面的分支已被
-      // 当作字面量吃进 buffer），故一个三元即覆盖开/闭两种情形。
-      state.quote = state.quote === char ? "" : char;
+      state.quote = toggleQuote(char, state.quote);
     } else if (COMMAND_BREAK_CHARS.has(char)) {
       flush();
-      state.atCommand = true;
-      // 只有单个 `|` 把上一段的 stdout 接进下一段的 stdin；`;`、`&&`、`||` 之后的
-      // 命令不是（`||` 的后半段恰恰是「前半段没产出时才跑」的那条，输入不是 stdout）。
-      // `||` 由两个竖线字符分别进来，前一枚与后一枚都必须判成「不是管道」。
-      const neighbourIsPipe =
-        command.slice(index + 1, index + 2) === "|" || command.slice(index - 1, index) === "|";
-      state.pipedNext = char === "|" && !neighbourIsPipe;
+      markCommandBreak(command, index, char, state);
+    } else if (GROUP_CHARS.has(char)) {
+      consumeGroupChar(char, state);
+    } else if (REDIRECT_CHARS.has(char)) {
+      flush();
+      state.redirectNext = true;
     } else if (TOKEN_BREAK_CHARS.has(char)) {
       flush();
     } else {
@@ -169,16 +428,6 @@ function tokenizeShell(command: string): ShellToken[] {
   }
   flush();
   return tokens;
-}
-
-/**
- * token 的命令名（basename，小写）。
- * 两个调用点都只喂命令位 token，而命令位判据已经把 `-` 开头的选项排除了
- * （见 `commandPositionIndexes`），所以这里不再重复判一次前缀：那会是一条
- * 永远走不到的分支。
- */
-function baseName(text: string): string {
-  return text.slice(text.lastIndexOf("/") + 1).toLowerCase();
 }
 
 /**
@@ -192,28 +441,12 @@ function baseName(text: string): string {
  */
 function commandPositionIndexes(tokens: ShellToken[]): number[] {
   const out: number[] = [];
-  let afterPrefix = false;
-  let pendingValue = false;
+  let chain: ChainState = { wrapper: "", pendingValue: false, afterPrefix: false };
   for (const [index, token] of tokens.entries()) {
-    const { text } = token;
-    const isCommand: boolean = token.atCommand || afterPrefix;
-    if (pendingValue) {
-      // 上一枚是取值旗标，这一枚是它的值：不是命令，命令位链继续
-      pendingValue = false;
-      afterPrefix = true;
-    } else if (isCommand && VALUE_TAKING_FLAGS.has(text)) {
-      pendingValue = true;
-    } else if (
-      isCommand &&
-      (text.startsWith("-") || BARE_NUMBER.test(text) || SHELL_ASSIGNMENT.test(text))
-    ) {
-      // 包装命令的旗标、裸数值、壳层赋值：都不是被执行的命令，也不结束命令位链
-      afterPrefix = true;
-    } else {
-      if (isCommand) {
-        out.push(index);
-      }
-      afterPrefix = isCommand && SEARCH_PREFIX_WORDS.has(baseName(text));
+    const step = advanceCommandChain(token, chain);
+    chain = step.state;
+    if (step.command) {
+      out.push(index);
     }
   }
   return out;
@@ -230,14 +463,8 @@ function hasPathOperand(tokens: ShellToken[], from: number): boolean {
     if (token.atCommand) {
       break;
     }
-    const isFlag = token.text.startsWith("-");
-    if (
-      !isFlag &&
-      (token.text.startsWith("/") ||
-        token.text.includes("/") ||
-        token.text === "." ||
-        token.text === "..")
-    ) {
+    // 重定向目标（`> /tmp/out`）是 I/O 落点、`-x` 是旗标：都不构成「检索文件系统」的操作数
+    if (!token.redirect && !token.text.startsWith("-") && isPathShape(token.text)) {
       return true;
     }
   }
@@ -263,7 +490,8 @@ function hasPathOperand(tokens: ShellToken[], from: number): boolean {
  *   - --help/--version/-V 豁免按整条命令判断（`rg a --version && grep b c`
  *     复合命令会漏拦 grep）；
  *   - shell 关键字（`for … ; do grep`、`if … ; then rg`）不是控制符，其后的
- *     grep 不在命令位；`VAR=1 grep x` 同理。
+ *     grep 不在命令位。壳层赋值（`VAR=1 grep x`）**不**属此列：commandPositionIndexes
+ *     把 `VAR=1` 当「跳过但不断链」处理。
  */
 export function isGrepRgCommand(command: string): boolean {
   const tokens = tokenizeShell(command);
@@ -343,13 +571,25 @@ export function hasExternalTarget(
   messages: ZvecGrepMessages,
 ): boolean {
   const base = normalizeRoot(root);
-  for (const token of tokenizeShell(command)) {
+  const tokens = tokenizeShell(command);
+  const commandIndexes = new Set(commandPositionIndexes(tokens));
+  /** 上一枚是检索侧的取值旗标：这一枚是它的值（模式 / glob / 编码名…），不是目标。 */
+  let pendingValue = false;
+  for (const [index, token] of tokens.entries()) {
     const { text } = token;
-    // flag 选项（-*）跳过；仅认明确的路径形状：绝对路径 / 含 / 的相对路径 / 裸 ..
-    const isPathShape =
-      !text.startsWith("-") && (text.startsWith("/") || text.includes("/") || text === "..");
-    if (isPathShape && !pathInsideRoot(text, base, messages)) {
-      return true;
+    const consumedValue = pendingValue;
+    pendingValue = false;
+    // 三类都不是检索目标：命令位 token 是**程序本身**（`/usr/bin/grep`、`git`、`xargs`），
+    // 否则任何绝对路径写法的 grep 都能凭自己那条路径判成「根外目标」而放行（实测绕过）；
+    // 取值旗标的取值是模式/glob；重定向目标（`> /tmp/out`）是 I/O 落点。
+    const notTarget = commandIndexes.has(index) || consumedValue || token.redirect;
+    if (!notTarget) {
+      // flag 选项（-*）跳过；仅认明确的路径形状：绝对路径 / 含 / 的相对路径 / 裸 ..
+      if (text.startsWith("-")) {
+        pendingValue = SEARCH_VALUE_FLAGS.has(text);
+      } else if (isPathShape(text) && !pathInsideRoot(text, base, messages)) {
+        return true;
+      }
     }
   }
   return false;

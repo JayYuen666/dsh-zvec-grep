@@ -122,7 +122,7 @@ import { normalizeRoot, pathsRelated } from "./lib/search-predicates.ts";
 import type { SearchUnlock } from "./lib/search-predicates.ts";
 // 活跃重建的统一状态源：占位互斥、作业 id 补写时机、等待者唤醒都在这一层。
 import { createRebuildRegistry } from "./lib/rebuild-state.ts";
-import type { RebuildRegistry } from "./lib/rebuild-state.ts";
+import type { ActiveRebuild, RebuildRegistry } from "./lib/rebuild-state.ts";
 // zg 结构化失败的识别层：错误文案与「要不要排队等锁」两条路径同源于此。
 import { classifyConcurrentFailure } from "./lib/zg-errors.ts";
 // zg CLI 的版本门槛：命令形态与旗标名是照某个版本写的，装了太老的 zg 会在命令构造前
@@ -1070,9 +1070,19 @@ function readEnforceSearchFirst(config: Config): boolean {
   return config.enforceSearchFirst.get() ?? true;
 }
 
-/** 归一路径的跨平台可比形式：剥掉 macOS 的 `/private` 解析前缀（`/tmp` ⇄ `/private/tmp`）。 */
-function comparablePath(root: string): string {
-  return root.startsWith("/private/") ? root.slice("/private".length) : root;
+/**
+ * 归一路径的跨平台可比形式：剥掉 macOS 的 `/private` 解析前缀（`/tmp` ⇄ `/private/tmp`）。
+ *
+ * 剥除**只在 macOS 上成立**：darwin 的 `/private` 是 `/tmp` 等目录的 realpath 前缀，
+ * 两种拼写指同一目录；Linux 上 `/private/xxx` 是一个与 `/xxx` 无关的真实目录，无差别
+ * 剥除会把两棵不同的树判成同一棵（manifest 覆盖判据随之错配）。Windows 不在本包支持面。
+ *
+ * `platform` 供测试注入：分支覆盖不依赖测试机自己的操作系统。导出只为可测。
+ */
+export function comparablePath(root: string, platform: string = process.platform): string {
+  return platform === "darwin" && root.startsWith("/private/")
+    ? root.slice("/private".length)
+    : root;
 }
 
 /** 认的清单版本：与上游 v0.2.2 的 `export const CURRENT_MANIFEST_VERSION = 1` 同值。 */
@@ -1957,6 +1967,7 @@ async function startBackgroundIndex(
   root: string,
   indexArgs: IndexArgs,
   messages: ZvecGrepMessages,
+  claimed: ActiveRebuild,
 ): Promise<{ text: string }> {
   const routes: IndexWriteRoutes = {
     host: runtime.host,
@@ -1970,21 +1981,26 @@ async function startBackgroundIndex(
   // 与设置卡那条重建同一道预检：官方注册表不在时**根本不起进程**。起一条没有环、没有
   // 容量、也没人能收的 zg 比不起更糟——它会一直占着同根的写锁，把这棵树的后续索引全堵死。
   if (runtime.jobsOf() === undefined) {
-    runtime.rebuilds.release(root);
+    runtime.rebuilds.release(root, claimed);
     throw new Error(messages.endpointJobsUnavailable);
   }
   const embedding = readDefaultEmbedding(runtime.config);
   const spawned = await spawnIndexWrite(routes, messages, indexArgs, embedding);
   if ("error" in spawned) {
-    runtime.rebuilds.release(root);
+    runtime.rebuilds.release(root, claimed);
     throw new Error(spawned.error);
   }
-  const attached = attachIndexWrite(routes, root, messages, spawned);
+  const attached = attachIndexWrite(routes, root, messages, spawned, claimed);
   if ("error" in attached) {
-    runtime.rebuilds.release(root);
+    runtime.rebuilds.release(root, claimed);
     throw new Error(attached.error);
   }
-  runtime.rebuilds.attach(root, attached.jobId);
+  // 带凭据 attach：注册表只在占位仍是这一代时写入作业号（代次校验住在 lib/rebuild-state.ts，
+  // 由它自己的用例钉住）。这里不再写「attach 失败就收作业再报在飞」的兜底——从 claim 到这一行
+  // 只有 spawnIndexWrite 里那一次 await，本调用自己的失败出口都是先 release 再抛，而别的入口
+  // 在占位存在时 claim 必返回 null（只跟随或答「在飞」），所以占位不可能在这段里被释放或顶替，
+  // 那条兜底永远走不到。将来若在这行之前插进新的 await，必须把 kill + 报「在飞」加回来。
+  runtime.rebuilds.attach(root, attached.jobId, claimed);
   return {
     text: fill(messages.indexBackgroundStarted, {
       root,
@@ -2023,11 +2039,19 @@ async function runIndexTool(
   // 之后的检索一直排队等一条永远不会落定的重建。后台那条由 spawnIndexWrite 自己的
   // 失败出口释放（它在这道门槛之前就 spawn 不到任何东西，见该函数）。
   await runtime.versionGate.ensure(messages);
-  if (rewriting && rebuilds.claim(root, "tool") === null) {
-    return { text: fill(messages.indexRebuildInFlight, { root }) };
-  }
-  if (background) {
-    return startBackgroundIndex(runtime, root, indexArgs, messages);
+  // background 在定义上就蕴含 rewriting（见上面那两行）：占位与「走后台」的判断收在同一层。
+  // 前台重建的那枚占位另收进一个非空局部量，finally 因此不必再在「有占位 / 没有」之间
+  // 做一次永远取同一支的空值兜底。
+  let foregroundClaim: ActiveRebuild | undefined;
+  if (rewriting) {
+    const claimed = rebuilds.claim(root, "tool");
+    if (claimed === null) {
+      return { text: fill(messages.indexRebuildInFlight, { root }) };
+    }
+    if (background) {
+      return startBackgroundIndex(runtime, root, indexArgs, messages, claimed);
+    }
+    foregroundClaim = claimed;
   }
   try {
     // **命令构造也必须在 try 里面**：它同样会抛（构造期 allowlist 拒非本地 embedding、
@@ -2054,8 +2078,9 @@ async function runIndexTool(
     return { text };
   } finally {
     // 工具侧的重建是前台的：命令返回即落定，占位随之交还（含超时/被中止/失败）。
-    if (rewriting) {
-      rebuilds.release(root);
+    // 带凭据释放：迟到的收尾不许删掉同根新 claim 的条目（见 release 的代次校验）。
+    if (foregroundClaim !== undefined) {
+      rebuilds.release(root, foregroundClaim);
     }
   }
 }
@@ -2127,6 +2152,12 @@ async function runStatusTool(
       ? {
           resolveFailure: (failure: string, result: ShellRunResult): string | null => {
             if (result.timedOut || result.aborted || result.sandbox?.denied === true) {
+              return null;
+            }
+            // 锁忙同样不是终局：它要走下面的重建等待重试。锁忙时 stdout 上那半截报告只是
+            // 一次被打断的查询——吸收它会让 RebuildLockBusyError 永远不抛、等待臂整个失效，
+            // 而模型拿到的还会是一句自相矛盾的「这不是执行失败」。
+            if (classifyConcurrentFailure(result.stderr.text) !== null) {
               return null;
             }
             const report = result.stdout.text.trim();

@@ -2,6 +2,27 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.10
+
+一轮跨面审查修复：search-first 门禁的词法判据重建、重建注册表代次化，状态读面与发布链收口。
+
+### Changed
+
+- **发布链加固**（`.github/workflows/publish.yml`）：分支守卫改比完整 `refs/heads/` ref；npm token 形态校验（`ghp_`/非 `npm_` 前缀拒用）；发布对象改为 check 验过的那枚 tarball 本体、不再解包重打；发布前查 registry 版本占用，发布后轮询可见性（上限 5 分钟）。ci.yml 的 attest 限默认分支 dispatch；actionlint 的 SC2016 豁免从全局 `-ignore` 收窄为按文件 `-config-file`。
+- **依赖与元数据**：author 改对象形（带 URL）；`@deepseek-ai/schemastery` peer 放宽为 `^3.18.6-alpha.1`；devDependencies 新增 fast-check 4.10.2；catalog 的 shared 抬到 0.2.2；LICENSE 署名同步。
+
+### Fixed
+
+- **门禁词法**（`lib/search-predicates.ts`）：包装命令取值旗标按包装名分表（sudo/time/git/xargs 各自的 `-n/-p/-E/-r/-t` 不再误吞真命令）；新增检索侧取值旗标表与重定向标记（`grep foo src > /tmp/out` 的落点不算操作数）；组字符只在独立成词时分隔（`${DIR}/src` 不再被切碎放行）；命令位绝对路径不再当根外目标。
+- **重建注册表代次化**（`lib/rebuild-state.ts`）：`release`/`attach` 增加可选 claim 凭据校验，迟到收尾不再删改同根新条目；`wait` 改递归 `waitCovering`，祖先+后代同时覆盖时逐轮都等；全部键经 `normalizeRoot`。
+- **状态读面**（`host.ts`、`lib/rebuild-remote.ts`）：zg_status 的锁忙 stderr 不再被吸收成「未就绪」；`comparablePath` 的 `/private` 剥除加 darwin 门控；超时 `jobs.kill` 包 try、失效退回 `killProc`；历史裁剪按 `startedAt` 排序；`roots()` 探测失败不再连带白名单不可用；超时分钟数 `Math.max(1, ceil)`。
+- **卡片与草稿**（`lib/card-logic.ts`、`lib/card-draft.ts`、`src/client-entry.ts`）：端点草稿逐字回显，键入中不被 URL 校验吞；草稿/已提交两层都只判自有属性；useRebuild 加 jobRef 代次与重挂置真。
+- **散修**：`lib/cli.ts` 查询串改 `--hybrid=` 等号拼值（`-` 开头的查询不再被当旗标）、embedding 引用 trim；`lib/messages.ts` `fill()` 只取自有属性；`lib/argv-guard.ts` 计数改过滤后长度；`lib/index-preflight.ts` 增 ENAMETOOLONG；`lib/sandbox-note.ts` trim 加「unknown」兜底；`lib/zg-errors.ts` 明细只认第一个错误块；`lib/zg-config.ts` 远程端点走与 HF 镜像同一套规范化校验；`lib/embedding-catalog.ts` 目录深冻结。
+
+### Added
+
+- **测试三层**：`test/platform/platform.test.ts`（平台门控/win32 根拒绝/CRLF/shq 往返）、`test/property/` 三件（paths、rebuild-state、zg-errors，fast-check）、`test/sandbox-note.test.ts`、`test/zg-config.test.ts`。
+
 ## 0.1.9
 
 这一版让 search-first 门禁认识宿主的步骤准入，并把设置卡与读面校验统一到 shared 组件和 zod；
@@ -168,6 +189,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `@deepseek-ai/dsh-*` 家族与 peer 的 `@deepseek-ai/dsh` 从 `0.2.1-alpha.1` 升到 `0.2.1-alpha.2`；`@deepseek-ai/cordis` `4.0.5-alpha.1`、`@deepseek-ai/schemastery` `3.18.5-alpha.1`、`@deepseek-ai/cordis-plugin-timer` `1.1.7-alpha.1` **不动**——那是 alpha.2 自己钉的那几枚，registry 上没有更新的 alpha。
 - `pnpm-workspace.yaml` 整体换成与 `dsh-danger-guard` / `dsh-plugin-shared` 逐字节相同的那一份：`dsh-*` 86 枚 override 跟到 alpha.2，工具链跟到 registry 现行头（`@types/node` 26.6.3→26.6.5、`vitest` 与 `@vitest/coverage-v8` 5.0.2→5.0.3、`vite` 8.3.1→8.3.4、`rolldown` 1.2.11→1.2.13、`oxlint` 1.86.0→1.87.0、`oxfmt` 0.71.0→0.72.0、`oxlint-tsgolint` 7.0.2003→7.0.2004、`happy-dom` 20.14.5→20.14.6、`jsdom` 30.1.1→30.1.2）。`@jayyuen66/dsh-plugin-shared` `^0.1.3`→`^0.1.4`（实装的 0.1.2 比声明还旧，锁文件已过期）。
 - `engines` 取严格口径：`dsh: >=0.2.1-alpha.2`（shared 0.1.4 自己的 `engines.dsh` 就是这个下限，声明得更宽等于撒谎）、`node: ^22.19.0 || >=24.0.0`（同取自 shared）。宿主按 **peer 声明**判兼容、不读 `engines.dsh`，且逐条比对每一枚 `@deepseek-ai/dsh*`——本包的精确钉因此意味着**高于 0.2.1-alpha.2 的宿主也需要 `dsh plugin allow-version … --accept-risk`**，两份 README 已按实测写明。
+  （更正：宿主判据与上面这句相反——`engine.dsh` 在场时它**先判这一条且单独决定**，`peerDependencies` 根本不参与比较，比较时还带 `includePrerelease`（见 deepseek-harness `packages/boot/app-boot/src/plugin-compatibility.ts` 的 `satisfies` 与 `unmetRequirements`）。本包现行的 `engines.dsh` 是 `^0.2.1-rc.3`、`node` 是 `>=22.12.0`，两份 README 已按现行口径写。）
 - README 拆成中英两份：`README.md` 为英文、`README.zh-CN.md` 为中文，两份顶部互链。原来是一份文件里的 `## 中文` / `## English` 两段，正文一字未改地按语言切开。
 - 注释里「钉进依赖 `.d.ts` 的行号」全量换成文件 + 符号/原文锚点。抽查即见腐坏：`dsh-tools` 那组（`ToolDefinition` / `ToolGuard` / `ToolRuntime`）随 alpha.2 整体漂了 7–17 行，`tool.execute` 的调用点也是。测试夹具里的 `src/beta.ts:1-3` 那类是 **数据**（zg 的输出形态），不在射程内。
 - `.github/workflows/publish.yml` 跟 `dsh-danger-guard` 同款加固：`concurrency` 防两次 dispatch 并行、action 钉 commit SHA、预检加「读本包」这一档（只查依赖就发现不了「版本号没进 main 就触发」）、发布用的 `NODE_AUTH_TOKEN` 走与预检同款清洗、加 `--provenance` 与 `--publish-wait-timeout 600000`，并且不再把凭据长度打进日志。

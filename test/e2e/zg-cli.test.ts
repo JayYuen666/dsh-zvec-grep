@@ -31,7 +31,12 @@ import {
 import { MESSAGES } from "../../lib/messages.ts";
 import type { ZvecGrepMessages } from "../../lib/messages.ts";
 import { classifyConcurrentFailure } from "../../lib/zg-errors.ts";
-import { MINIMUM_ZG_VERSION, parseZgVersion, tooOldZgVersion } from "../../lib/zg-version.ts";
+import {
+  MINIMUM_ZG_VERSION,
+  parseZgVersion,
+  tooOldZgVersion,
+  versionAtLeast,
+} from "../../lib/zg-version.ts";
 import { hitSummary, signalStderr } from "../../host.ts";
 import { inOrder, canMakeUnreadableFile, zgAvailable } from "../integration/host-stack.ts";
 
@@ -148,15 +153,24 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
   it("真 zg --version 的原文被解析，且不低于本包门槛", async () => {
     const { stdout: raw } = await run("zg --version", ws);
     // 门口径：真输出必须被解析成版本号（读不懂 ⇒ 门槛失效），且不低于本包门槛。
-    assert.deepEqual(parseZgVersion(raw), { major: 0, minor: 2, patch: 2 }, raw);
+    // **不钉具体版本号**：上游发 0.2.3 时旗标面可能一字未改，钉死补丁号只会让它误红。
+    // 比较必须走逐段数值（versionAtLeast），不能用字符串字典序——"0.10.0" < "0.2.2"。
+    const parsed = parseZgVersion(raw);
+    assert.ok(parsed !== undefined, `读不懂 zg --version 原文：${raw}`);
     expect(tooOldZgVersion(raw)).toBeUndefined();
-    const installed = raw.trim().split(/\s+/u).at(-1);
-    assert.ok(installed !== undefined && installed >= MINIMUM_ZG_VERSION, `装了 ${installed}`);
+    const minimum = parseZgVersion(MINIMUM_ZG_VERSION);
+    assert.ok(minimum !== undefined, MINIMUM_ZG_VERSION);
+    assert.ok(versionAtLeast(parsed, minimum), `装了 ${raw.trim()}，门槛 ${MINIMUM_ZG_VERSION}`);
   }, 30_000);
 
   it("老版本字面量被判为太老（形状就是真 zg 的 <版本号> 行）", () => {
-    expect(tooOldZgVersion("0.0.1\n")).not.toBeNull();
-    expect(tooOldZgVersion("0.1.0\n")).not.toBeNull();
+    // tooOldZgVersion 的「太老」是**交回实际版本**，「够新或读不懂」是 undefined：
+    // 它从不返回 null，所以 not.toBeNull() 恒真、一条回归都拦不住。断言具体版本号。
+    expect(tooOldZgVersion("0.0.1\n")).toStrictEqual({ major: 0, minor: 0, patch: 1 });
+    expect(tooOldZgVersion("0.1.0\n")).toStrictEqual({ major: 0, minor: 1, patch: 0 });
+    // 反向两臂：恰好等于门槛时放行；读不懂时也放行（门槛只拦「确知太老」）。
+    expect(tooOldZgVersion(`${MINIMUM_ZG_VERSION}\n`)).toBeUndefined();
+    expect(tooOldZgVersion("0.2.2-rc.1\n")).toBeUndefined();
   });
 
   it("穷举检索命令在真 zg 上跑通（--rg + 路径/时间过滤 + --mode）", async () => {
@@ -528,20 +542,25 @@ describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的�
       clientModeOf(undefined, messages),
     );
     const { command } = built;
-    const first = await run(command, root);
-    assert.equal(first.status, 0, `${command}\n${first.stderr}`);
-    // 第二条紧接着起：要么被锁拒（结构化失败），要么排到锁后成功。
-    const concurrent = await run(command, root);
-    if (concurrent.status === 0) {
-      // 没撞上（锁已放）也成立：这一条只断言「撞上时认得出来」。
-      return;
-    }
-    const classified = classifyConcurrentFailure(concurrent.stderr);
-    assert.ok(classified !== null, concurrent.stderr);
-    expect(["lock-busy", "daemon-lease"]).toContain(classified.kind);
-    if (classified.kind === "lock-busy") {
-      // 占锁方自报的操作名决定「要不要排队等」：不是重建就一等不到头。
-      assert.equal(typeof classified.ownerOperation, "string");
+    // 两条**同时**起：await 完第一条再起第二条等于串行，锁早已释放，本组会恒绿。
+    const first = run(command, root);
+    const concurrent = run(command, root);
+    const [built0, second] = await Promise.all([first, concurrent]);
+    // 并发之后**两条都可能**撞锁，不许再假定「第一条必然成功」；但至少要有一条真把索引建出来，
+    // 否则两臂都失败就什么都没证到。
+    const both = [built0, second];
+    assert.ok(
+      both.some((outcome) => outcome.status === 0),
+      `${command}\n${both.map((outcome) => outcome.stderr).join("\n")}`,
+    );
+    for (const failed of both.filter((outcome) => outcome.status !== 0)) {
+      const classified = classifyConcurrentFailure(failed.stderr);
+      assert.ok(classified !== null, failed.stderr);
+      expect(["lock-busy", "daemon-lease"]).toContain(classified.kind);
+      if (classified.kind === "lock-busy") {
+        // 占锁方自报的操作名决定「要不要排队等」：不是重建就一等不到头。
+        assert.equal(typeof classified.ownerOperation, "string");
+      }
     }
   }, 180_000);
 });

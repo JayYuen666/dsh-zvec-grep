@@ -53,12 +53,25 @@ function parseOrThrow<Result>(schema: z.ZodType<Result>, value: unknown): Result
 }
 
 const START_SCHEMA = z.object(
-  { root: z.string({ error: "rebuild request requires a string root" }) },
+  {
+    // 非空是必要判据：空 root 在宿主侧会被当成「没给路径」再退到默认工作区，而卡片这边
+    // 以为重建的是用户选的那一个。
+    root: z
+      .string({ error: "rebuild request requires a string root" })
+      .trim()
+      .min(1, { error: "rebuild request requires a non-empty root" }),
+  },
   { error: "rebuild request requires a string root" },
 );
 
 const STATUS_SCHEMA = z.object(
-  { jobId: z.string({ error: "rebuild status request requires a string jobId" }) },
+  {
+    // jobId 来自宿主回执，空串只可能是回执形状坏了：在这里拦下，别让它换成一个无意义的轮询。
+    jobId: z
+      .string({ error: "rebuild status request requires a string jobId" })
+      .trim()
+      .min(1, { error: "rebuild status request requires a non-empty jobId" }),
+  },
   { error: "rebuild status request requires a string jobId" },
 );
 
@@ -194,10 +207,18 @@ function buildRebuildReader(ctx: RemoteHost): RebuildReader {
     } catch (error) {
       // 挂载失败不留在缓存里：rejected promise 一旦复用，之后每次轮询（含 2s 一次的
       // status）都会撞同一个 rejection，重试永远不会发生。
+      //
+      // 直接清空即可，不需要「只清自己那一枚」的比较：`mounted ??=` 在 await **之前**
+      // 赋值，所以在它被拒之前，缓存里不可能出现「另一枚更新的、已成功的」promise——
+      // 新的挂载只有在本行清空之后才可能发生。
       mounted = undefined;
       throw error;
     }
-    const namespace = ctx.get?.(REBUILD_SERVICE_KEY, false);
+    // 与上面读 `remote` 用同一档 strict（`ctx.get` 的默认值）：两处都以「提供方 fiber 此刻
+    // 有效」为准。这里原先显式传 `false`（连未激活的提供方也交回），与上一处的判据不一致——
+    // 命名空间是刚刚 `$mount` 挂上去的，提供方就在本卡这条活动链上，放宽读只会读到一个
+    // 已经卸下的实现。
+    const namespace = ctx.get?.(REBUILD_SERVICE_KEY);
     if (!isRebuildNamespace(namespace)) {
       throw new Error(`${REBUILD_SERVICE_KEY} 未提供：宿主网关没有挂上这枚命名空间`);
     }

@@ -38,7 +38,7 @@ export interface ZvecGrepMessages {
   readonly limitDescription: string;
   /** zg_search 的 preview（含取值域与缺省）。 */
   readonly previewDescription: string;
-  /** zg_search 的 refresh（含 background 的降级条件）。 */
+  /** zg_search 的 refresh（没有守护进程或 clientMode 被钉死时在命令构造前拒绝）。 */
   readonly refreshDescription: string;
   /** zg_search 的 globs（带示例）。 */
   readonly globsDescription: string;
@@ -230,6 +230,7 @@ export interface ZvecGrepMessages {
    * ——模式是部署在 cordis.yml 的行 config 里定的，得回那里改。
    */
   readonly refreshBackgroundPinnedDirect: string;
+  /** zg_status 末尾补的守护进程就绪态（就绪那一臂）：无占位符。 */
   readonly serverReadyNote: string;
   /** zg_status 末尾补的守护进程就绪态（未就绪那一臂）：无占位符。 */
   readonly serverUnavailableNote: string;
@@ -279,8 +280,7 @@ export interface ZvecGrepMessages {
   readonly ignoreFileMissing: string;
   /** 无索引时自动改走穷举检索的前置说明。 */
   readonly exhaustiveFallbackNote: string;
-  /** 穷举检索不发放 grep/rg 配额。 */
-  /** 穷举模式参数说明（模型侧）。 */
+  /** 穷举检索不发放 grep/rg 配额；穷举模式参数说明（模型侧）。 */
   readonly rgDescription: string;
   /** 整数旗标（收到值也交代）：`{name}`、`{min}`、`{received}`。 */
   readonly intWithReceived: string;
@@ -309,7 +309,7 @@ const ABSOLUTE_ROOT_HINT_ZH =
   "工作区绝对路径（可选：缺省=当前会话工作区；显式传入时须在本会话可操作范围内——" +
   "会话工作区本身、其上级或下级、或本会话已登记过的工作区）";
 
-/** 英文侧「绝对路径 + 可操作范围」那句共用文案（检索/索引两个 root 参数同义）。 */
+/** 英文侧「绝对路径 + 可操作范围」那句共用文案（三个 root 参数同义）。 */
 const ABSOLUTE_ROOT_HINT =
   "Absolute workspace path (optional: default = current session workspace; when passed explicitly it " +
   "must stay inside this session's operable scope — the workspace itself, its parents or children, " +
@@ -564,7 +564,10 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "Semantic/hybrid search (BM25 + vector + RRF) over an indexed workspace, for questions exact " +
       "lookup cannot answer: architecture, call chains, dependencies, lifecycles, data/control flow, " +
       "design intent, cross-file comparison and synthesis. root defaults to the current session " +
-      "workspace; you may also name another already-indexed absolute path. Search refreshes the " +
+      "workspace; an explicit one must fall inside this session's operable range — the session " +
+      "workspace itself, a root the daemon has already observed, or an ancestor/descendant of the " +
+      "session workspace (the result then says which relation was used). A path being absolute, or " +
+      "already indexed, is not authorization by itself. Search refreshes the " +
       "existing index automatically (--refresh wait), so code edited moments ago is searchable " +
       "without re-running zg_index; a root that was never indexed is not indexed silently " +
       "either: the call switches to exhaustive literal search and says so in the result. Every hit carries a **bounded source snippet** (--preview short: " +
@@ -934,7 +937,8 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
  */
 export function fill(template: string, params: Record<string, string | number | null>): string {
   return template.replaceAll(/\{(?<key>\w+)\}/gu, (_all: string, key: string) => {
-    const value = params[key];
+    // 只取自有属性：模板里出现 {constructor}/{toString} 时不能把原型链上的函数 String 化。
+    const value = Object.hasOwn(params, key) ? params[key] : undefined;
     return value === undefined ? "" : String(value);
   });
 }

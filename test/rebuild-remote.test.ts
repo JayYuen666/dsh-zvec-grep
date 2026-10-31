@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { Context } from "@deepseek-ai/cordis";
+import type { ShellExecution } from "@deepseek-ai/dsh-shell";
 import { remoteMethods } from "@deepseek-ai/dsh-typert-protocol";
 
 import {
@@ -14,11 +15,21 @@ import {
   installRebuildRemote,
   ZvecRebuildService,
 } from "../lib/rebuild-remote.ts";
-import type { RebuildRecord, ZvecRebuildDeps } from "../lib/rebuild-remote.ts";
+import type {
+  IndexWriteRoutes,
+  RebuildHost,
+  RebuildRecord,
+  ZvecRebuildDeps,
+} from "../lib/rebuild-remote.ts";
+import type { ZgDeployConfig } from "../lib/zg-config.ts";
+import type { RebuildRegistry } from "../lib/rebuild-state.ts";
 import { REBUILD_REMOTE_NAMESPACE } from "../lib/rebuild-shape.ts";
 import { REBUILD_DESCRIPTORS, createRebuildReader } from "../src/rebuild-reader.ts";
 import type { RemoteHost } from "../src/rebuild-reader.ts";
 import { MESSAGES } from "../lib/messages.ts";
+
+/** 本包重建作业的命令形状：多处用例共用，避免同一字面量散落。 */
+const REBUILD_COMMAND = "zg index --rebuild";
 
 /**
  * 要「盘上真工作区」的用例按平台跳过：本包 root 判据（`lib/cli.ts` 的 `assertAbsoluteRoot`）
@@ -48,8 +59,10 @@ function depsOf(): ZvecRebuildDeps {
           void 0;
         },
       },
-    } as never,
-    config: {} as never,
+    } as unknown as RebuildHost,
+    // 只用到几面，但**按字段类型**转换而不是 `as never`：字段名写错、或这几面的签名
+    // 变了，返回值就不满足 ZvecRebuildDeps，编译期当场红；`as never` 会把这些静默吃掉。
+    config: {} as unknown as ZgDeployConfig,
     messages: () => MESSAGES.zh,
     jobsOf: () => {
       void 0;
@@ -60,7 +73,7 @@ function depsOf(): ZvecRebuildDeps {
       release: () => {
         void 0;
       },
-    } as never,
+    } as unknown as RebuildRegistry,
     versionGate: {
       ensure: async () => {
         void 0;
@@ -132,6 +145,19 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
     assert.match((status as { error: string }).error, /历史窗口/u);
   });
 
+  it("就绪探测抛错：白名单照常交回，serverReady 折成 false", async () => {
+    const ctx = new Context();
+    const deps = depsOf();
+    deps.serverGate = {
+      ready: async (): Promise<boolean> => {
+        throw new Error("probe boom");
+      },
+    };
+    installRebuildRemote(ctx, deps);
+    const service = ctx.get(REBUILD_REMOTE_NAMESPACE) as ZvecRebuildService;
+    assert.deepEqual(await service.roots(), { roots: [], serverReady: false });
+  });
+
   it("历史裁剪抛错：先杀掉刚起的进程再交回启动失败，不把异常穿过本函数", () => {
     // 回归用例：`pruneRebuildHistory` 里 `list()` / `remove()` 抛错时若不在这里接住，
     // 异常会穿过 attachIndexWrite，调用方那两条 release 都轮不到执行 —— 刚 spawn 的 zg
@@ -151,10 +177,13 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
           },
         }),
         records: new Map(),
-      } as never,
+        // 这条用例只需要这两面（错误路径在 `start` 之前就抛），而函数签名要整个
+        // IndexWriteRoutes：按索引面收窄只能落在注释上。真实约束由实现保证——它必须先碰
+        // 这两面，一旦把 versionGate/config 挪到裁剪之前，这条用例会在这里就崩成红。
+      } as unknown as IndexWriteRoutes,
       "/repo",
       MESSAGES.zh,
-      { proc, command: "zg index --rebuild" },
+      { proc, command: REBUILD_COMMAND },
     );
     assert.equal("error" in attached, true);
     assert.equal((attached as { status: number }).status, 500);
@@ -162,12 +191,77 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
     assert.deepEqual(killed, ["killed"], "起出来的那条进程必须被收掉");
   });
 
+  it("超时收作业时注册表 kill 抛错：退回手里那枚进程直接杀，异常不逃出定时器", () => {
+    // 回归用例：定时器回调里那段 try/catch。注册表可能不认这条 id（换过实例、或已被销毁），
+    // 而异常从 timer 回调里逃出去没有任何人接手——这条定时器存在的唯一理由就是
+    // 「zg 不能永远挂着」，所以必须退回手里这枚进程直接收。
+    const killed: string[] = [];
+    const identity = { kind: "zvec-grep-rebuild", label: REBUILD_COMMAND, startedAt: 1 };
+    const view = { ...identity, id: "zvec-grep-rebuild-cccccccccccccccc", status: "running" };
+    const timerCallbacks: (() => void)[] = [];
+    const neverSettles = Promise.withResolvers<null>();
+    const jobs = {
+      attachController: () => (): void => {
+        void 0;
+      },
+      start: (spec: { run: (handle: { id: string }) => unknown }): string => {
+        spec.run({ id: view.id });
+        return view.id;
+      },
+      get: () => view,
+      list: () => [],
+      kill: (): void => {
+        throw new Error("registry is gone");
+      },
+    };
+    const proc = {
+      status: "running",
+      kill: (): boolean => {
+        killed.push("killed");
+        return true;
+      },
+      done: neverSettles.promise,
+      observed: {},
+    } as unknown as ShellExecution;
+    const records = new Map<string, RebuildRecord>();
+    const attached = attachIndexWrite(
+      {
+        host: {
+          timer: {
+            // oxlint-disable-next-line promise/prefer-await-to-callbacks -- 替身要实现宿主 timer 的回调签名
+            timeout: (callback: () => void): (() => void) => {
+              timerCallbacks.push(callback);
+              return () => {
+                void 0;
+              };
+            },
+          },
+        },
+        config: { indexTimeoutMs: 700 },
+        messages: () => MESSAGES.zh,
+        jobsOf: () => jobs,
+        records,
+      } as unknown as IndexWriteRoutes,
+      "/repo",
+      MESSAGES.zh,
+      { proc, command: REBUILD_COMMAND },
+    );
+    assert.ok("jobId" in attached, "这条作业应当登记成功");
+    assert.equal(timerCallbacks.length, 1, "起作业时挂上了超时定时器");
+    timerCallbacks[0]?.();
+    assert.deepEqual(killed, ["killed"], "注册表收不了就必须退回进程直接杀");
+    const timeoutNote = records.get(view.id)?.state.timeoutNote ?? "";
+    assert.notEqual(timeoutNote, null, "超时说明照旧记下");
+    // 亚分钟超时向上取整到 1 分钟：文案不能写成「超过 0 分钟」。
+    assert.match(timeoutNote, /1 分钟/u);
+  });
+
   it("卸载效应：每条独立收口，remove 抛错时只收自己那条进程，侧表仍旧清空", async () => {
     // 回归用例：`releaseRebuildRecords` 的逐条 try/catch。`jobs.remove` 在跑作业上会抛，
     // 若不接住，异常会穿过卸载效应、后面的记录一条都收不成，而侧表还钉着一批已死的记录。
     const killed: string[] = [];
     const removed: string[] = [];
-    const identity = { kind: "zvec-grep-rebuild", label: "zg index --rebuild", startedAt: 1 };
+    const identity = { kind: "zvec-grep-rebuild", label: REBUILD_COMMAND, startedAt: 1 };
     const recordId = "zvec-grep-rebuild-aaaaaaaaaaaaaaaa";
     const records = new Map<string, RebuildRecord>([
       [
@@ -204,7 +298,7 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
     });
     await delay(0);
     await fiber.dispose();
-    assert.deepEqual(removed, ["zvec-grep-rebuild-aaaaaaaaaaaaaaaa"]);
+    assert.deepEqual(removed, [recordId]);
     assert.deepEqual(killed, ["killed"], "收不走的作业必须由我们杀掉进程");
     assert.equal(records.size, 0, "一条收失败不能跳过 records.clear()");
   });
@@ -255,23 +349,33 @@ interface HostStubOptions {
 
 /** remote/服务表替身：get 按名字查表；$mount 可编程（mountResults 逐次取，越界取末枚）。 */
 function hostOf(opts: HostStubOptions = {}): { host: RemoteHost; mountCalls: number[] } {
+  const results = opts.mountResults;
+  // 空数组不是「一条结局都没配」的合法表达：Math.min(0, -1) 是 -1、[].at(-1) 是 undefined，
+  // 于是 $mount 交回 undefined，读取器把它当成「挂载成功」，用例越写越离谱反而越绿。
+  if (results?.length === 0) {
+    throw new Error(
+      "mountResults 不能是空数组：至少给一条结局（要表达成功就给 { mounted: true }）",
+    );
+  }
   const mountCalls: number[] = [];
   let mountIndex = 0;
   const mounter = {
     $mount: (): Promise<unknown> => {
       mountCalls.push(1);
-      const results = opts.mountResults;
       const outcome =
         results === undefined
           ? { mounted: true }
           : results.at(Math.min(mountIndex, results.length - 1));
       mountIndex += 1;
+      assert.ok(outcome !== undefined, "mountResults 用尽后仍应有可用结局");
       return outcome instanceof Error ? Promise.reject(outcome) : Promise.resolve(outcome);
     },
   };
+  // 用 in 判定而不是 ??：{ remote: null } 要表达的是「remote 明明在场但形状不对」，
+  // ?? 会把它悄悄换成一个可用的 mounter——那样就再也测不到「缺席/坏形状」这一支。
   const services = new Map<string, unknown>([
-    ["remote", opts.remote ?? mounter],
-    [SERVICE_KEY, opts.namespace ?? namespaceStub()],
+    ["remote", "remote" in opts ? opts.remote : mounter],
+    [SERVICE_KEY, "namespace" in opts ? opts.namespace : namespaceStub()],
   ]);
   return { mountCalls, host: { get: (name: string) => services.get(name) } };
 }
@@ -282,12 +386,14 @@ const MOUNT_FAILURE = new Error("gateway restarted");
 interface CodecFace {
   create: () => { parse: (value: unknown) => unknown };
 }
-function codecAt(descriptorIndex: number): CodecFace {
-  const parameters = REBUILD_DESCRIPTORS[descriptorIndex]?.parameters as readonly {
-    codec: CodecFace;
-  }[];
+function codecAt(method: string): CodecFace {
+  // 按 method 找而不是按数组下标：下标取法把「描述符的书写顺序」变成隐式契约，一旦调整顺序
+  // 或插入新方法，这里会静默换成别的方法的 codec，而 strict parser 用例仍然全绿。
+  const descriptor = REBUILD_DESCRIPTORS.find((entry) => entry.method === method);
+  assert.ok(descriptor !== undefined, `descriptor ${method} 应存在`);
+  const parameters = descriptor.parameters as readonly { codec: CodecFace }[];
   const codec = parameters[0]?.codec;
-  assert.ok(codec !== undefined, `descriptor ${descriptorIndex} 应带入参 codec`);
+  assert.ok(codec !== undefined, `descriptor ${method} 应带入参 codec`);
   return codec;
 }
 
@@ -330,6 +436,17 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
     await reader.roots();
     await reader.roots();
     assert.equal(mountCalls.length, 1);
+  });
+
+  it("挂载在途时并发轮询共享同一枚 promise：只挂一次", async () => {
+    // mounted ??= mount() 是在 await 之前赋值的，所以「还没落定的那一枚」就是共享点。
+    // 串行跑两遍测不到这件事：第二轮一定命中已落定的缓存，与并发共享走的是不同分支。
+    const { host, mountCalls } = hostOf();
+    const reader = createRebuildReader(host);
+    assert.ok(reader !== undefined);
+    const [first, second] = await Promise.all([reader.roots(), reader.roots()]);
+    assert.deepEqual(first, second);
+    assert.equal(mountCalls.length, 1, "两次并发轮询共用同一次挂载");
   });
 
   it("rebuild 成功交回宿主的应答，重复发起仍只挂一次", async () => {
@@ -392,15 +509,28 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
   });
 
   it("入参 codec 是 strict 的手写 parser：形状不合当场抛，从不跨网", () => {
-    const startCodec = codecAt(1);
-    const statusCodec = codecAt(2);
-    assert.deepEqual(startCodec.create().parse({ root: "/repo" }), { root: "/repo" });
+    const rebuildCodec = codecAt("rebuild");
+    const statusCodec = codecAt("status");
+    assert.deepEqual(rebuildCodec.create().parse({ root: "/repo" }), { root: "/repo" });
     assert.deepEqual(statusCodec.create().parse({ jobId: "job-1" }), { jobId: "job-1" });
     for (const bad of [null, 42, {}, { root: 7 }]) {
-      assert.throws(() => startCodec.create().parse(bad), /string root/u);
+      assert.throws(() => rebuildCodec.create().parse(bad), /string root/u);
     }
     for (const bad of [null, 42, {}, { jobId: 7 }]) {
       assert.throws(() => statusCodec.create().parse(bad), /string jobId/u);
     }
+  });
+
+  it("入参 codec 拒空串：空白 root / jobId 不跨网，也不换成一个无意义的轮询", () => {
+    const rebuildCodec = codecAt("rebuild");
+    const statusCodec = codecAt("status");
+    for (const bad of [{ root: "" }, { root: "   " }]) {
+      assert.throws(() => rebuildCodec.create().parse(bad), /non-empty root/u);
+    }
+    for (const bad of [{ jobId: "" }, { jobId: " " }]) {
+      assert.throws(() => statusCodec.create().parse(bad), /non-empty jobId/u);
+    }
+    // 合法值原样通过（root 会 trim，两侧空白不属于路径的一部分）。
+    assert.deepEqual(rebuildCodec.create().parse({ root: " /repo " }), { root: "/repo" });
   });
 });

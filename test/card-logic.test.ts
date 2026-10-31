@@ -1,23 +1,18 @@
 // lib/card-logic.ts 单测（DOM-free，host typecheck 可直接 import）：
 // cardStore 快照投影与 per-scope 缓存 / 草稿取值（touched 优先；读判据在
-// lib/card-draft.ts，用例逐条照旧）/ limit 校验 /
-// 重建轮询应答解析（completed 且 exit 0 才算成功）。
+// lib/card-draft.ts，用例逐条照旧）/ 重建轮询应答解析（completed 且 exit 0 才算成功）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import {
-  cardStore,
-  daemonNoteKey,
-  draftFields,
-  limitDraftOf,
-  parseRebuildPoll,
-  resolveLimitInput,
-} from "../lib/card-logic.ts";
+import { cardStore, daemonNoteKey, draftFields, parseRebuildPoll } from "../lib/card-logic.ts";
 import type { CardText, SettingScope } from "../lib/card-logic.ts";
 import { draftOf } from "../lib/card-draft.ts";
 import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import { fill } from "../lib/messages.ts";
 import { UI_MESSAGES } from "../src/ui-messages.ts";
 import type { ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-settings/client";
+
+/** 已提交快照里的端点值：三个用例共用同一份事实源。 */
+const COMMITTED_ENDPOINT = "https://committed.example";
 
 /**
  * 本条目那张表单的官方快照面：别名在测试这边按官方类型**自己抄一份**（同
@@ -46,7 +41,6 @@ const ZH_REBUILD_EXIT_UNKNOWN = "重建失败，且没有可读的进程退出�
  * 中文「limit 非法」提示的期望整句：`tZh` 从 UI_MESSAGES 渲染出来就是这一串，断言里
  * 独立抄一份——引字典键/字典文本等于让字典自己给自己作证。三个用例共用（abc / 3.5 / 1e99）。
  */
-const ZH_LIMIT_INVALID_HINT = "请输入 1-50 的整数";
 
 // ── SettingScope（= 官方 ConfigForm<Record<string, unknown>>）替身 ──────────
 // 契约形状本身即断言：五成员全必选（getSnapshot / subscribe / mutate / set / unset，
@@ -191,16 +185,16 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
     assert.equal(draftOf({}, {}, "missing"), undefined);
   });
 
-  it("只判自有属性：继承键（toString 等）不算 touched，落回已提交层", () => {
-    // `field in touched` 会沿原型链命中 Object.prototype 的成员，把函数/对象当草稿交出去。
+  it("只判自有属性：继承键（toString 等）不算 touched/已提交值", () => {
+    // `field in touched` 或裸下标会沿原型链命中 Object.prototype 的成员，把函数/对象当值交出去。
     assert.equal(draftOf({}, { toString: 5 }, "toString"), 5);
-    assert.equal(typeof draftOf({}, {}, "toString"), "function", "继承成员没有被当草稿拦下");
+    assert.equal(draftOf({}, {}, "toString"), undefined, "继承成员不得作为已提交值");
   });
 
   it("六个字段全部草稿优先（含 hfEndpoint 与 embedding）", () => {
     const committed = {
       defaultEmbedding: "local/committed",
-      hfEndpoint: "https://committed.example",
+      hfEndpoint: COMMITTED_ENDPOINT,
       enforceSearchFirst: false,
       defaultLimit: 5,
       grepBudgetPerSearch: 2,
@@ -226,7 +220,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
     assert.deepEqual(draftFields({}, committed), {
       embedding: "local/committed",
       limitDisplay: "5",
-      hfEndpoint: "https://committed.example",
+      hfEndpoint: COMMITTED_ENDPOINT,
       enforceSearchFirst: false,
       grepBudget: "2",
       unlockWindow: "30",
@@ -267,9 +261,25 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
       draftFields({ grepBudgetPerSearch: Number.POSITIVE_INFINITY }, {}).grepBudget,
       "3",
     );
-    // 缺 scheme / 别家协议的端点不是可显示 URL，回落空串（host 侧也不会拿它去拼命令）
-    assert.equal(draftFields({ hfEndpoint: "modelscope.cn/models" }, {}).hfEndpoint, "");
-    assert.equal(draftFields({ hfEndpoint: "ftp://mirror.example" }, {}).hfEndpoint, "");
+    // 已提交快照里的坏端点不是可显示 URL，回落空串（host 侧也不会拿它去拼命令）
+    assert.equal(draftFields({}, { hfEndpoint: "modelscope.cn/models" }).hfEndpoint, "");
+    assert.equal(draftFields({}, { hfEndpoint: "ftp://mirror.example" }).hfEndpoint, "");
+  });
+
+  it("端点草稿原样回显：逐字键入的中间态不被 URL 校验吞掉", () => {
+    // 草稿是「这一格此刻的文本」，不是待校验的值：输到一半的 URL 必须原样显示，
+    // 否则输入第一个字符就被过滤成空串，界面看起来像输入无效、实际是显示层在吞键。
+    assert.equal(draftFields({ hfEndpoint: "h" }, {}).hfEndpoint, "h");
+    assert.equal(draftFields({ hfEndpoint: "https://exa" }, {}).hfEndpoint, "https://exa");
+    // 删字符：已提交 URL 改到少一位的草稿，显示刚删完的那串，不是空串。
+    assert.equal(
+      draftFields({ hfEndpoint: "https://committed.exampl" }, { hfEndpoint: COMMITTED_ENDPOINT })
+        .hfEndpoint,
+      "https://committed.exampl",
+    );
+    // 清空（显式 undefined）与类型不对的草稿显示空串：与三个数值字段同一条清空语义。
+    assert.equal(draftFields({ hfEndpoint: undefined }, {}).hfEndpoint, "");
+    assert.equal(draftFields({ hfEndpoint: 42 }, {}).hfEndpoint, "");
   });
 
   it("defaultLimit 清空（草稿显式 undefined）显示空串，而非默认文案", () => {
@@ -299,74 +309,6 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
         "快照里的 undefined（没动过）不是清空",
       );
     }
-  });
-});
-
-describe("resolveLimitInput / limitDraftOf（limit 输入校验）", () => {
-  it("有效整数原样通过", () => {
-    assert.deepEqual(resolveLimitInput("7", tZh), { kind: "valid", value: 7 });
-    assert.deepEqual(resolveLimitInput("1", tZh), { kind: "valid", value: 1 });
-    assert.deepEqual(resolveLimitInput("50", tZh), { kind: "valid", value: 50 });
-  });
-
-  it("空串 → empty（调用方 unset 回 base 默认）", () => {
-    assert.deepEqual(resolveLimitInput("", tZh), { kind: "empty" });
-    assert.deepEqual(resolveLimitInput("   ", tZh), { kind: "empty" });
-  });
-
-  it("越界 → clamped 到 1-50 并带 hint", () => {
-    assert.deepEqual(resolveLimitInput("0", tZh), {
-      kind: "clamped",
-      value: 1,
-      hint: "已钳到 1-50 范围：1",
-    });
-    assert.deepEqual(resolveLimitInput("99", tZh), {
-      kind: "clamped",
-      value: 50,
-      hint: "已钳到 1-50 范围：50",
-    });
-  });
-
-  it("非整数/非法 → invalid 并带 hint，保留上次有效值", () => {
-    const result = resolveLimitInput("abc", tZh);
-    // assert.equal 的 TS 断言签名（asserts actual is T）已经把 result 收窄成 invalid 那一支，
-    // 原来跟在后面的 `if (result.kind !== "invalid") assert.fail(...)` 是同一件事的第二遍：
-    // 类型面上恒假 ⇒ typescript/no-unnecessary-condition。断言本身留在上面那条，不弱化。
-    assert.equal(result.kind, "invalid");
-    assert.ok(result.hint.includes("1-50"));
-    assert.deepEqual(resolveLimitInput("3.5", tZh), {
-      kind: "invalid",
-      hint: ZH_LIMIT_INVALID_HINT,
-    });
-    assert.deepEqual(resolveLimitInput("1e99", tZh), {
-      kind: "invalid",
-      hint: ZH_LIMIT_INVALID_HINT,
-    });
-  });
-
-  it("limitDraftOf：invalid 只回提示，empty 写 undefined，valid/clamped 写数值", () => {
-    assert.deepEqual(limitDraftOf("abc", tZh), {
-      draft: undefined,
-      error: ZH_LIMIT_INVALID_HINT,
-      hint: null,
-    });
-    assert.deepEqual(limitDraftOf("", tZh), { draft: undefined, error: null, hint: null });
-    assert.deepEqual(limitDraftOf("7", tZh), { draft: 7, error: null, hint: null });
-  });
-
-  it("clamped 的值照常写入草稿，提示走独立的 hint 位（不是 error）", () => {
-    // 越界已被钳制这件事不能静默（limitClamped 文案在生产路径上要真的显示出来），
-    // 但它不是失败：error 为 null 时调用方照常写草稿。
-    assert.deepEqual(limitDraftOf("99", tZh), {
-      draft: 50,
-      error: null,
-      hint: "已钳到 1-50 范围：50",
-    });
-    assert.deepEqual(limitDraftOf("0", tZh), {
-      draft: 1,
-      error: null,
-      hint: "已钳到 1-50 范围：1",
-    });
   });
 });
 
@@ -506,16 +448,7 @@ describe("保存动作走 set/unset 两条路（草稿模型）", () => {
 
 // ── i18n：卡片文本取自注入的 translator（切语言 = 换字典那份）───────────────
 describe("卡片逻辑文案双语", () => {
-  it("en translator 下 limit 提示与轮询终态都是英文", () => {
-    assert.deepEqual(resolveLimitInput("abc", tEn), {
-      kind: "invalid",
-      hint: "enter an integer between 1 and 50",
-    });
-    assert.deepEqual(resolveLimitInput("99", tEn), {
-      kind: "clamped",
-      value: 50,
-      hint: "clamped into the 1-50 range: 50",
-    });
+  it("en translator 下轮询终态都是英文", () => {
     assert.equal(parseRebuildPoll({ status: "running" }, tEn).output, "rebuilding…");
     assert.equal(parseRebuildPoll({ status: "stopping" }, tEn).output, "rebuilding…");
     assert.match(
@@ -534,9 +467,6 @@ describe("卡片逻辑文案双语", () => {
 
   it("英文那份整段不残留中文（同一渲染路径只换字典）", () => {
     const rendered = JSON.stringify([
-      resolveLimitInput("abc", tEn),
-      resolveLimitInput("0", tEn),
-      limitDraftOf("abc", tEn),
       parseRebuildPoll({ status: "running" }, tEn),
       parseRebuildPoll({ status: "stopping" }, tEn),
       parseRebuildPoll({ status: "failed", exitCode: null }, tEn),

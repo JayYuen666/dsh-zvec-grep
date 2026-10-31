@@ -24,13 +24,15 @@ jobs:
       # 发布只允许从默认分支派发：workflow_dispatch 能在任意分支/tag 上触发，而 publish 会把
       # 检出时刻的那棵树原样推到 registry——版本号一旦占用就撤不回，只能弃号再发新版。
       # 用「失败」而不是 job 级 `if:` 跳过：跳过在结论上是绿的，误点的人只会看到工作流"成功"。
+      # 比较完整 ref（`refs/heads/<分支>`）：`ref_name` 对同名 tag 也返回 `main`，挡不住
+      # dispatch 在 tag 上触发时把 tag 指向的树发出去。
       - name: 确认发布只发生在默认分支
         env:
-          TARGET_REF: ${{ github.ref_name }}
+          TARGET_REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          if [ "$TARGET_REF" != "$DEFAULT_BRANCH" ]; then
+          if [ "$TARGET_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
             echo "::error::发布只能从默认分支（$DEFAULT_BRANCH）派发，当前是 $TARGET_REF。要发版请先把改动合进默认分支再 dispatch。"
             exit 1
           fi
@@ -95,10 +97,25 @@ jobs:
           REGISTRY_ANOMALY=0
           PASS_TOKEN="$(printf '%s' "${TOKEN:-}" | tr -d '\r\n[:space:]')"
           if [ -n "$PASS_TOKEN" ]; then echo "::add-mask::$PASS_TOKEN"; fi
+          # 形态校验必须在这里再做一次：上一步的结论不跨步骤传递，而这一步会把 PASS_TOKEN
+          # 作为 Bearer 发出去——GitHub token 送到 npm 就是一次凭据泄露。
+          case "$PASS_TOKEN" in
+            "") : ;;
+            ghp_*|github_pat_*) echo "::warning::这是 GitHub token——npmjs 需要 npm 自己的 access token，本次不启用它，按 OIDC 发布"; PASS_TOKEN="";;
+            npm_*) : ;;
+            *) echo "::warning::token 前缀不是 npm_，请确认它确实是 npm 的 access token";;
+          esac
+          if [ -n "$PASS_TOKEN" ]; then
+            junk=$(printf %s "$PASS_TOKEN" | tr -d "A-Za-z0-9_-" | wc -c | tr -d " ")
+            if [ "$junk" != "0" ]; then
+              echo "::warning::凭据里混进了非 token 字符（引号、说明文字之类）——本次不启用它，按 OIDC 发布"
+              PASS_TOKEN=""
+            fi
+          fi
 
           if [ -n "$PASS_TOKEN" ]; then
             body="$(mktemp)"
-            code=$(curl -s -o "$body" -w "%{http_code}" -H "Authorization: Bearer $PASS_TOKEN" "https://registry.npmjs.org/-/whoami")
+            code=$(curl -s --max-time 20 --retry 3 --retry-connrefused -o "$body" -w "%{http_code}" -H "Authorization: Bearer $PASS_TOKEN" "https://registry.npmjs.org/-/whoami")
             case "$code" in
               200)
                 login=$(sed -n 's/.*"username"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$body")
@@ -188,7 +205,7 @@ jobs:
         with:
           name: dist-tarball
           path: /tmp/pkg
-      - name: 校验并解开 tarball
+      - name: 校验 tarball（发布对象就是它，不再二次打包）
         run: |
           set -euo pipefail
           # 只信任 build job 传来的那份字节：数目必须恰好一枚，多了少了都是意外。
@@ -198,11 +215,24 @@ jobs:
             exit 1
           fi
           tarball="$(find /tmp/pkg -name '*.tgz' -print -quit)"
-          rm -rf /tmp/stage
-          mkdir -p /tmp/stage
-          tar -xzf "$tarball" -C /tmp/stage
-          test -f /tmp/stage/package/package.json
-          echo "PKG_DIR=/tmp/stage/package" >> "$GITHUB_ENV"
+          tar -xzOf "$tarball" package/package.json > "$RUNNER_TEMP/packed.json"
+          name="$(node -p 'require(process.env.RUNNER_TEMP + "/packed.json").name')"
+          version="$(node -p 'require(process.env.RUNNER_TEMP + "/packed.json").version')"
+          echo "发布物：$name@$version"
+          # 读 tarball 自己的版本（发布 job 不检出仓库），先判 registry 上有没有同名版本：
+          # 已存在时 pnpm 也会拒，但这里的报错能点名是哪个版本，而不是一句冲突。
+          encoded="${name/\//%2f}"
+          state=$(curl -s --max-time 20 --retry 3 --retry-connrefused "https://registry.npmjs.org/$encoded" | node -e 'let s="";process.stdin.on("data",(d)=>{s+=d}).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(Object.keys(j.versions??{}).includes(process.argv[1])?"yes":"no")}catch{process.stdout.write("error")}})' "$version")
+          case "$state" in
+            yes) echo "::error::$name@$version 已在 registry 上——先改版本再发"; exit 1;;
+            no) : ;;
+            *) echo "::error::读 $name 的元数据失败（响应不是预期的 JSON）——先查 registry 状态"; exit 1;;
+          esac
+          {
+            echo "TARBALL=$tarball"
+            echo "PKG_NAME=$name"
+            echo "PKG_VERSION=$version"
+          } >> "$GITHUB_ENV"
       # 凭据优先级：OIDC 在前，这枚 NODE_AUTH_TOKEN 在后（pnpm 的 publish_options.rs 原话
       # "OIDC takes precedence over a configured static token"）。trusted publisher 配好时
       # 它根本不参与认证，交换失败才轮到它——留着是兜底，不是主路。
@@ -210,9 +240,8 @@ jobs:
       # 一个换行就变成「whoami 通过、publish 401」，两处必须是同一份清洗。
       # --provenance 取的是另一枚 id-token（audience 为 sigstore），与 npm 交换那枚互相独立，
       # 所以它不受 trusted publisher 是否已配影响；少了它，产物只剩 npm 自己的签名。
-      # --ignore-scripts：发布对象是 build job 已经打好、check 已经验过的那份字节，这里展开成
-      # 目录再发布——pnpm 对目录发布默认会跑 prepack 等生命周期脚本，而本 job 没有 node_modules，
-      # 跑了必炸；跳过它们同时意味着发布侧不执行任何仓库与依赖的代码（这正是拆 job 的意义）。
+      # --ignore-scripts：发布对象是 build job 已经打好、check 已经验过的那枚 tarball，
+      # 直接把它交给 pnpm（tarball 参数），发布侧不重打包、也不执行仓库或依赖的代码。
       # pnpm 12 的 publish 不接受 --publish-wait-timeout（CI 实测参数解析即退 2），
       # 因此这里不带它；发布后由 registry 逐步可见。
       # 若要改成 staged 发布（CI 只 stage、人工 approve）：发布命令换成 `pnpm stage publish`。
@@ -239,4 +268,16 @@ jobs:
           else
             echo "凭据：OIDC trusted publishing"
           fi
-          pnpm publish "$PKG_DIR" --ignore-scripts --no-git-checks --access public --provenance
+          pnpm publish "$TARBALL" --ignore-scripts --no-git-checks --access public --provenance
+          # 发布命令成功不等于 registry 已可读：轮询到同名版本出现为止（上限 5 分钟）。
+          encoded="${PKG_NAME/\//%2f}"
+          for attempt in $(seq 1 30); do
+            if curl -s --max-time 20 --retry 3 --retry-connrefused "https://registry.npmjs.org/$encoded" | node -e 'let s="";process.stdin.on("data",(d)=>{s+=d}).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(Object.keys(j.versions??{}).includes(process.argv[1])?"yes":"no")}catch{process.stdout.write("error")}})' "$PKG_VERSION" | grep -qx yes; then
+              echo "registry 已可见 $PKG_NAME@$PKG_VERSION"
+              exit 0
+            fi
+            echo "第 ${attempt} 次读取未命中，10 秒后重试"
+            sleep 10
+          done
+          echo "::error::发布命令成功，但 5 分钟内从 registry 读不到 $PKG_NAME@$PKG_VERSION——去 npmjs 面板核对，不要重发同一版本"
+          exit 1

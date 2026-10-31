@@ -65,7 +65,7 @@ import { UI_MESSAGES } from "./ui-messages.ts";
 import type { LocaleNs, Translate, UiMessages } from "./ui-messages.ts";
 import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 
-export { cardStore, draftFields, parseRebuildPoll, resolveLimitInput } from "../lib/card-logic.ts";
+export { cardStore, draftFields, parseRebuildPoll } from "../lib/card-logic.ts";
 
 const NS: LocaleNs = "zvec-grep";
 /**
@@ -164,7 +164,6 @@ interface CardDeps {
   saveError: string | null;
   setField: (field: string, draft: unknown) => void;
   setRoot: (root: string) => void;
-  setSaveError: (err: string | null) => void;
   onSave: () => void;
   onDiscard: () => void;
   onRebuild: () => void;
@@ -468,12 +467,19 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
   // 会同时在飞、按完成先后乱序 setRebuild——后回来的旧结果把 phase 覆写回 running，
   // 已经到终态的面板于是永远不会停。卸载后也要拒绝再写 state。
   const pollingRef = useRef(false);
+  // 当前轮询的作业代次：只有这一代 jobId 的应答能写面板。原实现 stopPolling 只清 interval，
+  // 既不取消在飞请求、也不认作业归属——上一轮的 status 迟到回来时：phase 仍是 running 就与
+  // 新一轮竞写（旧输出覆掉新进度）；phase 到了终态就 stopPolling，把**新一轮**的 interval
+  // 掐断，面板永久卡在 running。start() 先作废旧代次，pollStatus 回来再对一次。
+  const jobRef = useRef<string | null>(null);
   const mountedRef = useRef<boolean>(true);
   // 经函数读：直接写 `mountedRef.current` 时类型检查把它收窄成字面量 `true`（赋值发生在
   // 另一个闭包里，tsc 看不见），于是「已卸载」这一支会被判成永远为假。
   const isMounted = (): boolean => mountedRef.current;
 
   function stopPolling(): void {
+    // 代次一并作废：这一代在飞的那一发回来时会因 jobRef 不匹配而被丢弃。
+    jobRef.current = null;
     if (pollRef.current !== null) {
       clearInterval(pollRef.current);
       pollRef.current = null;
@@ -482,13 +488,15 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
 
   // 卸载时一定停轮询：卡片关闭后继续 setInterval 会一直打 status。
   // 挂载位同样在这里落回 false：已经在飞的那一发回来时不许再 setRebuild。
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // effect 重跑/StrictMode 双调用时，这一次挂载必须重新把标志置真；
+    // 只在 cleanup 里置假会让第二次挂载的轮询永久失效。
+    mountedRef.current = true;
+    return () => {
       mountedRef.current = false;
       stopPolling();
-    },
-    [],
-  );
+    };
+  }, []);
 
   /** 拉白名单 + 就绪态。失败**不**改重建面板：面板 idle 时冒一个红字只是噪音，
    *  用户真点「重建」时 start() 会把同一错误显示出来。 */
@@ -520,13 +528,15 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
   }, [refreshAccess]);
 
   async function pollStatus(jobId: string): Promise<void> {
-    if (pollingRef.current || !isMounted()) {
+    if (pollingRef.current || !isMounted() || jobRef.current !== jobId) {
       return;
     }
     pollingRef.current = true;
     try {
       const body = await requireReader(reader, t).status(jobId);
-      if (!isMounted()) {
+      // await 期间可能已经换了代（用户又点了一次重建）或卸载：这一发是旧作业的答案，
+      // 既不许写面板，也不许 stopPolling——那会掐断新一轮自己的 interval。
+      if (!isMounted() || jobRef.current !== jobId) {
         return;
       }
       const poll = parseRebuildPoll(body, t);
@@ -535,7 +545,7 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
       }
       setRebuild({ phase: poll.phase, output: poll.output });
     } catch (error) {
-      if (!isMounted()) {
+      if (!isMounted() || jobRef.current !== jobId) {
         return;
       }
       stopPolling();
@@ -553,6 +563,8 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
       throw new TypeError(t("rebuildMissingJobId"));
     }
     const { jobId } = parsedStarted.data;
+    // 登记代次之后才开表：两次 start 之间在飞的那一发会带着旧 jobId 回来，它对不上这一代。
+    jobRef.current = jobId;
     pollRef.current = setInterval(() => {
       void pollStatus(jobId);
     }, REBUILD_POLL_MS);
@@ -669,7 +681,6 @@ function ZgCard(props: CardSlotProps): ReactNode {
     saveError,
     setField,
     setRoot: rebuildView.setRoot,
-    setSaveError,
     onSave: () => {
       void save();
     },
