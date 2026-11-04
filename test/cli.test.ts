@@ -16,6 +16,8 @@ import {
   SYMBOL_TYPE_NAMES,
 } from "../lib/cli.ts";
 import type { BuiltCommand } from "../lib/cli.ts";
+// 默认 embedding 用 lib 侧那份常量：本地再抄一份字面量，改名时不会有任何门红。
+import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import {
   shq,
   MAX_COMMAND_BYTES,
@@ -173,8 +175,10 @@ describe("singleOrList", () => {
     assert.throws(() => singleOrList(`a${String.fromCodePoint(0)}b`, "globs", zhMessages), /NUL/u);
   });
 
-  it("非字符串也非数组仍报错", () => {
-    assert.throws(() => singleOrList(5, "globs", zhMessages), /必须是字符串数组/u);
+  it("非字符串也非数组：报「两种合法形态」而不是误导的『必须是字符串数组』", () => {
+    // 单值字符串本就是合法输入；非串非数组的坏值交给 stringList 只会说「必须是
+    // 字符串数组」，与「兼容上游单值形态」的契约自相矛盾。
+    assert.throws(() => singleOrList(5, "globs", zhMessages), /必须是字符串或字符串数组/u);
   });
 });
 
@@ -312,10 +316,18 @@ describe("buildSearchCommand", () => {
   });
 
   it("refresh=background 的两种「用不了」各有各的文案，第三种才把命令拼出来", () => {
-    // 守护进程缺席：出路是起一个。
+    // 守护进程缺席：出路是起一个。判据显式传，而不是靠 `backgroundSupport` 的缺省值——
+    // lib/cli.ts 那个形参默认就是 "daemon-down"，「不传」与「传 daemon-down」是同一条分支，
+    // 原来这里各写一条断言，第二条没有覆盖任何新东西（#117）。
     assert.throws(
       () =>
-        buildSearchCommand({ root: "/ws", query: "x", refresh: "background" }, zhMessages, "auto"),
+        buildSearchCommand(
+          { root: "/ws", query: "x", refresh: "background" },
+          zhMessages,
+          "auto",
+          false,
+          "daemon-down",
+        ),
       /zg server on/u,
     );
     // 部署钉死 direct：此时叫用户去起守护进程是指错方向，两句必须分得开。
@@ -364,12 +376,6 @@ describe("buildSearchCommand", () => {
       "available",
     );
     assert.ok(ok.command.includes("--refresh background"));
-    // 缺省（不传判据）按**不可用**收：拿不到事实时保守拒绝，而不是把假话发给模型。
-    assert.throws(
-      () =>
-        buildSearchCommand({ root: "/ws", query: "x", refresh: "background" }, zhMessages, "auto"),
-      /refresh=background/u,
-    );
     // wait / off 与守护进程无关，任何判据下都照常构造。
     for (const refresh of ["wait", "off"]) {
       const plain = buildSearchCommand({ root: "/ws", query: "x", refresh }, zhMessages);
@@ -451,13 +457,14 @@ describe("buildSearchCommand", () => {
   });
 
   it("路径过滤收单值后，其它类型错误仍照旧报错（不因兼容单值而放宽类型）", () => {
+    // 5 与 {a:1} 都不是字符串/数组/缺席：报「两种合法形态」（与 singleOrList 同一口径）。
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: "x", globs: 5 }, zhMessages),
-      /必须是字符串数组/u,
+      /必须是字符串或字符串数组/u,
     );
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: "x", globs: { a: 1 } }, zhMessages),
-      /必须是字符串数组/u,
+      /必须是字符串或字符串数组/u,
     );
     assert.throws(
       () =>
@@ -567,30 +574,27 @@ describe("穷举词法通道（buildSearchCommand 的 exhaustive 臂）", () => 
   });
 });
 
-/** 本包的默认 embedding（与 lib/embedding-catalog.ts 同值；多组用例都要它当基准）。 */
-const DEFAULT_EMBEDDING = "local/qwen3-embedding-0.6b";
 /** 远程 provider 引用：allowlist 必须拒它，除非部署显式开放。 */
 const REMOTE_REFERENCE = "qwen/text-embedding-v4";
 
 describe("buildIndexCommand", () => {
-  const DEFAULT = DEFAULT_EMBEDDING;
   // 默认密钥排除 glob 的命令行形态（由 lib/argv-guard.ts 单一来源派生，避免两处硬编码漂移）。
   // 旗标是 --iglob 而非 --glob：大小写不敏感、且排在用户 iglob 之后，理由见 lib/cli.ts 的 pushIndexGlobs。
   const SECRET_ARGS = SECRET_EXCLUDE_GLOBS.map((globStr) => `--iglob '${globStr}'`).join(" ");
 
   it("最小：root + 默认 embedding + 默认密钥排除", () => {
-    const { command, workdir } = buildIndexCommand({ root: "/ws" }, DEFAULT, zhMessages);
+    const { command, workdir } = buildIndexCommand({ root: "/ws" }, DEFAULT_EMBEDDING, zhMessages);
     assert.equal(workdir, "/ws");
     assert.equal(
       command,
-      `zg index '/ws' --embedding '${DEFAULT}' ${SECRET_ARGS} --device 'auto' --mode auto`,
+      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
     );
   });
 
   it("显式 embedding 覆盖默认", () => {
     const { command } = buildIndexCommand(
       { root: "/ws", embedding: "local/potion-code-16m-v2" },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
     );
     assert.equal(
@@ -602,17 +606,20 @@ describe("buildIndexCommand", () => {
   it("excludeSecrets=false 关闭密钥排除", () => {
     const { command } = buildIndexCommand(
       { root: "/ws", excludeSecrets: false },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
     );
-    assert.equal(command, `zg index '/ws' --embedding '${DEFAULT}' --device 'auto' --mode auto`);
+    assert.equal(
+      command,
+      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' --device 'auto' --mode auto`,
+    );
     assert.ok(!command.includes(".pem"));
   });
 
   it("密钥排除以 --iglob 发出：大小写不敏感，且必须排在用户 iglob 之后", () => {
     const { command } = buildIndexCommand(
       { root: "/ws", globs: ["src/**"], insensitiveGlobs: ["**", "DOC/**"] },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
     );
     // 引擎把全部 --glob 规则排在全部 --iglob 规则之前有序求值。密钥规则若走 --glob，
@@ -631,7 +638,7 @@ describe("buildIndexCommand", () => {
   it("ignoreFiles 透传为 --ignore-file 且转义", () => {
     const { command } = buildIndexCommand(
       { root: "/ws", ignoreFiles: ["/ws/.zgignore", "/a'b/.ign"] },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
     );
     assert.ok(command.includes(`--ignore-file '/ws/.zgignore'`));
@@ -655,18 +662,22 @@ describe("buildIndexCommand", () => {
         embeddingConcurrency: 4,
         device: "metal",
       },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
     );
     assert.equal(
       command,
-      `zg index '/ws' --embedding '${DEFAULT}' --rebuild --glob 'src/**' --iglob 'DOC/**' --type 'ts' --type-not 'md' ` +
+      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' --rebuild --glob 'src/**' --iglob 'DOC/**' --type 'ts' --type-not 'md' ` +
         `${SECRET_ARGS} --hidden --no-ignore --max-depth 2 --max-filesize 1048576 --follow --embedding-concurrency 4 --device 'metal' --mode auto`,
     );
   });
 
   it("drop 干净时只发 --drop --yes --mode（多余参数一个都不进命令）", () => {
-    const { command } = buildIndexCommand({ root: "/ws", drop: true }, DEFAULT, zhMessages);
+    const { command } = buildIndexCommand(
+      { root: "/ws", drop: true },
+      DEFAULT_EMBEDDING,
+      zhMessages,
+    );
     assert.equal(command, "zg index '/ws' --drop --yes --mode auto");
   });
 
@@ -677,7 +688,7 @@ describe("buildIndexCommand", () => {
     try {
       buildIndexCommand(
         { root: "/ws", drop: true, rebuild: true, embedding: "x", maxDepth: 2, hidden: true },
-        DEFAULT,
+        DEFAULT_EMBEDDING,
         zhMessages,
       );
       assert.fail("drop 携带索引侧参数必须被拒");
@@ -691,7 +702,7 @@ describe("buildIndexCommand", () => {
     // 显式 null 与缺省同样按「没给」处理，不算携带。
     const cleanDrop = buildIndexCommand(
       { root: "/ws", drop: true, globs: null, maxDepth: undefined },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
     );
     assert.ok(cleanDrop.command.includes("--drop"));
@@ -701,19 +712,24 @@ describe("buildIndexCommand", () => {
     // drop 那一臂只发 `--drop --yes`，任何别的旗标都会消失。resetPaths 若跟着消失，
     // 用户以为清了继承设置，其实那条 zg 只是把索引删了——必须响亮地拒。
     assert.throws(
-      () => buildIndexCommand({ root: "/ws", drop: true, resetPaths: true }, DEFAULT, zhMessages),
+      () =>
+        buildIndexCommand(
+          { root: "/ws", drop: true, resetPaths: true },
+          DEFAULT_EMBEDDING,
+          zhMessages,
+        ),
       /resetPaths/u,
     );
   });
 
   it("resetPaths=true 透传 --reset-paths，缺省不下发", () => {
-    const off = buildIndexCommand({ root: "/ws" }, DEFAULT, zhMessages);
+    const off = buildIndexCommand({ root: "/ws" }, DEFAULT_EMBEDDING, zhMessages);
     assert.ok(!off.command.includes("--reset-paths"), "缺省不得凭空带上这个旗标");
-    const on = buildIndexCommand({ root: "/ws", resetPaths: true }, DEFAULT, zhMessages);
+    const on = buildIndexCommand({ root: "/ws", resetPaths: true }, DEFAULT_EMBEDDING, zhMessages);
     // 位置固定在 embedding-concurrency 之后、--device 之前（测试锁死旗标顺序）。
     assert.equal(
       on.command,
-      `zg index '/ws' --embedding '${DEFAULT}' ${SECRET_ARGS} --reset-paths --device 'auto' --mode auto`,
+      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --reset-paths --device 'auto' --mode auto`,
     );
   });
 
@@ -722,7 +738,7 @@ describe("buildIndexCommand", () => {
     // applyRootPathOverrides。两段都在时表达「清干净再按这次的规则选」。
     const { command } = buildIndexCommand(
       { root: "/ws", resetPaths: true, globs: ["src/**"], fileTypes: ["ts"] },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
     );
     assert.ok(command.includes("--glob 'src/**'"));
@@ -732,24 +748,27 @@ describe("buildIndexCommand", () => {
 
   it("resetPaths 非布尔按类型错拒（true 之外的真值不算数）", () => {
     assert.throws(
-      () => buildIndexCommand({ root: "/ws", resetPaths: "true" }, DEFAULT, zhMessages),
+      () => buildIndexCommand({ root: "/ws", resetPaths: "true" }, DEFAULT_EMBEDDING, zhMessages),
       /resetPaths/u,
     );
   });
 });
 
 describe("embedding 构造期 allowlist", () => {
-  const DEFAULT = DEFAULT_EMBEDDING;
   const LOCAL = "local/potion-code-16m-v2";
 
   it("清单内的本地引用照旧透传", () => {
-    const { command } = buildIndexCommand({ root: "/ws", embedding: LOCAL }, DEFAULT, zhMessages);
+    const { command } = buildIndexCommand(
+      { root: "/ws", embedding: LOCAL },
+      DEFAULT_EMBEDDING,
+      zhMessages,
+    );
     assert.ok(command.includes(`--embedding '${LOCAL}'`));
   });
 
   it("缺省 embedding 走设置里的默认值，不受 allowlist 影响", () => {
-    const { command } = buildIndexCommand({ root: "/ws" }, DEFAULT, zhMessages);
-    assert.ok(command.includes(`--embedding '${DEFAULT}'`));
+    const { command } = buildIndexCommand({ root: "/ws" }, DEFAULT_EMBEDDING, zhMessages);
+    assert.ok(command.includes(`--embedding '${DEFAULT_EMBEDDING}'`));
   });
 
   it("三类非法引用在构造期就被拒：远程 provider / 不存在的本地模型 / 任意前缀 URL", () => {
@@ -760,7 +779,8 @@ describe("embedding 构造期 allowlist", () => {
       "not-a-provider/model",
     ]) {
       assert.throws(
-        () => buildIndexCommand({ root: "/ws", embedding: reference }, DEFAULT, zhMessages),
+        () =>
+          buildIndexCommand({ root: "/ws", embedding: reference }, DEFAULT_EMBEDDING, zhMessages),
         (error: unknown) => {
           const text = error instanceof Error ? error.message : String(error);
           assert.match(text, /allowRemoteEmbedding/u, "文案要指向部署开关");
@@ -776,7 +796,7 @@ describe("embedding 构造期 allowlist", () => {
     for (const reference of [REMOTE_REFERENCE, "evil/http://attacker/x"]) {
       const { command } = buildIndexCommand(
         { root: "/ws", embedding: reference },
-        DEFAULT,
+        DEFAULT_EMBEDDING,
         zhMessages,
         "auto",
         true,
@@ -799,7 +819,7 @@ describe("embedding 构造期 allowlist", () => {
       // 多余的键走宿主真实的展开形态（`{ ...args, root }`）：IndexArgs 的多余属性在
       // TS 里是「展开时忽略」，不是报错，所以这里传得进去、也测得到它们被忽略。
       { root: "/ws", embedding: REMOTE_REFERENCE, ...EXTRA_REMOTE_KEYS },
-      DEFAULT,
+      DEFAULT_EMBEDDING,
       zhMessages,
       "auto",
       true,
@@ -813,25 +833,25 @@ describe("embedding 构造期 allowlist", () => {
 });
 
 describe("buildIndexCommand 入参类型错拒（续 buildIndexCommand 组）", () => {
-  const DEFAULT = DEFAULT_EMBEDDING;
-
   it("maxDepth 负值报错", () => {
     assert.throws(
-      () => buildIndexCommand({ root: "/ws", maxDepth: -1 }, DEFAULT, zhMessages),
+      () => buildIndexCommand({ root: "/ws", maxDepth: -1 }, DEFAULT_EMBEDDING, zhMessages),
       /maxDepth/u,
     );
   });
 
   it("embeddingConcurrency 为 0 报错", () => {
     assert.throws(
-      () => buildIndexCommand({ root: "/ws", embeddingConcurrency: 0 }, DEFAULT, zhMessages),
+      () =>
+        buildIndexCommand({ root: "/ws", embeddingConcurrency: 0 }, DEFAULT_EMBEDDING, zhMessages),
       /embeddingConcurrency/u,
     );
   });
 
   it("embedding 含 NUL 报错", () => {
     assert.throws(
-      () => buildIndexCommand({ root: "/ws", embedding: "a\u0000b" }, DEFAULT, zhMessages),
+      () =>
+        buildIndexCommand({ root: "/ws", embedding: "a\u0000b" }, DEFAULT_EMBEDDING, zhMessages),
       /NUL/u,
     );
   });
@@ -920,8 +940,13 @@ describe("传输模式（缺省自动，三条命令同源）", () => {
   it("检索 / 索引 / 状态三条命令透传同一个模式", () => {
     for (const mode of ["auto", "direct", "server"] as const) {
       const search = buildSearchCommand({ root: "/ws", query: "q" }, zhMessages, mode);
-      const index = buildIndexCommand({ root: "/ws" }, "local/x", zhMessages, mode);
-      const drop = buildIndexCommand({ root: "/ws", drop: true }, "local/x", zhMessages, mode);
+      const index = buildIndexCommand({ root: "/ws" }, DEFAULT_EMBEDDING, zhMessages, mode);
+      const drop = buildIndexCommand(
+        { root: "/ws", drop: true },
+        DEFAULT_EMBEDDING,
+        zhMessages,
+        mode,
+      );
       const status = buildStatusCommand({ root: "/ws" }, zhMessages, mode);
       for (const command of [search.command, index.command, drop.command, status.command]) {
         assert.ok(command.endsWith(`--mode ${mode}`), `模式未透传到命令：${command}`);
@@ -1025,11 +1050,7 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
     // UTF-8 字节 = 3 × 36000 ≈ 108KB，已越过 Linux MAX_ARG_STRLEN≈128KB 的方向。
     // 闸门若按码元数比，这条命令会被静默放行并在 execve 上 E2BIG。
     const routes = Array.from({ length: 12 }, () => "中".repeat(3000));
-    const command = routes;
-    assert.ok(
-      command.join("").length < MAX_COMMAND_BYTES,
-      "前置条件：码元数确实在旧口径的闸门之下",
-    );
+    assert.ok(routes.join("").length < MAX_COMMAND_BYTES, "前置条件：码元数确实在旧口径的闸门之下");
     assert.throws(
       () => buildSearchCommand({ root: "/ws", queries: routes }, zhMessages),
       /字节上限/u,

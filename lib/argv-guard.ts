@@ -125,6 +125,12 @@ export function singleOrList(
   maxItems: number = MAX_FILTER_ITEMS,
   maxChars: number = MAX_FILTER_CHARS,
 ): string[] {
+  // 缺席（undefined/null）仍交 stringList 回空数组——那是「字段没给」的合法形状。
+  // 其余既非字符串也非数组的坏值单独报「两种合法形态」：交给 stringList 会说成
+  // 「必须是字符串数组」，而单值形态本就是本入口的合法输入，那条文案会误导。
+  if (value !== undefined && value !== null && typeof value !== "string" && !Array.isArray(value)) {
+    throw new TypeError(fill(messages.mustBeStringOrArray, { name }));
+  }
   return stringList(
     typeof value === "string" ? [value] : value,
     name,

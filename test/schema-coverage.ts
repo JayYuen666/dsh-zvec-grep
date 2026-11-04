@@ -29,6 +29,7 @@
 
 import { it } from "vitest";
 import assert from "node:assert/strict";
+import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,12 +58,69 @@ function commentEndAfter(text: string, index: number): number {
 
 const isQuoteChar = (char: string): boolean => char === '"' || char === "'" || char === "`";
 
+/** 表达式起点的那几枚前字符：它们后面不可能接除法，只可能是正则字面量的开头。
+ *  行首（前面没有非空白字符）也算——那是语句起点。 */
+const REGEX_BEFORE = "([{,;:=!&|?+-*%~^<>";
+
+/** 正则正文里收尾那枚 `/` 的下标：字符类内的 `/` 不算闭合（`/[/*]/` 正是被旧写法读成
+ *  块注释的那一类写法），反斜杠连后面一枚一起跳过；跨行即判不是正则（本仓源码里没有多行
+ *  正则字面量），交回 -1。 */
+function regexCloseAt(text: string, start: number): number {
+  let inClass = false;
+  let cursor = start;
+  while (cursor < text.length) {
+    const char = text.charAt(cursor);
+    if (char === "\n" || char === "\r") {
+      return -1;
+    }
+    if (char === "\\") {
+      cursor += 2;
+    } else {
+      if (char === "[") {
+        inClass = true;
+      } else if (char === "]") {
+        inClass = false;
+      } else if (char === "/" && !inClass) {
+        return cursor;
+      }
+      cursor += 1;
+    }
+  }
+  return -1;
+}
+
+/** `index` 处若是正则字面量的开头，交回它之后的下标（含 flags）；不是正则时 -1。 */
+function regexEndAfter(text: string, index: number): number {
+  const close = regexCloseAt(text, index + 1);
+  if (close === -1) {
+    return -1;
+  }
+  let cursor = close + 1;
+  while (/[a-z]/u.test(text.charAt(cursor))) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+/** 前一枚非空白字符是否落在表达式起点（注释与正则的歧义就此判开）。 */
+function startsRegexAt(text: string, index: number): boolean {
+  let cursor = index - 1;
+  while (cursor >= 0 && /\s/u.test(text.charAt(cursor))) {
+    cursor -= 1;
+  }
+  return cursor < 0 || REGEX_BEFORE.includes(text.charAt(cursor));
+}
+
 /**
- * `index` 处若是字符串/注释的开头（或正处在字符串内部），交回它的跨度；否则交回 `null`。
+ * `index` 处若是字符串/注释/正则字面量的开头（或正处在字符串内部），交回它的跨度；否则 `null`。
  *
  * 三处文本扫描（取字段名、配括号、剥注释）都要认同一套字面量边界，抄三份就会三处不同步，
- * 所以只在这里定义一次。转义只认反斜杠（模板串里的 `${}` 不需要特判：里面出现的括号属于
- * 表达式，本来该参与配对）。
+ * 所以只在这里定义一次。转义只认反斜杠。
+ *
+ * ⚠ 模板串按**整段**跳过：`${}` 里的括号与嵌套反引号都不参与配对，也不另作处理。
+ * 于是 `` `a${`x`}z` `` 这类写法会把内层反引号当成外层串的闭合，后续扫描的引号状态随之错位。
+ * 这里不补插值跟踪：客户端源码里没有这种嵌套写法，而补了就没人再测它——真出现时表现是
+ * 字段解析不出、由 `unresolved` 报成问题项，不是静默少认。
  */
 function literalAt(text: string, index: number, quote: string): LiteralSpan | null {
   const char = text.charAt(index);
@@ -73,6 +131,11 @@ function literalAt(text: string, index: number, quote: string): LiteralSpan | nu
     span = { end, quote: nextQuote, kind: "string" };
   } else if (char === "/" && (text.charAt(index + 1) === "/" || text.charAt(index + 1) === "*")) {
     span = { end: commentEndAfter(text, index), quote: "", kind: "comment" };
+  } else if (char === "/" && startsRegexAt(text, index)) {
+    const end = regexEndAfter(text, index);
+    // 判不成正则（未闭合、跨行）时交回 null 而不是硬算一段：让调用方把这枚 `/` 当普通字符，
+    // 与改动前的行为一致，不会凭空吞掉一段代码。
+    span = end === -1 ? null : { end, quote: "", kind: "string" };
   } else if (isQuoteChar(char)) {
     span = { end: index + 1, quote: char, kind: "string" };
   }
@@ -187,24 +250,60 @@ function sliceInside(text: string, open: number, openChar: string, closeChar: st
 const bracesAt = (text: string, open: number): string => sliceInside(text, open, "{", "}");
 const parensAt = (text: string, open: number): string => sliceInside(text, open, "(", ")");
 
-/** `Schema.object(` 的实参 → 字段名；字面量直取顶层键，标识符回溯到同名 const 字面量。 */
-function fieldsOfSchemaArgument(hostTs: string, argument: string): string[] {
+/** 标识符 → 正则源串里的安全写法（`$schema` 这类名字里的 `$` 不转义就是行尾锚点）。 */
+function escapeForRegExp(literal: string): string {
+  return literal.replaceAll(/[$()*+.?[\\\]^{|}]/gu, String.raw`\$&`);
+}
+
+/** 从 `from` 起第一处「赋值到一个对象字面量」的左花括号下标；找不到 -1。
+ *  跳类型注解用这一条而不是 `[^=]+`：`Fields<T = string> = {` 里注解段自带一个 `=`，
+ *  按「注解不含等号」匹配的写法会整条失配，回溯就此失败。 */
+function assignedBraceAt(text: string, from: number): number {
+  const assign = /[ \t\r\n]*=[ \t\r\n]*\{/u.exec(text.slice(from));
+  return assign === null ? -1 : from + assign.index + assign[0].length - 1;
+}
+
+/**
+ * `Schema.object(` 的实参 → 字段名；字面量直取顶层键，标识符回溯到同名 const 字面量。
+ *
+ * @param hostTs 剥过注释的 host 全文
+ * @param argument `Schema.object(...)` 的实参文本
+ * @param markerStart 本处 `Schema.object` 在 hostTs 里的下标；同名 const 出现多处时
+ *        取**它之前最近**的那一条声明（取全文第一处会回溯到别的作用域的对象上，
+ *        字段集悄悄变错而不报 unresolved）。
+ */
+function fieldsOfSchemaArgument(hostTs: string, argument: string, markerStart: number): string[] {
   const trimmed = argument.trim();
   if (trimmed.startsWith("{")) {
-    return literalTopLevelKeys(trimmed.slice(1, -1));
+    // 按配对花括号取正文，不按「首字符是 { 就砍掉最后一字符」处理：尾巴不是 `}` 时
+    // （`as const`、`satisfies Foo`、`as { tailOnly: number }`）砍掉的是尾巴自己的末字符，
+    // 块内那个 `}` 留在正文里把深度压成负数，随后类型标注里的键就落在 depth 0 上被当成设置字段。
+    return literalTopLevelKeys(bracesAt(trimmed, 0));
   }
   const identifier = /^(?<name>[A-Za-z_$][\w$]*)$/u.exec(trimmed)?.groups?.["name"] ?? "";
   if (identifier === "") {
     return [];
   }
   const declaration = new RegExp(
-    `(?:const|let|var)\\s+${identifier}\\s*(?::[^=]+)?=\\s*\\{`,
-    "u",
-  ).exec(hostTs);
-  if (declaration === null) {
+    `(?:const|let|var)[ \\t\\r\\n]+${escapeForRegExp(identifier)}[ \\t\\r\\n]*[;:=\\]})\\[]`,
+    "gu",
+  );
+  let open = -1;
+  // 正序遍历全文所有同名声明，留下位置在 marker 之前、且能走到对象字面量的最后一条：
+  // 同名出现两次时这才是本处实参看到的那个绑定（倒着取要复制一份再翻，正序覆盖同样结果）。
+  for (const found of hostTs.matchAll(declaration)) {
+    if (found.index >= markerStart) {
+      break;
+    }
+    const candidate = assignedBraceAt(hostTs, found.index + found[0].length - 1);
+    if (candidate !== -1) {
+      open = candidate;
+    }
+  }
+  if (open === -1) {
     return [];
   }
-  return literalTopLevelKeys(bracesAt(hostTs, declaration.index + declaration[0].length - 1));
+  return literalTopLevelKeys(bracesAt(hostTs, open));
 }
 
 /**
@@ -214,7 +313,7 @@ function fieldsOfSchemaArgument(hostTs: string, argument: string): string[] {
  * 会被当成块起点、被注释掉的旧代码里的 `field: 'x'` 会算成"已绑定"，一个虚构漏项、一个假绿。
  * 字符串不剥：字段名本身就写在字符串里（`set("importAllowRoots")`），抹了等于一个都认不出。
  */
-function stripComments(src: string): string {
+export function stripComments(src: string): string {
   let out = "";
   let quote = "";
   for (let index = 0; index < src.length; index += 1) {
@@ -230,25 +329,69 @@ function stripComments(src: string): string {
   return out;
 }
 
+/** 字符串内容占据的下标区间（不含两侧引号）。注释已被 stripComments 抹掉，这里只剩串。 */
+export function stringSpans(text: string): (readonly [number, number])[] {
+  const spans: (readonly [number, number])[] = [];
+  let quote = "";
+  let start = -1;
+  for (let index = 0; index < text.length; index += 1) {
+    const span = literalAt(text, index, quote);
+    if (span !== null) {
+      if (quote === "" && span.quote !== "" && span.kind === "string") {
+        start = index + 1;
+      } else if (quote !== "" && span.quote === "" && span.kind === "string") {
+        spans.push([start, index]);
+        start = -1;
+      }
+      ({ quote } = span);
+      index = span.end - 1;
+    }
+  }
+  if (start !== -1) {
+    // 串没闭合（剥注释后理论上不该出现）：把剩余一段也算进去，宁可少认一处 marker，
+    // 也不把串内容当成代码去解析。
+    spans.push([start, text.length]);
+  }
+  return spans;
+}
+
 /**
  * 从 host.ts 抽取**全部** `Schema.object(...)` 块内的字段名（并集）。
  * 解析不了的块不静默跳过，由调用方把块首原文报成问题项。
+ *
+ * ⚠ marker 只在**字符串之外**算数：这里扫的是剥注释、保留字符串的文本，所以
+ * `文案: "对 Schema.object( 的说明"` 里那一处会被当成块起点，随后取到的实参是一段无关文本，
+ * 结果是一条指向 host.ts 的假红（合法代码硬失败）。反向一侧同样坏：把无关对象里的键当成
+ * host 字段，门禁就要求一张并不存在的控件。
  */
-function hostSchemaFields(source: string): { fields: string[]; unresolved: string[] } {
+export function hostSchemaFields(source: string): { fields: string[]; unresolved: string[] } {
   const hostTs = stripComments(source);
   const marker = "Schema.object(";
+  const spans = stringSpans(hostTs);
+  const insideString = (at: number): boolean => spans.some(([from, to]) => at >= from && at < to);
+  /** 从 `from` 起第一处落在字符串之外的 marker；没有则 -1。
+   *  串里那一处不算，但也不能就此停止扫描：从它的下一枚字符继续，别把同一处再读一遍。 */
+  const nextMarker = (from: number): number => {
+    let cursor = from;
+    for (;;) {
+      const at = hostTs.indexOf(marker, cursor);
+      if (at === -1) {
+        return -1;
+      }
+      if (!insideString(at)) {
+        return at;
+      }
+      cursor = at + 1;
+    }
+  };
   const fields = new Set<string>();
   const unresolved: string[] = [];
-  let from = 0;
-  for (;;) {
-    const start = hostTs.indexOf(marker, from);
-    if (start === -1) {
-      break;
-    }
-    from = start + marker.length;
-    const open = hostTs.indexOf("(", start);
-    const argument = open === -1 ? "" : parensAt(hostTs, open);
-    const parsed = argument === "" ? [] : fieldsOfSchemaArgument(hostTs, argument);
+  let start = nextMarker(0);
+  while (start !== -1) {
+    // marker 自带左括号，所以实参的起点就是它，不必再 indexOf 找"最近的一个左括号"。
+    const open = start + marker.length - 1;
+    const argument = parensAt(hostTs, open);
+    const parsed = argument === "" ? [] : fieldsOfSchemaArgument(hostTs, argument, start);
     if (parsed.length === 0) {
       unresolved.push(
         argument === "" ? `${marker}… 的括号没有配对` : `${marker}${argument.trim().slice(0, 40)})`,
@@ -257,6 +400,7 @@ function hostSchemaFields(source: string): { fields: string[]; unresolved: strin
     for (const field of parsed) {
       fields.add(field);
     }
+    start = nextMarker(start + marker.length);
   }
   return { fields: [...fields], unresolved };
 }
@@ -267,7 +411,7 @@ function group(match: RegExpExecArray, index: number): string {
 }
 
 /** 扫描一个 client 源文件，收集作为「设置写入第一参」出现的字段名字面量。 */
-function boundFieldsIn(source: string): Set<string> {
+export function boundFieldsIn(source: string): Set<string> {
   const src = stripComments(source);
   const out = new Set<string>();
   // 输入行组件的 field prop：field: 'x'
@@ -291,13 +435,22 @@ const CLIENT_SOURCE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs"] as const
 /** 测试文件的形状：里面的 set('x') / field: 'x' 是断言不是绑定。 */
 const TEST_FILE_SHAPE = /(?:^|[/.])(?:test|spec)\.[jt]sx?$|__tests__/u;
 
+/** 测试面的目录名：那里的 `set('x')` 是断言而不是绑定，算进来等于给这些字段一张免检证。
+ *  只按**目录名**排除文件名盖不住的那一批 —— 目录叫 `test` 时 `TEST_FILE_SHAPE` 匹配不上
+ *  （那条正则认的是 `test.ts` / `__tests__/` 这类文件形状），整棵子树照旧被递归。 */
+const SKIP_DIR_NAMES = new Set(["node_modules", "test", "tests", "spec", "specs", "__tests__"]);
+
 /**
- * 递归收集目录下所有卡片源文件文本。跳过 node_modules、test 形状与软链（不跟随——
+ * 递归收集目录下所有卡片源文件文本。跳过 {@link SKIP_DIR_NAMES} 与软链（不跟随——
  * 目录自指的软链会让递归不收敛）；readdir 带 withFileTypes 一次拿到类型，不做会跟链的 stat。
- * 读不动的条目跳过：调用方的契约是「交回绑定集」，门禁自己不抛。
+ *
+ * 两处读失败的待遇不同，各自有理由：文件读不动跳过（枚举出来的文件偶发不可读不该让整个
+ * 门禁炸掉，交回「交回绑定集」这个契约）；**目录列不出**只有 ENOENT（该树不存在）安静返回空，
+ * 其它错误（权限、EMFILE）一律上抛 —— 静默缩小扫描面会把未绑定判成已绑定，正是本门禁
+ * 最忌讳的失效方向，宁可红在收集期。
  */
-async function walk(dir: string): Promise<string[]> {
-  let entries;
+export async function walk(dir: string): Promise<string[]> {
+  let entries: Dirent[];
   try {
     entries = await readdir(dir, { withFileTypes: true });
   } catch (error) {
@@ -310,8 +463,7 @@ async function walk(dir: string): Promise<string[]> {
     entries
       .filter(
         (entry) =>
-          entry.name !== "node_modules" &&
-          entry.name !== "__tests__" &&
+          !SKIP_DIR_NAMES.has(entry.name) &&
           !entry.isSymbolicLink() &&
           !TEST_FILE_SHAPE.test(entry.name),
       )

@@ -97,6 +97,7 @@ function asLockBusy(failure: ConcurrentZgFailure | null): LockBusyFailure {
 describe("并发类失败识别", () => {
   it("锁忙且占锁方是重建：可排队等待", () => {
     const failure = asLockBusy(classifyConcurrentFailure(LOCK_BUSY_REBUILD));
+    assert.equal(failure.ownerOperation, "index.rebuild", "明细里确实读到了这一枚操作名");
     assert.equal(failure.rebuild, true);
     assert.equal(failure.ownerPid, "14962");
     assert.equal(failure.lockPath, "/private/tmp/zgconc/.zvec-grep/locks/home.write");
@@ -118,6 +119,19 @@ describe("并发类失败识别", () => {
   it("守护进程租约", () => {
     const failure = asDaemonLease(classifyConcurrentFailure(DAEMON_LEASE));
     assert.equal(failure.pid, "17135");
+  });
+
+  it("租约缺明细块或明细里没有 pid 键：仍判成租约，pid 交回 undefined", () => {
+    // 上游省略明细不是「换个错误码」：判据把 kind 认对，等锁策略才不会跟着走偏。
+    const leaseCodeLine = `Code: ${DAEMON_LEASE_CODE}`;
+    const noDetails = [TITLE, leaseCodeLine].join("\n");
+    const emptyDetails = [TITLE, leaseCodeLine, DETAILS, "  root: /tmp/zgsrv2"].join("\n");
+    assert.equal(asDaemonLease(classifyConcurrentFailure(noDetails)).pid, undefined, noDetails);
+    assert.equal(
+      asDaemonLease(classifyConcurrentFailure(emptyDetails)).pid,
+      undefined,
+      emptyDetails,
+    );
   });
 
   it("其它错误码一律不归并发类", () => {
@@ -169,11 +183,18 @@ describe("并发类失败识别", () => {
       DETAILS,
       `  lock: ${INDEX_LOCK_PATH}`,
       "",
+      // 空行不中断明细块：这一枚缩进键该收到（只把「遇空行即停」写成实现的两种坏形状之一）。
+      "  ownerPid: 777",
       "Error: another failure",
       "Code: SOMETHING.ELSE",
+      // 判定相关的两枚键：缩进一旦被放宽就会被收进明细表，而它们直接改变等待策略。
+      "ownerOperation: index",
+      "ownerPid: 999",
     ].join("\n");
     const failure = asLockBusy(classifyConcurrentFailure(twoBlocks));
     assert.equal(failure.lockPath, INDEX_LOCK_PATH);
+    assert.equal(failure.ownerPid, "777", "空行之后的缩进键仍算明细");
+    assert.equal(failure.ownerOperation, undefined, "零缩进的第二个错误块不得进明细表");
     assert.equal(zgErrorCode(twoBlocks), LOCK_BUSY_CODE, "错误码仍取第一处");
   });
 

@@ -173,9 +173,8 @@ const isRebuildNamespace = (value: unknown): value is RebuildNamespace =>
  * 三个方法同构，收成一个入口——同一份判据，不抄三份。
  */
 async function unwrapWire<Value>(
-  call: Promise<
-    { ok: false; error: { code: string; message: string } } | { ok: true; value: Value }
-  >,
+  // RemoteResult 本身就是本文件已 import 的类型：内联重写一份会在协议演进时漏改。
+  call: Promise<RemoteResult<Value>>,
 ): Promise<Value> {
   const result = await call;
   // 两个分支都写成真实语句（if-return / throw）：裸 if-throw 的隐式空 else 在 v8 的块覆盖

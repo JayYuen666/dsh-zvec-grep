@@ -77,34 +77,53 @@ function digestOf(text: string): string {
 }
 
 /**
- * 取包名：正则从 package.json 抠，不为此把整张依赖表拉进类型面（同 client 侧夹具的取法）。
+ * 取包名：JSON.parse 后读顶层 `name`（与 client 侧夹具同一读法）。
+ * 正则抠第一处 `"name":` 会命中嵌套对象里的同名键（`bin` / `contributes` 排在顶层之前时就取错），
+ * 而静默回退 `unknown` 会让用例名变成 `unknown: …` 却照样绿 —— manifest 坏了没人知道。
  * @param pkgDir - 包根绝对路径
- * @returns package.json 的 name，抠不到时为 unknown
+ * @returns package.json 的 name；缺失或不是非空字符串时抛错点名目录
  */
 function packageNameOf(pkgDir: string): string {
-  return (
-    /"name":\s*"(?<pkgName>[^"]+)"/u.exec(readText(path.resolve(pkgDir, "package.json")))?.groups?.[
-      "pkgName"
-    ] ?? "unknown"
-  );
+  const manifest = JSON.parse(readText(path.resolve(pkgDir, "package.json"))) as { name?: unknown };
+  const { name } = manifest;
+  if (typeof name !== "string" || name === "") {
+    throw new Error(`[${pkgDir}] package.json 的 name 缺失或不是字符串，新鲜度门禁无从标身份`);
+  }
+  return name;
 }
 
 /**
  * 多产物形态：把清单折成按路径排序的「相对路径 + 正文摘要」文本，两侧共用同一排序。
+ *
+ * ⚠ 键必须是**落盘绝对路径**：相对键会按 runner 的 cwd 解析，`path.relative` 于是产出
+ * `../xx` 这种越出包根的路径、`readText` 则多半读不到东西，两侧差异看着像"产物过期"，
+ * 实际是清单口径错了 —— 误报红且 diff 里看不出病因，所以这里先判形状再折。
+ * ⚠ 只比对本轮声明的产物：磁盘上多出来的陈旧产物（构建已不再产出、旧文件还躺着）不进这张表，
+ * 因此这一道门不检测残留。要覆盖残留得从产物根目录枚举实际文件再对照，本仓没有那个需求。
+ * ⚠ 清单文本按 POSIX 分隔符写：`path.relative` 在 win32 上交回 `dist\a.js`，而两侧都走同一
+ * 归一化才不会把「平台分隔符」误报成「产物过期」；排序也落在归一化后的行上，跨平台同字。
  * @param pkgDir - 包根绝对路径（相对化是为了清单不绑定装机位置）
+ * @param pkgName - 包名，只用于报错时标身份
  * @param files - 构建函数交回的「落盘绝对路径 → 正文」
  * @param fromDisk - true 时逐个读盘算摘要（缺文件即摘要不同，行里已点名是哪个产物）
  * @returns 可直接与另一侧逐字节相等的清单文本
  */
-function manifestOf(pkgDir: string, files: Map<string, string>, fromDisk: boolean): string {
+function manifestOf(
+  pkgDir: string,
+  pkgName: string,
+  files: Map<string, string>,
+  fromDisk: boolean,
+): string {
   const rows: string[] = [];
-  for (const [file, code] of [...files.entries()].toSorted(([left], [right]) =>
-    left.localeCompare(right),
-  )) {
+  for (const [file, code] of files.entries()) {
+    if (!path.isAbsolute(file)) {
+      throw new TypeError(`[${pkgName}] 产物清单的键不是绝对路径：${file}`);
+    }
     const identity = fromDisk ? digestOf(readText(file)) : digestOf(code);
-    rows.push(`${path.relative(pkgDir, file)}\t${identity}`);
+    const relative = path.relative(pkgDir, file).split(path.sep).join("/");
+    rows.push(`${relative}\t${identity}`);
   }
-  return `${rows.join("\n")}\n`;
+  return `${rows.toSorted((left, right) => left.localeCompare(right)).join("\n")}\n`;
 }
 
 /**
@@ -123,23 +142,52 @@ export async function hostFreshnessEvidence(
   const artifact = options.artifact ?? DEFAULT_ARTIFACT;
   const pkgName = packageNameOf(pkgDir);
   // 动态导入 .mjs 对 TS 为 any，先收窄到调用面再 await（避免 no-unsafe-*）。
-  const mod = (await import(
-    pathToFileURL(path.resolve(pkgDir, "build-host.mjs")).href
-  )) as unknown as Record<string, (() => Promise<BuiltArtifacts>) | undefined>;
+  // 载入与构建失败带上下文重抛：这条门禁的语义是「产物过期」，连构建都跑不起来
+  // 属于另一类病因，裸 ERR_MODULE_NOT_FOUND / rolldown 栈看不出是哪个包。
+  let mod: Record<string, (() => Promise<BuiltArtifacts>) | undefined>;
+  try {
+    mod = (await import(pathToFileURL(path.resolve(pkgDir, "build-host.mjs")).href)) as Record<
+      string,
+      (() => Promise<BuiltArtifacts>) | undefined
+    >;
+  } catch (error: unknown) {
+    throw new Error(
+      `[${pkgName}] 无法载入 ${path.resolve(pkgDir, "build-host.mjs")}：门禁要对它做内存构建`,
+      { cause: error },
+    );
+  }
   const build = mod[builder];
   if (typeof build !== "function") {
     throw new TypeError(
       `[${pkgName}] build-host.mjs 没有可调用导出 ${builder}：门禁的 builder 选项必须指它真实导出的名字。`,
     );
   }
-  const built = await build();
+  let built: BuiltArtifacts;
+  try {
+    built = await build();
+  } catch (error: unknown) {
+    throw new Error(
+      `[${pkgName}] build-host.mjs 的 ${builder}() 构建失败：先让构建本身过，再谈产物新鲜度`,
+      { cause: error },
+    );
+  }
   if (typeof built === "string") {
     return { pkgName, pkgDir, onDisk: readText(path.resolve(pkgDir, artifact)), built };
+  }
+  // 类型面 `BuiltArtifacts` 是断言出来的（.mjs 对 TS 就是无类型），运行期真拿到别的东西
+  // （undefined、`{ code }` 这一类）时不该在 `files.entries()` 上炸一句与包名无关的栈：
+  // 先验形状，报错点名是哪个包的哪个 builder。经 unknown 判，而不是对已收窄成 Map 的值
+  // 再问一次 instanceof（那在类型面是恒真，会被 lint 判成多余条件）。
+  const shape: unknown = built;
+  if (!(shape instanceof Map)) {
+    throw new TypeError(
+      `[${pkgName}] build-host.mjs 的 ${builder}() 返回值既不是字符串也不是「路径→正文」的 Map：门禁无法比对。`,
+    );
   }
   return {
     pkgName,
     pkgDir,
-    onDisk: manifestOf(pkgDir, built, true),
-    built: manifestOf(pkgDir, built, false),
+    onDisk: manifestOf(pkgDir, pkgName, built, true),
+    built: manifestOf(pkgDir, pkgName, built, false),
   };
 }

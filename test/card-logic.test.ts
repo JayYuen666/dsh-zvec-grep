@@ -9,6 +9,7 @@ import { draftOf } from "../lib/card-draft.ts";
 import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import { fill } from "../lib/messages.ts";
 import { UI_MESSAGES } from "../src/ui-messages.ts";
+import { CJK_RESIDUE } from "./cjk-residue.ts";
 import type { ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-settings/client";
 
 /** 已提交快照里的端点值：三个用例共用同一份事实源。 */
@@ -31,11 +32,14 @@ const tZh: CardText = (key, params) => fill(UI_MESSAGES.zh[key], params ?? {});
 /** 英文 translator：同一渲染路径只换字典那份（模块级，不随 describe 重建）。 */
 const tEn: CardText = (key, params) => fill(UI_MESSAGES.en[key], params ?? {});
 
+/** 继承成员哨兵：一枚有身份的函数，用来证明 `Object.prototype` 上的成员不会被当成已提交值交出。 */
+const PROTOTYPE_SENTINEL = (): void => undefined;
+
 /**
  * 中文「无退出码」文案的期望整句：三个用例共用（exitCode null / 缺 status / NaN），
  * 引字典键等于让字典自己给自己作证，独立抄一份。
  */
-const ZH_REBUILD_EXIT_UNKNOWN = "重建失败，且没有可读的进程退出码（应答的 status 无法识别）";
+const ZH_REBUILD_EXIT_UNKNOWN = "重建没有可判定的结果（应答的 status 无法识别，或缺少进程退出码）";
 
 /**
  * 中文「limit 非法」提示的期望整句：`tZh` 从 UI_MESSAGES 渲染出来就是这一串，断言里
@@ -63,24 +67,37 @@ function snap(over: Partial<FormSnapshot> = {}): FormSnapshot {
   };
 }
 
+/** 退订替身本体：一枚有身份的函数，`fakeScope` 每次订阅都交回它 —— 「卡片拿到的退订
+ *  就是 scope 那一枚」这条身份断言靠的就是它不是就地新建的空函数。不捕获外层变量，
+ *  所以住在模块层。 */
+function fakeUnsubscribe(): void {
+  void 0;
+}
+
 function fakeScope(initial: FormSnapshot): SettingScope & {
   setSnap: (value: FormSnapshot) => void;
   sets: [string, unknown][];
   unsets: string[];
   mutates: unknown[][];
   subscribes: number;
+  /** 交进来的 listener 原样留着：`cardStore.subscribe` 必须转发同一枚，而不是自己造一枚。 */
+  listeners: (() => void)[];
+  /** 每次订阅自己造一枚有身份的退订函数，供「返回值就是 scope 那一枚」的身份断言。 */
+  unsubscribes: (() => void)[];
 } {
   let snapValue = initial;
   const sets: [string, unknown][] = [];
   const unsets: string[] = [];
   const mutates: unknown[][] = [];
+  const listeners: (() => void)[] = [];
+  const unsubscribes: (() => void)[] = [];
   const scope = {
     getSnapshot: () => snapValue,
-    subscribe: (_listener: () => void) => {
+    subscribe: (listener: () => void) => {
       scope.subscribes += 1;
-      return () => {
-        void 0;
-      };
+      listeners.push(listener);
+      unsubscribes.push(fakeUnsubscribe);
+      return fakeUnsubscribe;
     },
     // 路径级原子写入：本卡不走它，但官方类型面要求它在位（缺了就编译不过）。
     mutate: async (ops: readonly unknown[]): Promise<boolean> => {
@@ -101,6 +118,8 @@ function fakeScope(initial: FormSnapshot): SettingScope & {
     sets,
     unsets,
     mutates,
+    listeners,
+    unsubscribes,
     subscribes: 0,
   };
   return scope;
@@ -168,11 +187,18 @@ describe("cardStore 快照投影", () => {
   it("subscribe 透传到 scope 并回传其退订函数", () => {
     const scope = fakeScope(snap({ value: {} }));
     const store = cardStore(scope);
-    const unsubscribe = store.subscribe(() => {
-      void 0;
-    });
+    let heard = 0;
+    const listener = (): void => {
+      heard += 1;
+    };
+    const unsubscribe = store.subscribe(listener);
     assert.equal(scope.subscribes, 1);
-    assert.equal(typeof unsubscribe, "function");
+    // 只数次数与 typeof 的话，「另造一枚空函数交给 scope」或「返回自己的空实现」都会绿 ——
+    // 而卡片重挂靠的正是这两个身份：转过去的是同一枚 listener，退订的是 scope 交回的那一枚。
+    assert.equal(scope.listeners[0], listener, "listener 原样转发，不另造");
+    assert.equal(unsubscribe, scope.unsubscribes[0], "退订函数就是 scope 交回的那一枚");
+    scope.listeners[0]();
+    assert.equal(heard, 1, "转过去的那枚确实可达");
     unsubscribe();
   });
 });
@@ -185,10 +211,18 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
     assert.equal(draftOf({}, {}, "missing"), undefined);
   });
 
-  it("只判自有属性：继承键（toString 等）不算 touched/已提交值", () => {
+  it("只判自有属性：继承键（toString/constructor/hasOwnProperty）不算 touched/已提交值", () => {
     // `field in touched` 或裸下标会沿原型链命中 Object.prototype 的成员，把函数/对象当值交出去。
+    // 哨兵用身份断言而非 typeof：typeof 对函数/对象只会给 "function"/"object"，区分不出被顶替的值。
     assert.equal(draftOf({}, { toString: 5 }, "toString"), 5);
+    assert.equal(
+      draftOf({}, { constructor: PROTOTYPE_SENTINEL }, "constructor"),
+      PROTOTYPE_SENTINEL,
+    );
+    assert.equal(draftOf({}, { hasOwnProperty: 7 }, "hasOwnProperty"), 7);
     assert.equal(draftOf({}, {}, "toString"), undefined, "继承成员不得作为已提交值");
+    assert.equal(draftOf({}, {}, "constructor"), undefined);
+    assert.equal(draftOf({}, {}, "hasOwnProperty"), undefined);
   });
 
   it("六个字段全部草稿优先（含 hfEndpoint 与 embedding）", () => {
@@ -386,8 +420,14 @@ describe("parseRebuildPoll（completed 且 exit 0 才算成功）", () => {
 
   it("非对象载荷 → 按未知态兜底（schema 拒收，走 safeParse 的失败支）", () => {
     // 运行时可能送来 null / 数组（HTTP 载荷被换过）；函数签名只约束编译期。
-    assert.equal(parseRebuildPoll(null as unknown as Record<string, unknown>, tZh).phase, "error");
-    assert.equal(parseRebuildPoll([] as unknown as Record<string, unknown>, tZh).phase, "error");
+    // 整个结果一起钉：只断 phase 分不清 safeParse 失败支与「未知 status」支。
+    for (const raw of [null, []]) {
+      const poll = parseRebuildPoll(raw, tZh);
+      assert.deepEqual(
+        { phase: poll.phase, output: poll.output },
+        { phase: "error", output: ZH_REBUILD_EXIT_UNKNOWN },
+      );
+    }
   });
 
   it("未知 status（含缺省）→ error", () => {
@@ -422,8 +462,13 @@ describe("parseRebuildPoll（completed 且 exit 0 才算成功）", () => {
   });
 });
 
-describe("保存动作走 set/unset 两条路（草稿模型）", () => {
-  it("清空字段用 unset，有值字段用 set", async () => {
+describe("替身的写入轨迹分别记账（供上面几条依赖）", () => {
+  // 这条不是产品覆盖：卡片"清空走 unset、有值走 set"的决策在 src/client-entry.ts 的 save() 里，
+  // 那是浏览器入口（document/React），node 侧求值不到它。这里只证明 fakeScope 这两条轨迹
+  // 各自记账、互不串台 —— 后面「mutate 不落到 set 轨迹」那类断言靠的就是它先成立。
+  // 写通道**透传**的产品判据在 test/build-client.test.ts（对产物求值 payload.set/unset
+  // 是否落进本条目那张表单）；save() 里那一支的分支选择没有 node 侧判据，按已知缺口登记。
+  it("set 与 unset 各记各的轨迹", async () => {
     const scope = fakeScope(snap({ value: {} }));
     await scope.set("defaultLimit", 12);
     await scope.unset("defaultLimit");
@@ -466,13 +511,18 @@ describe("卡片逻辑文案双语", () => {
   });
 
   it("英文那份整段不残留中文（同一渲染路径只换字典）", () => {
-    const rendered = JSON.stringify([
-      parseRebuildPoll({ status: "running" }, tEn),
-      parseRebuildPoll({ status: "stopping" }, tEn),
-      parseRebuildPoll({ status: "failed", exitCode: null }, tEn),
-      parseRebuildPoll({ status: "completed", exitCode: 1 }, tEn),
-    ]);
-    assert.doesNotMatch(rendered, /[\u4E00-\u9FFF]/u);
+    const rendered = [
+      parseRebuildPoll({ status: "running" }, tEn).output,
+      parseRebuildPoll({ status: "stopping" }, tEn).output,
+      parseRebuildPoll({ status: "failed", exitCode: null }, tEn).output,
+      parseRebuildPoll({ status: "completed", exitCode: 1 }, tEn).output,
+    ];
+    // 先逐项钉非空字符串：JSON.stringify 会丢 undefined 值、空串也过 doesNotMatch，
+    // 不先钉「有内容」时缺键/空文案的退化在这里是隐形的。
+    for (const text of rendered) {
+      assert.ok(typeof text === "string" && text.length > 0, "渲染结果必须是非空字符串");
+    }
+    assert.doesNotMatch(rendered.join("\n"), CJK_RESIDUE);
   });
 });
 
@@ -481,6 +531,13 @@ describe("daemonNoteKey：守护进程就绪态该显示哪一行", () => {
     assert.equal(daemonNoteKey(undefined), undefined, "应答里没有这一档 ⇒ 不显示");
     assert.equal(daemonNoteKey(false), "daemonOfflineNote");
     assert.equal(daemonNoteKey(true), "daemonReadyNote");
+    // wire 上的 serverReady 未经运行时校验（lib/rebuild-shape.ts 只有类型声明）：
+    // null/字符串这类畸形值不得被 falsy 判断误收——实现是 === true/false 严格判等，
+    // 实现改宽时这些用例会红。
+    assert.equal(daemonNoteKey(null), undefined, "null 不是合法三档之一");
+    assert.equal(daemonNoteKey("false"), undefined, "字符串形态不命中 false 档");
+    assert.equal(daemonNoteKey("true"), undefined, "字符串形态不命中 true 档");
+    assert.equal(daemonNoteKey(0), undefined, "数字形态不命中");
   });
 
   it("选出来的两个键都在双语字典里（缺键会在运行时才 t() 出 undefined）", () => {

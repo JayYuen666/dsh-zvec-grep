@@ -5,6 +5,7 @@
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { Context } from "@deepseek-ai/cordis";
+import { createScope } from "@deepseek-ai/dsh-scope";
 import {
   ROUTING_NAME,
   ROUTING_ORDER,
@@ -21,6 +22,10 @@ import {
 } from "../lib/routing.ts";
 import type { GuardExecution, SearchFirstDeps } from "../lib/routing.ts";
 import {
+  DEFAULT_GREP_BUDGET as BUDGET_FROM_LIMITS,
+  DEFAULT_UNLOCK_WINDOW_MIN as WINDOW_FROM_LIMITS,
+} from "../lib/limits.ts";
+import {
   isGrepRgCommand,
   normalizeRoot,
   pathInsideRoot,
@@ -29,6 +34,7 @@ import {
 } from "../lib/search-predicates.ts";
 import type { SearchUnlock } from "../lib/search-predicates.ts";
 import { MESSAGES } from "../lib/messages.ts";
+import { CJK_RESIDUE } from "./cjk-residue.ts";
 
 /**
  * 中文消息表：guard 拒绝理由与规则段的文本按语言由调用点注入（纯函数不读设置），
@@ -83,7 +89,7 @@ describe("ROUTING 常量", () => {
       assert.ok(en.includes(token), `en 规则文本缺 ${token}`);
     }
     assert.ok(en.includes("must call zg_search first"), "en 版给出同一条硬规则");
-    assert.doesNotMatch(en, /[一-龥]/u, "en 版不得残留中文");
+    assert.doesNotMatch(en, CJK_RESIDUE, "en 版不得残留中文（含中文标点与全角形式字符）");
   });
 
   // 「恰好三工具」这一钉原来在本文件（直接摊开 lib 的 ZG_TOOLS 常量比一遍）。常量已不外露
@@ -253,6 +259,39 @@ describe("isGrepRgCommand", () => {
     assert.equal(isGrepRgCommand("rg --version"), false);
     assert.equal(isGrepRgCommand("grep -V"), false);
     assert.equal(isGrepRgCommand("rg --help"), false);
+  });
+
+  it("命令替换里的检索照样执行：一层括号不是豁免", () => {
+    // 旧实现把词中的 `(` 一律并进当前 token（那是 `${DIR}/src` 那条规则），于是
+    // `$(grep x y)` 只切出一枚 `$(grep`——对不上任何检索命令名，门禁凭一层括号放行。
+    // 反引号形态本来就在 COMMAND_BREAK_CHARS 里，这里一起钉住，免得只留一半。
+    assert.equal(isGrepRgCommand("echo $(rg foo src)"), true);
+    assert.equal(isGrepRgCommand("$(grep -r secret /etc)"), true);
+    assert.equal(isGrepRgCommand("echo `grep foo src`"), true);
+    // 词内的 `(` 仍属展开：不能因为「认命令替换」就把 `${DIR}/src` 切成两枚 token，
+    // 那会让 `/src` 变成根外证据而放行（见 tokenizeShell 头注的组字符一条）。
+    // `$` 单列成常量：整串写成字面量会被 linter 判成「误写的模板串」，而这里要的正是字面的 `${`。
+    const dollar = "$";
+    assert.equal(isGrepRgCommand(`grep foo ${dollar}{DIR}/src`), true);
+    assert.equal(isGrepRgCommand("cat $(pwd)/src"), false);
+  });
+
+  it("壳层 -c 后面的脚本递归判一次", () => {
+    // `bash -c '…'` 的那一枚参数整枚落在非命令位（引号内），不递归看进去就等于
+    // 「一层引号绕过门禁」。深度上限 2：第三层不再看进去（也造不出该看的场景）。
+    assert.equal(isGrepRgCommand("bash -c 'grep foo src'"), true);
+    assert.equal(isGrepRgCommand("sh -c 'rg foo src'"), true);
+    assert.equal(isGrepRgCommand("zsh -c 'rg foo'"), true);
+    assert.equal(isGrepRgCommand("bash -lc 'rg foo'"), true);
+    assert.equal(isGrepRgCommand(String.raw`bash -c "bash -c 'grep foo src'"`), true);
+    // 三层的写法在真 shell 里就得用 `\"` 转义，那两个反斜杠是命令文本的一部分，故用 String.raw。
+    assert.equal(isGrepRgCommand(String.raw`bash -c "bash -c \"bash -c 'grep foo src'\""`), false);
+    // 递归只看「会被执行的那一段」：脚本里没有检索、包装名不对、或那段根本不执行，都放行。
+    assert.equal(isGrepRgCommand(String.raw`bash -c "echo hi"`), false);
+    assert.equal(isGrepRgCommand("git commit -m 'mention grep foo'"), false);
+    assert.equal(isGrepRgCommand("echo bash -c 'grep foo src'"), false);
+    // 包装名单之外的前缀（watch 每 5 秒真跑一次 grep）是已知近似，与文件头的漏拦清单同侧。
+    assert.equal(isGrepRgCommand("watch -n 5 grep foo src"), false);
   });
 });
 
@@ -580,7 +619,12 @@ describe("searchFirstGuard", () => {
   it("准入视图按 Agent 作用域查：受限子代理的拒绝在该视图里显形", () => {
     const { deps } = makeDeps();
     const scopes: unknown[] = [];
-    const ctx = new Context();
+    // 一枚真作用域键：`new Context()` 本身没打标签（scopeOf 读回 undefined），拿它当入参
+    // 时「传了 undefined」和「传了该 ctx 的作用域键」两种实现都会绿。createScope 造出的
+    // ctx 才带键，而键由本用例自己写死——视图收到的是不是这一枚，就成了可红的判据。
+    const base = new Context();
+    const scopeKey = { id: "scoped-session" };
+    const scoped = createScope(base, scopeKey);
     const toolSet = {
       dispose: (): void => {
         void 0;
@@ -594,7 +638,7 @@ describe("searchFirstGuard", () => {
       {
         name: "bash",
         arguments: { command: RG_SRC },
-        agent: { session: { id: "s1", header: { cwd: INDEXED } }, ctx },
+        agent: { session: { id: "s1", header: { cwd: INDEXED } }, ctx: scoped.ctx },
         toolSet,
       },
       deps,
@@ -602,6 +646,11 @@ describe("searchFirstGuard", () => {
     );
     assert.equal(reason, undefined, "该作用域不允许 zg_search → 放行");
     assert.equal(scopes.length, 1, "查了一次准入视图");
+    assert.equal(
+      scopes[0],
+      scopeKey,
+      "按该 agent 的作用域键查（不是 ctx、不是 agent、也不是 undefined）",
+    );
   });
 
   it("bash 非 grep 命令放行", () => {
@@ -957,10 +1006,17 @@ describe("rootSessionKeyOf（子代理与主代理共享一份配额）", () => 
     assert.equal(key, "mid");
   });
 
-  it("链成环时停住，不无限上溯", () => {
+  it("链成环时停在检出环的那一跳，且每次同一答案", () => {
     const lookup = table({ hopA: "hopB", hopB: "hopA" });
-    const key = rootSessionKeyOf(at("entry", "hopA"), lookup);
-    assert.ok(["hopA", "hopB"].includes(key));
+    // seen 里已带着 entry 与第一跳，所以从 hopA 出发会在 hopB 处认出自己见过的 hopA 而停下；
+    // 反向出发停在 hopA。钉具体值才防得住「随便返回链上任一 id」那种退化实现。
+    assert.equal(rootSessionKeyOf(at("entry", "hopA"), lookup), "hopB");
+    assert.equal(rootSessionKeyOf(at("entry", "hopB"), lookup), "hopA");
+    assert.equal(
+      rootSessionKeyOf(at("entry", "hopA"), lookup),
+      rootSessionKeyOf(at("entry", "hopA"), lookup),
+      "同一入参两次调用给出同一个键（额度才不会随迭代顺序漂）",
+    );
   });
 
   it("跳数有上限：超长链停在上限处", () => {
@@ -1009,8 +1065,13 @@ describe("unlockActive", () => {
     assert.equal(unlockActive({ grepsLeft: 3, expiresAt: NOW }, NOW), false);
   });
 
-  it("默认阈值导出（与宿主 BUILTIN_BASE 单源）", () => {
+  it("默认阈值取 lib/limits.ts 那一份（改值只有一处可改）", () => {
+    // 字面值独立写死：limits.ts 里的数被人改动时这里先红，改值是有意识的决定。
     assert.equal(DEFAULT_GREP_BUDGET, 3);
     assert.equal(DEFAULT_UNLOCK_WINDOW_MIN, 10);
+    // 同一段钉住「routing.ts 交回的就是 limits.ts 那一枚」：host.ts 的 schema 默认值从这里取，
+    // routing.ts 里落一份副本时只有取值不同才会在这里显形（同值副本要等下一次改值）。
+    assert.equal(DEFAULT_GREP_BUDGET, BUDGET_FROM_LIMITS);
+    assert.equal(DEFAULT_UNLOCK_WINDOW_MIN, WINDOW_FROM_LIMITS);
   });
 });

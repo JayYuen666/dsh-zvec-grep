@@ -17,11 +17,17 @@
 
 import { describe, it, expect, beforeEach, afterAll, afterEach } from "vitest";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { startHost, installFakeZg, zgAvailable, sleep } from "./host-stack.ts";
-import type { Host } from "./host-stack.ts";
+import {
+  startHost,
+  installFakeZg,
+  zgAvailable,
+  sleep,
+  drainCleanups,
+  makeTempDir,
+} from "./host-stack.ts";
+import type { Cleanups, Host } from "./host-stack.ts";
 import type {
   RebuildRefused,
   RebuildRoots,
@@ -43,14 +49,20 @@ function isAlive(pid: number): boolean {
   }
 }
 
-/** 等到那条作业落定（不再是 running/stopping）：返回最终状态词。 */
-async function waitTerminal(
-  host: Host,
-  jobId: string,
-  timeoutAt: number,
-): Promise<string | undefined> {
-  const status = host.ctx.jobs.list().find((row) => row.id === jobId)?.status;
-  if (status !== undefined && status !== "running" && status !== "stopping") {
+/**
+ * 等到那条作业落定（不再是 running/stopping）：返回最终状态词。
+ *
+ * 名册里查不到这条 id 直接抛，不返回 undefined：卸载那一条要验的契约是「经官方注册表
+ * kill 推到终态」，而「作业从名册里消失」同样让 `!= running` 成立——把它当成落定，
+ * 就等于用断言承认了两种相反的结局。
+ */
+async function waitTerminal(host: Host, jobId: string, timeoutAt: number): Promise<string> {
+  const row = host.ctx.jobs.list().find((job) => job.id === jobId);
+  if (row === undefined) {
+    throw new Error(`作业 ${jobId} 不在官方名册里`);
+  }
+  const { status } = row;
+  if (status !== "running" && status !== "stopping") {
     return status;
   }
   if (Date.now() > timeoutAt) {
@@ -72,20 +84,9 @@ async function waitForExit(pid: number, timeoutAt = Date.now() + 5000): Promise<
   return waitForExit(pid, timeoutAt);
 }
 
-const cleanups: (() => void)[] = [];
-
-/** 临时目录 + 登记清理。 */
-function temp(prefix: string): string {
-  const dir = mkdtempSync(path.join(tmpdir(), prefix));
-  cleanups.push(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
-
 /** 一枚待观测的工作区（随后由 observe() 借一次工具调用把它记进重建白名单）。 */
-function observedWorkspace(): string {
-  const dir = temp("zg-rb-");
+function observedWorkspace(cleanups: Cleanups): string {
+  const dir = makeTempDir(cleanups, "zg-rb-");
   writeFileSync(path.join(dir, "auth.ts"), "export function authService() { return 1; }\n");
   writeFileSync(path.join(dir, ".gitignore"), "dist/\n");
   return dir;
@@ -187,15 +188,15 @@ async function waitSettled(
 }
 
 describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", () => {
+  const cleanups: Cleanups = [];
+
   afterAll(() => {
-    for (const cleanup of cleanups.splice(0).toReversed()) {
-      cleanup();
-    }
+    drainCleanups(cleanups);
   });
 
   it("引导读面交回候选工作区与就绪位，roots 就是这台 daemon 观测到的那些", async () => {
     const host = await startHost();
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const roots = await readRoots(host);
@@ -213,7 +214,7 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
 
   it("启动读面：白名单与绝对路径判据都过 ⇒ 真起一条后台作业进官方注册表", async () => {
     const host = await startHost();
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const started = startedOf(await startRebuild(host, ws));
@@ -249,7 +250,7 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
     // 身份比较会恒为假 ⇒ 每条活着的重建都回 404。身份判据改用 JobView 上的值三段
     // （kind/label/startedAt）之后，同一条作业的连续轮询才读得到读数。
     const host = await startHost();
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const { jobId } = startedOf(await startRebuild(host, ws));
@@ -267,8 +268,8 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
 
   it("白名单仍拦未观测的 root 与相对路径，且不起进程", async () => {
     const host = await startHost();
-    const ws = observedWorkspace();
-    const stranger = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
+    const stranger = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const before = host.shellCalls.length;
@@ -291,10 +292,10 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
   }, 60_000);
 
   it("同根第二条启动请求复用在跑的那条（不并发起第二条 zg）", async () => {
-    const pidFile = path.join(temp("zg-rb-pid-"), "zg.pid");
+    const pidFile = path.join(makeTempDir(cleanups, "zg-rb-pid-"), "zg.pid");
     const restore = installFakeZg({ ms: 800, pidFile });
     const host = await startHost();
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const first = startedOf(await startRebuild(host, ws));
@@ -313,7 +314,7 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
 
   it("历史窗口外的 jobId 答 404 且不代读别人的作业", async () => {
     const host = await startHost();
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const ghost = refusedOf(readStatus(host, "zvec-grep-rebuild-999"));
@@ -326,7 +327,13 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
 });
 
 describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", () => {
-  const pidDir = mkdtempSync(path.join(tmpdir(), "zg-life-"));
+  const cleanups: Cleanups = [];
+
+  afterAll(() => {
+    drainCleanups(cleanups);
+  });
+
+  const pidDir = makeTempDir(cleanups, "zg-life-");
   const pidFile = path.join(pidDir, "zg.pid");
   let restoreFake: (() => void) | undefined;
 
@@ -337,16 +344,12 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
   afterEach(() => {
     restoreFake?.();
     restoreFake = undefined;
+    // pid 名册每条用例从空开始：留着上一条那枚（被杀掉的）pid，`waitForPid()` 会立刻返回
+    // 一个不属于本轮的进程号，本轮重建进程是否真的起过就没人看了。
+    rmSync(pidFile, { force: true });
   });
 
-  afterAll(() => {
-    for (const cleanup of cleanups.splice(0).toReversed()) {
-      cleanup();
-    }
-    rmSync(pidDir, { recursive: true, force: true });
-  });
-
-  /** 等假 zg 把 pid 落地（它一被 spawn 就会写）：归帿而非循环。 */
+  /** 等假 zg 把 pid 落地（它一被 spawn 就会写）：递归而非循环。 */
   async function waitForPid(timeoutAt = Date.now() + 5000): Promise<number> {
     if (existsSync(pidFile)) {
       return Number(readFileSync(pidFile, "utf8"));
@@ -365,7 +368,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
     // 这个用例故意造「卸载时还有活作业」：任何一条断言失败都必须把宿主收掉，否则那条
     // 假 zg（ms:5000）与已绑定的端口会留给后面的用例，失败点从断言漂到污染。
     try {
-      const ws = observedWorkspace();
+      const ws = observedWorkspace(cleanups);
       await observe(ws, host);
       const { jobId } = startedOf(await startRebuild(host, ws));
       // 进程真的起来了（假 zg 把 pid 落地）。
@@ -375,14 +378,20 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
 
       // 旧 URL 在**装载态**就是 404：读面走的是官方网关，不是本包注册的 webServer 路由。
       // 只在卸载之后测一次的话，将来谁把路由加回来也不会红。
-      const during = await fetch(`http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`);
-      assert.equal(during.status, 404);
+      const legacyUrl = `http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`;
+      const during = await fetch(legacyUrl);
+      assert.equal(
+        during.status,
+        404,
+        `${legacyUrl} 在装载态必须是 404，实际 ${String(during.status)}`,
+      );
 
       await host.unload();
-      // 卸载效应收口：走**官方注册表** kill（不是绕过它直接杀进程）⇒ 名册里那条被推到
-      // stopping/killed，模型侧 job_list 看得见结局；环也由官方件收。
+      // 卸载效应收口：走**官方注册表** kill（不是绕过它直接杀进程）⇒ 名册里那条被推到终态，
+      // 模型侧 job_list 看得见结局；环也由官方件收。这里钉具体的终态词，而不是 `!= running`：
+      // 后者对「名册里查无此条」同样成立，而那正是本条要排除的绕过形态。
       const terminal = await waitTerminal(host, jobId, Date.now() + 5000);
-      expect(terminal, "卸载后那条作业必须离开 running").not.toBe("running");
+      expect(terminal, "卸载后那条作业必须由官方 kill 推到 killed").toBe("killed");
 
       const alive = await waitForExit(pid);
       assert.equal(alive, false, `进程 ${pid} 必须被收掉`);
@@ -393,7 +402,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
 
   it("超过 indexTimeoutMs：kill 定时器收进程，轮询读面说明为什么没跑完", async () => {
     const host = await startHost({ indexTimeoutMs: 700 });
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const settled = await waitSettled(
@@ -401,7 +410,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
         startedOf(await startRebuild(host, ws)).jobId,
         Date.now() + 30_000,
       );
-      expect(settled.status).not.toBe("running");
+      expect(settled.status).toBe("killed");
       // 超时说明必须出现在投影里（它由本包合成，不进官方环）。
       expect(settled.output).toContain("超时");
     } finally {
@@ -411,7 +420,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
 
   it("模型侧后台索引与设置卡那条路同形：作业号可轮询、落定后交回退出码", async () => {
     const host = await startHost();
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const started = await host.call(
@@ -439,7 +448,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
 
   it("重建期间同根的检索不失败（等它落定后重试，而不是把失败直接丢给模型）", async () => {
     const host = await startHost({ indexTimeoutMs: 60_000, config: { rebuildWaitMs: 30_000 } });
-    const ws = observedWorkspace();
+    const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
       const started = await host.call(
@@ -448,8 +457,21 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
         host.agentOf(ws),
       );
       assert.ok(!started.isError, host.textOf(started));
+      // 等重建进程把 pid 写进名册再检索：抢在它之前，假件看到的是「同根没有重建在跑」，
+      // 这一轮递回去的就是普通读数而不是锁占用，等待臂依旧没被走到。
+      const owner = await waitForPid();
+      assert.ok(isAlive(owner), `${pidFile} 记的进程 ${String(owner)} 应还活着`);
       const search = await host.call("zg_search", { query: "authService" }, host.agentOf(ws));
       assert.ok(!search.isError, host.textOf(search));
+      // 判据落在**递进官方执行器的次数**上：第一次被同根重建的锁挡下、等落定后重试一次。
+      // 整段拿掉等待臂，第一次的失败就直接回到模型身上（上一条红）；把重试改成"再试一次
+      // 也别等"，这一条红。只断言"结果不报错"则两种坏法都看不见。
+      const queries = host.shellCalls.filter((row) => row.request.command.startsWith("zg query"));
+      assert.equal(
+        queries.length,
+        2,
+        `检索应是「一次被锁挡下 + 等落定后重试一次」，实际递了 ${String(queries.length)} 次`,
+      );
     } finally {
       await host.dispose();
     }

@@ -19,8 +19,8 @@ import type { ChildProcess } from "node:child_process";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
 import type { Readable } from "node:stream";
-import { existsSync, chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   buildIndexCommand,
@@ -28,6 +28,8 @@ import {
   buildStatusCommand,
   clientModeOf,
 } from "../../lib/cli.ts";
+import type { BuiltCommand, ClientMode, IndexArgs } from "../../lib/cli.ts";
+import { embeddingCached } from "../embedding-cache.ts";
 import { MESSAGES } from "../../lib/messages.ts";
 import type { ZvecGrepMessages } from "../../lib/messages.ts";
 import { classifyConcurrentFailure } from "../../lib/zg-errors.ts";
@@ -40,11 +42,22 @@ import {
 import { hitSummary, signalStderr } from "../../host.ts";
 import { inOrder, canMakeUnreadableFile, zgAvailable } from "../integration/host-stack.ts";
 
-/** 子进程退出码（close 事件；kill 不等于退出码，这里只看退出码）。 */
-async function exitCode(child: ChildProcess): Promise<number> {
-  const signals: unknown[] = await once(child, "close");
-  const code: unknown = signals[0];
-  return typeof code === "number" ? code : -1;
+/**
+ * 子进程退出码（close 事件的第一个参数）。
+ *
+ * 被信号打死与「没有数字退出码」都抛出去并带上命令行：把信号终止折成 `-1`，
+ * 下游那些「非零退出」的断言会在进程根本没跑成的前提下照样通过——那与折成 0 只是
+ * 换一种藏法，两种都不该藏。
+ */
+async function exitCode(child: ChildProcess, command: string): Promise<number> {
+  const [code, signal] = (await once(child, "close")) as [unknown, unknown];
+  if (typeof signal === "string") {
+    throw new TypeError(`子进程被信号 ${signal} 终止，没有退出码可判：${command}`);
+  }
+  if (typeof code !== "number") {
+    throw new TypeError(`子进程交回的退出码不是数字（实际 ${String(code)}）：${command}`);
+  }
+  return code;
 }
 
 /** 读完一路流（空流端视为空串）。 */
@@ -60,19 +73,56 @@ async function drain(stream: Readable | null): Promise<string> {
 }
 
 /**
+ * 一条命令的上限。本套用例递出去的都是单棵小树，真跑用不了这么久；超了就是它挂住
+ * （等锁、联网下载权重），由这里先把进程收掉，而不是留给 vitest 的用例超时——
+ * 用例超时只让这条用例红，不杀子进程，被挂住的 zg 会带着工作区锁留给后面的用例。
+ */
+const RUN_TIMEOUT_MS = 20_000;
+
+/**
  * 异步跑一条命令（不用同步 API：本包审查只开 node/no-sync 的写盘一组）。
  * 非零退出也不抛：失败输出正是这套用例要对照的资料（上游拒绝原文）。
+ *
+ * `shell: true` 把命令串交给 sh 解析，因此引号完全由 lib/cli.ts 的 shq 负责：
+ * 这里不接受未加引号的拼接。超时的 SIGKILL 打到的就是 zg 本身——`sh -c` 对单条命令
+ * 直接 exec，不再多留一层 shell（本机实测：超时后按命令名找不到遗留进程）。
  */
 async function run(
   command: string,
   cwd: string,
 ): Promise<{ stdout: string; stderr: string; status: number }> {
-  const child = execFile(command, { cwd, shell: true, encoding: "utf8" });
-  const [stdout, stderr, status] = await Promise.all([
-    drain(child.stdout),
-    drain(child.stderr),
-    exitCode(child),
-  ]);
+  const child = execFile(command, {
+    cwd,
+    shell: true,
+    encoding: "utf8",
+    timeout: RUN_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  // spawn 失败走 'error'，必须接住并点名命令。maxBuffer 超限本机实测**不**走 'error'：
+  // 而是把子进程打死、以 close(code=null, signal=SIGKILL) 收（`seq 1 400000` 实测），
+  // 于是超限与挂住都由 exitCode 抛出去，而不是留下一段被截断的输出配一句 status=0。
+  let spawnError: Error | undefined;
+  child.on("error", (error: Error) => {
+    spawnError = error;
+  });
+  let stdout: string;
+  let stderr: string;
+  let status: number;
+  try {
+    [stdout, stderr, status] = await Promise.all([
+      drain(child.stdout),
+      drain(child.stderr),
+      exitCode(child, command),
+    ]);
+  } catch (error) {
+    // 打死进程后一路流会提前结束（实测 `Error: Premature close`）：把它折回带命令行的失败，
+    // 否则栈上只有那句流内部的措辞，看不出是哪条命令没跑成。
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`读这条子进程的输出时失败：${command}\n${reason}`, { cause: error });
+  }
+  if (spawnError !== undefined) {
+    throw new Error(`子进程没能正常跑完：${command}\n${spawnError.message}`);
+  }
   return { stdout, stderr, status };
 }
 
@@ -93,6 +143,17 @@ async function searchLiteral(dir: string, marker: string): Promise<string> {
 
 /** 本包给 zg 索引命令的 embedding（本地模型，本机已缓存）。 */
 const LOCAL_EMBEDDING = "local/potion-code-16m-v2";
+
+/** 本地权重是否在场（缺了它，真建索引的用例会转成联网下载）。 */
+const modelReady = embeddingCached(LOCAL_EMBEDDING);
+
+/** 索引命令的本包口径：embedding / 文案表 / clientMode 缺省那一路都收在这里，调用点只递 args。 */
+function indexCommand(args: IndexArgs, mode?: ClientMode): BuiltCommand {
+  return buildIndexCommand(args, LOCAL_EMBEDDING, messages, clientModeOf(mode, messages));
+}
+
+/** 索引/检索那组用例的前置：真 zg 在场，且这枚本地权重已在缓存里（否则要联网下载）。 */
+const indexSuiteReady = zgAvailable() && embeddingCached(LOCAL_EMBEDDING);
 /** 样本文件名与统一检索字面量（断言里多次引用）。 */
 const AUTH_TS_NAME = "auth.ts";
 const NOTES_NAME = "notes.md";
@@ -125,15 +186,6 @@ function workspace(files: Record<string, string> = {}): string {
     rmSync(dir, { recursive: true, force: true });
   });
   return dir;
-}
-
-/** 本地 embedding 权重是否已缓存。 */
-function modelCached(): boolean {
-  const models = path.join(homedir(), ".zvec-grep", "models");
-  return (
-    existsSync(path.join(models, "hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf")) ||
-    existsSync(path.join(models, "model2vec", "minishlab--potion-code-16M-v2"))
-  );
 }
 
 describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg CLI", () => {
@@ -198,17 +250,22 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
   }, 30_000);
 
   it("状态命令在真 zg 上跑通（root 位置参数 + --check-ready + --mode）", async () => {
-    const { command } = buildStatusCommand({ root: ws, checkReady: true }, messages);
-    const result = await run(command, ws);
+    // 独立的一棵树：这几条判的是「这棵树建过 / 还没建索引」，共享的 ws 会被别条用例改掉状态。
+    const own = workspace();
+    const { command } = buildStatusCommand({ root: own, checkReady: true }, messages);
+    const result = await run(command, own);
     // 未建索引 ⇒ --check-ready 以非零退出码表达「未就绪」，报告仍在 stdout。
     assert.notEqual(result.status, 0, `${command}\n${result.stderr}`);
     expect(result.stdout).toContain("Workspace index is not configured");
   }, 30_000);
 
-  it("索引命令的每一个旗标都被真 zg 的 index 接受", async () => {
-    const { command } = buildIndexCommand(
-      {
-        root: ws,
+  it.skipIf(!modelReady)(
+    "索引命令的每一个旗标都被真 zg 的 index 接受",
+    async () => {
+      // 独立的一棵树：这几条判的是「这棵树建过 / 还没建索引」，共享的 ws 会被别条用例改掉状态。
+      const own = workspace();
+      const { command } = indexCommand({
+        root: own,
         rebuild: true,
         globs: ["**/*.ts"],
         insensitiveGlobs: ["!*.map"],
@@ -223,15 +280,13 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
         embeddingConcurrency: 2,
         device: "auto",
         resetPaths: true,
-      },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
-    const result = await run(command, ws);
-    assert.equal(result.status, 0, `${command}\n${result.stderr}`);
-    expect(result.stdout).toContain("Workspace index");
-  }, 60_000);
+      });
+      const result = await run(command, own);
+      assert.equal(result.status, 0, `${command}\n${result.stderr}`);
+      expect(result.stdout).toContain("Workspace index");
+    },
+    60_000,
+  );
 
   it("穷举通道的冲突集合与实测报错原文一致", async () => {
     // lib/cli.ts 的 assertExhaustiveArgs 把这一整组拦在构造期，理由是这些实测原文；
@@ -269,73 +324,72 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
     assert.match(result.stderr, /Unsupported symbol type: Class/u);
   }, 30_000);
 
-  it("密钥排除旗标被真 zg 接受，且排在本函数最后（用户 iglob 之后）", async () => {
-    const built = buildIndexCommand(
-      { root: ws, globs: ["**/*.ts"], insensitiveGlobs: ["**"], excludeSecrets: true },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
-    // `**` 这条宽泛正向规则若排在密钥规则之后会把密钥文件救回索引：真 zg 的求值顺序是全
-    // --glob 先于全 --iglob，而密钥规则是本包最后追加的 --iglob。
-    const iglobs = built.command.match(/--iglob '[^']*'/gu) ?? [];
-    expect(iglobs.length).toBeGreaterThan(3);
-    expect(iglobs.at(-1)).toContain("id_ed25519");
-    const result = await run(built.command, ws);
-    assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
-  }, 60_000);
+  it.skipIf(!modelReady)(
+    "密钥排除旗标被真 zg 接受，且排在本函数最后（用户 iglob 之后）",
+    async () => {
+      // 独立的一棵树：这几条判的是「这棵树建过 / 还没建索引」，共享的 ws 会被别条用例改掉状态。
+      const own = workspace();
+      const built = indexCommand({
+        root: own,
+        globs: ["**/*.ts"],
+        insensitiveGlobs: ["**"],
+        excludeSecrets: true,
+      });
+      // `**` 这条宽泛正向规则若排在密钥规则之后会把密钥文件救回索引：真 zg 的求值顺序是全
+      // --glob 先于全 --iglob，而密钥规则是本包最后追加的 --iglob。
+      const iglobs = built.command.match(/--iglob '[^']*'/gu) ?? [];
+      expect(iglobs.length).toBeGreaterThan(3);
+      expect(iglobs.at(-1)).toContain("id_ed25519");
+      const result = await run(built.command, own);
+      assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
+    },
+    60_000,
+  );
 
-  it("drop 分支的 --yes 让真 zg 非交互删索引", async () => {
-    const built = buildIndexCommand(
-      { root: ws, drop: true },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
-    const result = await run(built.command, ws);
-    assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
-    const status = await run(buildStatusCommand({ root: ws }, messages).command, ws);
-    expect(status.stdout).toContain("not configured");
-  }, 60_000);
+  it.skipIf(!modelReady)(
+    "drop 分支的 --yes 让真 zg 非交互删索引",
+    async () => {
+      // 独立的一棵树：这几条判的是「这棵树建过 / 还没建索引」，共享的 ws 会被别条用例改掉状态。
+      const own = workspace();
+      const seed = indexCommand({ root: own });
+      const seeded = await run(seed.command, own);
+      assert.equal(seeded.status, 0, `${seed.command}\n${seeded.stderr}`);
+      const built = indexCommand({ root: own, drop: true });
+      const result = await run(built.command, own);
+      assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
+      const status = await run(buildStatusCommand({ root: own }, messages).command, own);
+      expect(status.stdout).toContain("not configured");
+    },
+    60_000,
+  );
 
-  it("--ignore-file 指向不存在的文件会把这棵树的索引弄坏（不是静默忽略）", async () => {
-    // 上游实测：ENOENT ⇒ 整次索引失败，并且那个坏路径**写进工作区索引状态**——此后这条树上的
-    // zg index / zg status 都报同一个 ENOENT，--reset-paths 清不掉，只有 drop 能救。
-    // 本包因此在 host.ts 侧补了存在性预检（assertIgnoreFilesExist），这条钉住上游事实。
-    const dir = workspace();
-    const bad = buildIndexCommand(
-      { root: dir, ignoreFiles: ["does-not-exist.ignore"] },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
-    const badResult = await run(bad.command, dir);
-    assert.notEqual(badResult.status, 0, bad.command);
-    assert.match(badResult.stderr, /ZVEC_GREP\.ENGINE\.INDEXING\.WORKSPACE_FAILED/u);
-    assert.match(badResult.stderr, /ENOENT/u);
-    // 对照半边：换一棵没被弄坏的树，同一条旗标照常工作。
-    const fresh = workspace();
-    const good = buildIndexCommand(
-      { root: fresh, ignoreFiles: [GITIGNORE_NAME] },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
-    const goodResult = await run(good.command, fresh);
-    assert.equal(goodResult.status, 0, `${good.command}\n${goodResult.stderr}`);
-    // 而同一棵树再来一次（哪怕这次给的路径是真的）也救不回来。
-    const retry = buildIndexCommand(
-      { root: dir, ignoreFiles: [GITIGNORE_NAME] },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
-    const retryResult = await run(retry.command, dir);
-    assert.notEqual(retryResult.status, 0, `${retry.command}\n${retryResult.stderr}`);
-    assert.match(retryResult.stderr, /ENOENT/u);
-  }, 120_000);
+  it.skipIf(!modelReady)(
+    "--ignore-file 指向不存在的文件会把这棵树的索引弄坏（不是静默忽略）",
+    async () => {
+      // 上游实测：ENOENT ⇒ 整次索引失败，并且那个坏路径**写进工作区索引状态**——此后这条树上的
+      // zg index / zg status 都报同一个 ENOENT，--reset-paths 清不掉，只有 drop 能救。
+      // 本包因此在 host.ts 侧补了存在性预检（assertIgnoreFilesExist），这条钉住上游事实。
+      const dir = workspace();
+      const bad = indexCommand({ root: dir, ignoreFiles: ["does-not-exist.ignore"] });
+      const badResult = await run(bad.command, dir);
+      assert.notEqual(badResult.status, 0, bad.command);
+      assert.match(badResult.stderr, /ZVEC_GREP\.ENGINE\.INDEXING\.WORKSPACE_FAILED/u);
+      assert.match(badResult.stderr, /ENOENT/u);
+      // 对照半边：换一棵没被弄坏的树，同一条旗标照常工作。
+      const fresh = workspace();
+      const good = indexCommand({ root: fresh, ignoreFiles: [GITIGNORE_NAME] });
+      const goodResult = await run(good.command, fresh);
+      assert.equal(goodResult.status, 0, `${good.command}\n${goodResult.stderr}`);
+      // 而同一棵树再来一次（哪怕这次给的路径是真的）也救不回来。
+      const retry = indexCommand({ root: dir, ignoreFiles: [GITIGNORE_NAME] });
+      const retryResult = await run(retry.command, dir);
+      assert.notEqual(retryResult.status, 0, `${retry.command}\n${retryResult.stderr}`);
+      assert.match(retryResult.stderr, /ENOENT/u);
+    },
+    120_000,
+  );
 
-  it.skipIf(!canMakeUnreadableFile())(
+  it.skipIf(!canMakeUnreadableFile() || !modelReady)(
     "--ignore-file 指向读不了的文件同样把这棵树弄坏（不是静默忽略）",
     async () => {
       // 与"不存在"那一档同一种损坏，但更隐蔽：mode 000 的文件 statSync().isFile() 照样为真，
@@ -348,23 +402,13 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
       const unreadable = path.join(dir, "unreadable.ignore");
       chmodSync(unreadable, 0o000);
       try {
-        const bad = buildIndexCommand(
-          { root: dir, ignoreFiles: ["unreadable.ignore"] },
-          LOCAL_EMBEDDING,
-          messages,
-          clientModeOf(undefined, messages),
-        );
+        const bad = indexCommand({ root: dir, ignoreFiles: ["unreadable.ignore"] });
         const badResult = await run(bad.command, dir);
         assert.notEqual(badResult.status, 0, bad.command);
         assert.match(badResult.stderr, /ZVEC_GREP\.ENGINE\.INDEXING\.WORKSPACE_FAILED/u);
         assert.match(badResult.stderr, /EACCES/u);
         // 坏路径已写进工作区状态：换一条**可读**的忽略文件再来一次也救不回来（只有 drop 能救）。
-        const retry = buildIndexCommand(
-          { root: dir, ignoreFiles: [GITIGNORE_NAME] },
-          LOCAL_EMBEDDING,
-          messages,
-          clientModeOf(undefined, messages),
-        );
+        const retry = indexCommand({ root: dir, ignoreFiles: [GITIGNORE_NAME] });
         const retryResult = await run(retry.command, dir);
         assert.notEqual(retryResult.status, 0, `${retry.command}\n${retryResult.stderr}`);
         assert.match(retryResult.stderr, /EACCES/u);
@@ -382,7 +426,7 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
   });
 });
 
-describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的输出形状与摘要解析", () => {
+describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘要解析", () => {
   const cleanupsIndexed: (() => void)[] = [];
 
   afterAll(() => {
@@ -398,12 +442,7 @@ describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的�
     cleanupsIndexed.push(() => {
       rmSync(dir, { recursive: true, force: true });
     });
-    const built = buildIndexCommand(
-      { root: dir },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
+    const built = indexCommand({ root: dir });
     const result = await run(built.command, dir);
     assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
     return dir;
@@ -448,12 +487,7 @@ describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的�
 
   it("stderr 进度噪声词表覆盖真索引进度行，且不漏掉告警", async () => {
     const dir = await indexedWorkspace();
-    const built = buildIndexCommand(
-      { root: dir, rebuild: true },
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
+    const built = indexCommand({ root: dir, rebuild: true });
     const result = await run(built.command, dir);
     assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
     // 真进度行进噪声表：signalStderr 之后一句都不剩。
@@ -489,12 +523,7 @@ describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的�
     /** 按给定排除开关建一次索引。 */
     async function indexSecrets(excludeSecrets: boolean): Promise<string> {
       const dir = secretWorkspace();
-      const built = buildIndexCommand(
-        { root: dir, excludeSecrets },
-        LOCAL_EMBEDDING,
-        messages,
-        clientModeOf(undefined, messages),
-      );
+      const built = indexCommand({ root: dir, excludeSecrets });
       const result = await run(built.command, dir);
       assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
       return dir;
@@ -532,15 +561,14 @@ describe.skipIf(!zgAvailable() || !modelCached())("点对点：索引检索的�
 
   it("并发重建的真实报错被 classifyConcurrentFailure 认出（含占锁方字段）", async () => {
     // 真 zg 在另一条写路径持锁时会给出结构化失败；这里连起两条真索引来撞它。
+    // 传输模式显式取 direct：auto 那一支在该 root 的索引写权被守护进程持住时，两条显式重建会被
+    // **双双**挡下（本机空闲复跑两次读到的形状：两臂 `ENGINE.LOCK.BUSY`，或一臂
+    // `ENGINE.DAEMON_LEASE_ACTIVE` 且 `pid: 0`、另一臂才建成），于是「至少一臂真把索引建出来」
+    // 这条见证与守护进程状态耦合。direct 让两条命令自己抢锁，撞出来的仍是 lock-busy 那一族。
     const root = await indexedWorkspace();
     const { rebuild } = REBUILD_ARGS;
     const args = { root, rebuild };
-    const built = buildIndexCommand(
-      args,
-      LOCAL_EMBEDDING,
-      messages,
-      clientModeOf(undefined, messages),
-    );
+    const built = indexCommand(args, "direct");
     const { command } = built;
     // 两条**同时**起：await 完第一条再起第二条等于串行，锁早已释放，本组会恒绿。
     const first = run(command, root);

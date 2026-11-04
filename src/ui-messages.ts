@@ -16,7 +16,6 @@ export interface UiMessages {
   /** 作用域只读时的状态条文本。 */
   readonly statusReadOnly: string;
   /** 有未保存改动时的状态条文本。 */
-  readonly statusDirty: string;
   /** 无未保存改动时的状态条文本。 */
   readonly statusClean: string;
   /** 保存条上的改动条数（`{count}` 插值）。 */
@@ -70,6 +69,7 @@ export interface UiMessages {
 
   /** 「工作区重建」行标题。 */
   readonly rebuildLabel: string;
+  readonly rebuildInputPlaceholder: string;
   /** 守护进程就绪那一行（无占位符）。 */
   readonly daemonReadyNote: string;
   /** 守护进程未就绪那一行（无占位符）。 */
@@ -94,7 +94,7 @@ export interface UiMessages {
   readonly rebuildFailed: string;
   /** 重建进程非零退出：`{exitCode}`。 */
   readonly rebuildExitCode: string;
-  /** 轮询应答的 status 无法识别、且没有可读的退出码（旧 host / 畸形应答）。 */
+  /** 兜底那一支：status 认不出（旧 host / 畸形应答），或 status 认得却没有可读的退出码。 */
   readonly rebuildExitUnknown: string;
   /** 启动端点应答缺 jobId。 */
   readonly rebuildMissingJobId: string;
@@ -156,10 +156,12 @@ export type LocaleNs = typeof LOCALE_NS_KEY;
  */
 export type Translate = OfficialTranslateNS<typeof LOCALE_NS_KEY>;
 
+/** 推荐的 embedding 模型镜像（endpointHint 与 client-entry 的 placeholder 共用）。 */
+export const EMBEDDING_MIRROR_URL = "https://modelscope.cn/models";
+
 export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
   zh: {
     statusReadOnly: "当前作用域只读",
-    statusDirty: "有未保存的修改，点「保存」生效",
     statusClean: "无未保存的修改",
     dirtyCount: "已修改 {count} 项",
     save: "保存",
@@ -179,8 +181,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     limitInvalid: "请输入 {min}-{max} 的整数",
     limitClamped: "已钳到 {min}-{max} 范围：{value}",
     endpointLabel: "HuggingFace 镜像地址",
-    endpointHint:
-      "留空走 huggingface.co；国内网络可填 https://modelscope.cn/models 等兼容镜像（仅 llama-cpp 后端生效，如 qwen3）",
+    endpointHint: `留空走 huggingface.co；国内网络可填 ${EMBEDDING_MIRROR_URL} 等兼容镜像（仅 llama-cpp 后端生效，如 qwen3）`,
     enforceLabel: "强制 search-first（先 zg_search 再 grep/rg）",
     enforceHint:
       "开启后，已建索引工作区内的 grep/rg 受配额门禁约束：每次成功 zg_search 解锁下方次数的 grep/rg（时效见下），用尽或过期后再次拦截（提高检索覆盖与准确性）",
@@ -189,6 +190,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     windowLabel: "解锁时效",
     windowHint: "超过该时长未再次 zg_search，配额整体过期；清空恢复默认 {default}（单位：分钟）",
     rebuildLabel: "工作区重建（切换 embedding 并保存后执行）",
+    rebuildInputPlaceholder: "/workspace 的绝对路径",
     daemonReadyNote: "守护进程：就绪（zg server 在跑）。",
     daemonOfflineNote:
       "守护进程：未就绪。守护进程提供的索引增量刷新、refresh=background 与常驻模型池在缺席时都不可用；需要时在终端执行 `zg server on`。",
@@ -202,7 +204,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildKilled: "重建进程被终止",
     rebuildFailed: "重建作业被宿主注册表判定失败（没拿到进程退出码）",
     rebuildExitCode: "重建进程退出码 {exitCode}（zg 未安装/权限不足/沙箱拒绝都会走到这里）",
-    rebuildExitUnknown: "重建失败，且没有可读的进程退出码（应答的 status 无法识别）",
+    rebuildExitUnknown: "重建没有可判定的结果（应答的 status 无法识别，或缺少进程退出码）",
     rebuildMissingJobId: "启动重建失败：应答缺 jobId",
     rebuildRootNotAbsolute: "root 必须是绝对路径（以 / 开头）",
     rebuildUnavailable: "宿主没有提供工作区重建读面（未装远程服务）",
@@ -213,7 +215,6 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
   },
   en: {
     statusReadOnly: "This scope is read-only",
-    statusDirty: "Unsaved changes — press Save to apply",
     statusClean: "No unsaved changes",
     dirtyCount: "{count} changed",
     save: "Save",
@@ -235,8 +236,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     limitInvalid: "enter an integer between {min} and {max}",
     limitClamped: "clamped into the {min}-{max} range: {value}",
     endpointLabel: "HuggingFace mirror URL",
-    endpointHint:
-      "Leave empty for huggingface.co; on networks that cannot reach HF, fill a compatible mirror such as https://modelscope.cn/models (llama-cpp backends only, e.g. qwen3)",
+    endpointHint: `Leave empty for huggingface.co; on networks that cannot reach HF, fill a compatible mirror such as ${EMBEDDING_MIRROR_URL} (llama-cpp backends only, e.g. qwen3)`,
     enforceLabel: "Enforce search-first (zg_search before grep/rg)",
     enforceHint:
       "When on, grep/rg inside indexed workspaces is quota-gated: each successful zg_search unlocks the number of grep/rg calls below (valid for the window below), and the gate blocks again once it is spent or expired (better coverage and relevance)",
@@ -247,6 +247,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     windowHint:
       "Without another zg_search inside this window the whole quota expires; clear to restore the default {default} (minutes)",
     rebuildLabel: "Workspace rebuild (run after switching embedding and saving)",
+    rebuildInputPlaceholder: "absolute path to a /workspace",
     daemonReadyNote: "Daemon: ready (zg server is running).",
     daemonOfflineNote:
       "Daemon: not ready. What the daemon provides — incremental index refresh, refresh=background and the resident embedding model pool — is unavailable while it is absent; run `zg server on` in a terminal when you want it.",
@@ -266,7 +267,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildExitCode:
       "the rebuild process exited with code {exitCode} (missing zg, insufficient permissions and sandbox denials all land here)",
     rebuildExitUnknown:
-      "the rebuild failed and no process exit code is readable (the response status is unrecognized)",
+      "the rebuild has no determinable outcome (the response status is unrecognized, or its exit code is missing)",
     rebuildMissingJobId: "failed to start the rebuild: the response has no jobId",
     rebuildRootNotAbsolute: "root must be an absolute path (starting with /)",
     rebuildUnavailable: "the host does not expose the rebuild Remote API",

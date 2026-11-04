@@ -1,6 +1,6 @@
 // lib/rebuild-state.ts 的单元测试：占位的互斥、作业 id 的补写时机、释放的幂等、
 // 等待者的四种出口，以及容量上限。纯逻辑，不触宿主面。
-import { describe, it, vi } from "vitest";
+import { describe, it, vi, afterEach } from "vitest";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { getEventListeners } from "node:events";
@@ -16,6 +16,18 @@ const PKG = "/repo/pkg";
 
 /** 覆盖判据只为判路径归属，文案表在这一层是摆设（异常文本被丢弃，出界才是结论）。 */
 const { zh } = MESSAGES;
+
+/**
+ * 告警收集面：整个文件只改 `console.warn` 一次，并由 afterEach 统一还原。
+ *
+ * 原先三处用例各自 `const original = console.warn; console.warn = …` 再在 finally 里手工
+ * 还原：try 之前抛错（claim 断言失败之外的那一档）或还原语句本身被跳过时，全局就被留在
+ * 替身上，后面的用例再也收不到告警也不会红。spy 由 vitest 的生命周期负责还原。
+ */
+function collectWarnings(): { calls: () => string[] } {
+  const spy = vi.spyOn(console, "warn").mockReturnValue(undefined);
+  return { calls: () => spy.mock.calls.map((call) => String(call[0])) };
+}
 
 /** 挂在某枚 signal 上的 abort 监听数：用来钉「收尾真的把监听撤销了」。 */
 function liveAbortListeners(signal: AbortSignal): number {
@@ -122,14 +134,6 @@ describe("等待者", () => {
     assert.equal(await rebuilds.wait("/ws", zh, 5000, controller.signal), "aborted");
   });
 
-  it("不传取消信号时也能等到落定（无信号那一档不参与竞争）", async () => {
-    const rebuilds = createRebuildRegistry();
-    rebuilds.claim("/ws", "card");
-    const waiting = rebuilds.wait("/ws", zh, 5000);
-    rebuilds.release("/ws");
-    assert.equal(await waiting, "settled");
-  });
-
   it("等待途中取消", async () => {
     const rebuilds = createRebuildRegistry();
     rebuilds.claim("/ws", "card");
@@ -139,14 +143,33 @@ describe("等待者", () => {
     assert.equal(await waiting, "aborted");
   });
 
-  it("先到的出口生效后，后来者不改变结论（收尾只兑现一次）", async () => {
+  it("等待者超时之后条目才消失：新的等待按落定算，不再超时一次", async () => {
     const rebuilds = createRebuildRegistry();
     rebuilds.claim("/ws", "card");
-    // 超时先到（0ms），随后重建才落定：等待者必须停在「超时」这个结论上。
     assert.equal(await rebuilds.wait("/ws", zh, 0), "timeout");
     rebuilds.release("/ws");
-    // 再等一次：条目已消失，按约定算落定而不是又超时一次。
+    // 条目已消失 ⇒ 按约定算落定（这一条钉的是「查无覆盖条目 = settled」，不是同一个等待者）。
     assert.equal(await rebuilds.wait("/ws", zh, 0), "settled");
+  });
+
+  it("先到的出口生效后，同一个等待者不停在别的结论上（收尾只清一次）", async () => {
+    // 标题这条语义要单独钉：超时先到之后 release 才发生，等待者的结论不许被后来者改判，
+    // 且收尾只清一次——监听与定时器都得撤销（宿主常驻，没撤销的那一档按调用次数累积）。
+    vi.useFakeTimers();
+    try {
+      const rebuilds = createRebuildRegistry();
+      rebuilds.claim("/ws", "card");
+      const controller = new AbortController();
+      const waiting = rebuilds.wait("/ws", zh, 1000, controller.signal);
+      assert.equal(liveAbortListeners(controller.signal), 1, "等待期间监听该挂在 signal 上");
+      await vi.advanceTimersToNextTimerAsync();
+      rebuilds.release("/ws");
+      assert.equal(await waiting, "timeout", "先来的是超时，后来的 release 不得改判");
+      assert.equal(liveAbortListeners(controller.signal), 0, "收尾必须成对撤销 abort 监听");
+      assert.equal(vi.getTimerCount(), 0, "收尾必须 clearTimeout");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("多个等待者都被同一次释放唤醒", async () => {
@@ -226,8 +249,12 @@ describe("等待者的收尾（不留监听与悬挂定时器）", () => {
 describe("覆盖判据（covering）", () => {
   it("精确键命中：active 与 covering 对同一根给同一条", () => {
     const rebuilds = createRebuildRegistry();
-    rebuilds.claim(REPO, "card");
-    assert.equal(rebuilds.covering(REPO, zh), rebuilds.active("/repo"));
+    // 基准必须是 claim 交回的那枚条目：两侧都从注册表读的话，占位一旦回归成 no-op，
+    // covering 与 active 会同时给出 undefined，这条判据反而恒绿。
+    const entry = rebuilds.claim(REPO, "card");
+    assert.ok(entry !== null, "claim 应当登记条目");
+    assert.equal(rebuilds.covering(REPO, zh), entry);
+    assert.equal(rebuilds.active(REPO), entry);
   });
 
   it("祖先根在重建 → 子目录查询命中（这正是门禁等得到、等待等不到的那个缺口）", () => {
@@ -367,13 +394,13 @@ describe("覆盖判据（covering）", () => {
 });
 
 describe("容量阈值", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("超过阈值只报警、不淘汰：在途的一条被挤掉会让同根起第二条 zg", () => {
-    const warned: string[] = [];
-    const original = console.warn;
-    console.warn = (message?: unknown): void => {
-      warned.push(String(message));
-    };
-    try {
+    const warnings = collectWarnings();
+    {
       const rebuilds = createRebuildRegistry({ maxTracked: 2 });
       // A 刚 claim、还在起进程（jobId 仍是 undefined）：这正是旧实现会淘汰的那一档。
       const a = rebuilds.claim("/a", "card");
@@ -387,18 +414,19 @@ describe("容量阈值", () => {
       assert.equal(rebuilds.active("/a"), a);
       // 同根仍然互斥：旧实现把它淘汰掉之后这里会成功。
       assert.equal(rebuilds.claim("/a", "tool"), null);
-    } finally {
-      console.warn = original;
     }
-    assert.equal(warned.filter((line) => line.includes("活跃重建表")).length, 1, "只报一次");
-    assert.match(warned.join("\n"), /超过阈值 2/u);
+    assert.equal(
+      warnings.calls().filter((line) => line.includes("活跃重建表")).length,
+      1,
+      "只报一次",
+    );
+    assert.match(warnings.calls().join("\n"), /超过阈值 2/u);
   });
 
   it("在途占位的等待者不会被超限误唤醒（淘汰会把它兑现成「已落定」）", async () => {
     // 这一跑也会越过阈值：告警本身不是被测对象，屏蔽掉以免 stderr 横幅进噪点表。
-    const original = console.warn;
-    console.warn = (): void => undefined;
-    try {
+    collectWarnings();
+    {
       const rebuilds = createRebuildRegistry({ maxTracked: 1 });
       rebuilds.claim("/repo", "card");
       const waiting = rebuilds.wait("/repo", zh, 60_000);
@@ -410,34 +438,29 @@ describe("容量阈值", () => {
       // 真释放才唤醒。
       rebuilds.release("/repo");
       assert.equal(await waiting, "settled");
-    } finally {
-      console.warn = original;
     }
   });
 
-  it("回落到阈值以下才重新武装告警（不在每次 claim 时刷屏）", () => {
-    const warned: string[] = [];
-    const original = console.warn;
-    console.warn = (message?: unknown): void => {
-      warned.push(String(message));
-    };
-    try {
+  // #255：实现里的重新武装条件是 `entries.size <= maxTracked`，即**等于阈值就算回落**，
+  // 不是「掉到阈值以下」。标题按实现说，免得读者拿 `<` 去核对代码。
+  it("回落到阈值以内（含等于阈值）才重新武装告警（不在每次 claim 时刷屏）", () => {
+    const warnings = collectWarnings();
+    {
       const rebuilds = createRebuildRegistry({ maxTracked: 1 });
       rebuilds.claim("/a", "card");
       rebuilds.claim("/b", "card");
       rebuilds.claim("/c", "card");
       // 仍在阈值之上：不再重复报。
       rebuilds.claim("/d", "card");
-      assert.equal(warned.length, 1);
-      // 回落到阈值以内之后再越阈，应该再报一次。
+      assert.equal(warnings.calls().length, 1);
+      // 只释放到「等于阈值」（1 条 /a 留下）就该重新武装：下一越阈再报一次。
       rebuilds.release("/b");
       rebuilds.release("/c");
       rebuilds.release("/d");
+      assert.equal(rebuilds.keys().length, 1, "回落这一步必须停在等于阈值");
       rebuilds.claim("/e", "card");
       rebuilds.claim("/f", "card");
-      assert.equal(warned.length, 2);
-    } finally {
-      console.warn = original;
+      assert.equal(warnings.calls().length, 2);
     }
   });
 });

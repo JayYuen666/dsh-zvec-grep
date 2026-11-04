@@ -10,8 +10,8 @@ coverage/
 *.pem
 *.key
 *.log
-dist/
-build/
+/dist/
+/build/
 
 # 统一构建件的原子落盘草稿目录（shared/lib/build-artifacts 的 writeArtifact）。
 /.tmp/

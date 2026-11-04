@@ -10,8 +10,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   startHost,
@@ -19,58 +18,48 @@ import {
   inOrder,
   zgAvailable,
   TEST_EMBEDDING,
+  drainCleanups,
+  makeTempDir,
 } from "./host-stack.ts";
-
-const cleanups: (() => void)[] = [];
+import type { Cleanups } from "./host-stack.ts";
+import { embeddingCached } from "../embedding-cache.ts";
 
 /** 门禁拦截时回给模型的动作（断言里多次出现，抽成常量）。 */
 const GREP_COMMAND = "grep -rn authService .";
+/** 本用例自己递给 `grepBudgetPerSearch` 的额度；轮次由它生成，不跟包里的默认值走。 */
+const GREP_BUDGET = 3;
 /** 被问的工具名（这组用例全部问它）。 */
 const ASKED_TOOL = "zg_status";
 /** 用户点了「允许一次」（每条都装一枚一自主实例）。 */
 const ALLOW_ONCE = "allowed-once";
 
-/** 索引是否可能离线建起来（决定 search-first 那组用例跑不跑）。 */
-function indexable(): boolean {
-  const models = path.join(homedir(), ".zvec-grep", "models");
-  return (
-    existsSync(path.join(models, "hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf")) ||
-    existsSync(path.join(models, "model2vec", "minishlab--potion-code-16M-v2"))
-  );
-}
-
-/** 建一个带源文件的临时工作区，并登记清理。 */
-function workspace(): string {
-  const dir = mkdtempSync(path.join(tmpdir(), "zg-guard-"));
+/** 建一个带源文件的临时工作区，登记进调用方那条 describe 名下。 */
+function workspace(cleanups: Cleanups): string {
+  const dir = makeTempDir(cleanups, "zg-guard-");
   writeFileSync(path.join(dir, "auth.ts"), "export function authService() { return 1; }\n");
-  cleanups.push(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
   return dir;
 }
 
 /** 一棵树：root 与其子目录 pkg（会话开在子目录、模型要检索上层）。 */
-function tree(): { root: string; pkg: string } {
-  const root = workspace();
+function tree(cleanups: Cleanups): { root: string; pkg: string } {
+  const root = workspace(cleanups);
   const pkg = path.join(root, "pkg");
   mkdirSync(pkg, { recursive: true });
-  cleanups.push(() => {
-    rmSync(pkg, { recursive: true, force: true });
-  });
+  // pkg 不单独登记：root 那条清理是递归的，同一次删除里已经带上它。
   return { root, pkg };
 }
 
 describe.skipIf(!zgAvailable())("真实宿主：安全兜底 guard 被官方管线当成拒绝", () => {
+  const cleanups: Cleanups = [];
+
   afterAll(() => {
-    for (const cleanup of cleanups.splice(0).toReversed()) {
-      cleanup();
-    }
+    drainCleanups(cleanups);
   });
 
   it("zg_index 少 confirm=true 被拒，理由是本包那一句（不是框架的通用错）", async () => {
     const host = await startHost();
     registerDummyTools(host, ["bash"]);
-    const ws = workspace();
+    const ws = workspace(cleanups);
     try {
       const outcome = await host.call("zg_index", {}, host.agentOf(ws));
       assert.ok(outcome.isError);
@@ -87,7 +76,7 @@ describe.skipIf(!zgAvailable())("真实宿主：安全兜底 guard 被官方管�
   it("root 非法（相对路径）同样在 guard 就被拒", async () => {
     const host = await startHost();
     registerDummyTools(host, ["bash"]);
-    const ws = workspace();
+    const ws = workspace(cleanups);
     try {
       const outcome = await host.call(ASKED_TOOL, { root: "relative/path" }, host.agentOf(ws));
       assert.ok(outcome.isError);
@@ -100,7 +89,7 @@ describe.skipIf(!zgAvailable())("真实宿主：安全兜底 guard 被官方管�
   it("别的工具一律放行（guard 只拦 zg_*）", async () => {
     const host = await startHost();
     registerDummyTools(host, ["bash"]);
-    const ws = workspace();
+    const ws = workspace(cleanups);
     try {
       const outcome = await host.call("bash", { command: "ls -la" }, host.agentOf(ws));
       assert.ok(!outcome.isError, host.textOf(outcome));
@@ -111,13 +100,21 @@ describe.skipIf(!zgAvailable())("真实宿主：安全兜底 guard 被官方管�
   }, 60_000);
 });
 
-describe.skipIf(!zgAvailable() || !indexable())(
+describe.skipIf(!zgAvailable() || !embeddingCached(TEST_EMBEDDING))(
   "真实宿主：search-first 门禁在真实调用序下放行/拦截",
   () => {
+    const cleanups: Cleanups = [];
+
+    afterAll(() => {
+      drainCleanups(cleanups);
+    });
+
     it("索引在时 grep 先被拦 → 成功 zg_search 发配额 → 放行 → 配额耗尽再拦", async () => {
-      const host = await startHost({ config: { defaultEmbedding: TEST_EMBEDDING } });
+      const host = await startHost({
+        config: { defaultEmbedding: TEST_EMBEDDING, grepBudgetPerSearch: GREP_BUDGET },
+      });
       registerDummyTools(host, ["bash", "grep"]);
-      const ws = workspace();
+      const ws = workspace(cleanups);
       try {
         const agent = host.agentOf(ws);
         const built = await host.call("zg_index", { confirm: true }, agent);
@@ -128,14 +125,17 @@ describe.skipIf(!zgAvailable() || !indexable())(
         assert.ok(blocked.isError);
         expect(host.textOf(blocked)).toContain("zg_search");
 
-        // 一次成功的语义检索发一次配额（默认 3 次）。
+        // 一次成功的语义检索发一轮配额（本轮是 GREP_BUDGET）。
         const search = await host.call("zg_search", { query: "authService" }, agent);
         assert.ok(!search.isError, host.textOf(search));
         expect(host.textOf(search)).toContain("命中摘要");
 
-        // 额度是 grepBudgetPerSearch（默认 3）：一次花掉一额，每额都放行。
+        // 额度就是上面传进去的那一枚：一次花掉一额，每额都放行，多一轮少一轮都由它生成。
         const rounds = await inOrder(
-          [0, 1, 2].map(() => () => host.call("bash", { command: GREP_COMMAND }, agent)),
+          Array.from(
+            { length: GREP_BUDGET },
+            () => () => host.call("bash", { command: GREP_COMMAND }, agent),
+          ),
         );
         for (const allowed of rounds) {
           assert.ok(!allowed.isError, host.textOf(allowed));
@@ -158,7 +158,7 @@ describe.skipIf(!zgAvailable() || !indexable())(
         config: { enforceSearchFirst: false, defaultEmbedding: TEST_EMBEDDING },
       });
       registerDummyTools(host, ["bash"]);
-      const ws = workspace();
+      const ws = workspace(cleanups);
       try {
         const agent = host.agentOf(ws);
         const built = await host.call("zg_index", { confirm: true }, agent);
@@ -176,7 +176,7 @@ describe.skipIf(!zgAvailable() || !indexable())(
         config: { defaultEmbedding: TEST_EMBEDDING },
       });
       registerDummyTools(host, ["bash"]);
-      const ws = workspace();
+      const ws = workspace(cleanups);
       try {
         const agent = host.agentOf(ws);
         const built = await host.call("zg_index", { confirm: true }, agent);
@@ -202,8 +202,14 @@ describe.skipIf(!zgAvailable() || !indexable())(
 describe.skipIf(!zgAvailable())(
   "真实宿主：显式 root 的官方用户确认（pre-execute → approval）",
   () => {
+    const cleanups: Cleanups = [];
+
+    afterAll(() => {
+      drainCleanups(cleanups);
+    });
+
     it("开关打开时，祖先工作区要被问一次；用户允许一次即放行并照常执行", async () => {
-      const { root, pkg } = tree();
+      const { root, pkg } = tree(cleanups);
       const host = await startHost({ requireApprovalForExplicitRoot: true, approval: true });
       const asked = host.patchApproval(ALLOW_ONCE);
       try {
@@ -211,9 +217,14 @@ describe.skipIf(!zgAvailable())(
         assert.ok(!outcome.isError, host.textOf(outcome));
         // 真的问过一次，问的是这个 root（不是别的调用）。
         expect(asked).toHaveLength(1);
-        const request = asked[0] as { toolName: string; reason: string };
+        const [request] = asked;
+        assert.ok(request !== undefined, "审批桩应记下那一次询问");
         expect(request.toolName).toBe(ASKED_TOOL);
-        expect(request.reason).toContain(root);
+        // 官方形状里 reason 是可选的一位（ApprovalRequestEvent），不先收窄就拿它做子串断言，
+        // 红了只会得到一句 received must be a string。
+        const { reason } = request;
+        assert.equal(typeof reason, "string", `询问理由应是字符串，实际 ${String(reason)}`);
+        expect(reason).toContain(root);
         // 执行期回显的是真 zg 的状态报告（说明放行后真的跑了命令）。
         expect(host.textOf(outcome)).toContain("Workspace index is not configured");
       } finally {
@@ -222,7 +233,7 @@ describe.skipIf(!zgAvailable())(
     }, 60_000);
 
     it("同意一次之后同一个 root 不再被问（它已由那次成功执行登记进白名单）", async () => {
-      const { root, pkg } = tree();
+      const { root, pkg } = tree(cleanups);
       const host = await startHost({ requireApprovalForExplicitRoot: true, approval: true });
       const asked = host.patchApproval(ALLOW_ONCE);
       try {
@@ -239,7 +250,7 @@ describe.skipIf(!zgAvailable())(
     }, 60_000);
 
     it("用户拒绝时确定性失败，且拒绝不把那个 root 记进白名单", async () => {
-      const { root, pkg } = tree();
+      const { root, pkg } = tree(cleanups);
       const host = await startHost({ requireApprovalForExplicitRoot: true, approval: true });
       const asked = host.patchApproval("rejected");
       try {
@@ -255,7 +266,7 @@ describe.skipIf(!zgAvailable())(
     }, 60_000);
 
     it("宿主没装 approval：ask 由官方 fail-closed 成拒绝，理由是本包那一句", async () => {
-      const { root, pkg } = tree();
+      const { root, pkg } = tree(cleanups);
       const host = await startHost({ requireApprovalForExplicitRoot: true });
       try {
         const outcome = await host.call(ASKED_TOOL, { root }, host.agentOf(pkg));
@@ -268,7 +279,7 @@ describe.skipIf(!zgAvailable())(
     }, 60_000);
 
     it("审批通道不可用（unavailable）同样是拒绝，不是放行", async () => {
-      const { root, pkg } = tree();
+      const { root, pkg } = tree(cleanups);
       const host = await startHost({ requireApprovalForExplicitRoot: true, approval: true });
       const asked = host.patchApproval("unavailable");
       try {
@@ -282,9 +293,10 @@ describe.skipIf(!zgAvailable())(
     }, 60_000);
 
     it("开关关着（默认）时不问：授权判据照旧，该放行的放行、该拒的拒", async () => {
-      const { root, pkg } = tree();
-      const stranger = workspace();
-      const host = await startHost();
+      const { root, pkg } = tree(cleanups);
+      const stranger = workspace(cleanups);
+      // 装服务才谈得上「一次都没问」：没有 approval 时那份名册根本无从记录。
+      const host = await startHost({ approval: true });
       const asked = host.patchApproval(ALLOW_ONCE);
       try {
         // 相关 ⇒ 直接放行，且没有被问。
@@ -301,7 +313,7 @@ describe.skipIf(!zgAvailable())(
     }, 60_000);
 
     it("自己的会话工作区不必问（首次调用就被问会是纯打扰）", async () => {
-      const ws = workspace();
+      const ws = workspace(cleanups);
       const host = await startHost({ requireApprovalForExplicitRoot: true, approval: true });
       const asked = host.patchApproval(ALLOW_ONCE);
       try {

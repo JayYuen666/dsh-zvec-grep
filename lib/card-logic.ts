@@ -46,10 +46,13 @@ export type CardTextKey =
  * `undefined` 是**必要**的一臂，不是兜底：旧版 host 的应答里没有 `serverReady` 这个字段，
  * 而「应答里没写」与「写了未就绪」是两件事——把前者显示成后者，卡片就在用户眼前谎称了一次
  * 「没有守护进程」。判据收在可单测的这一层，client 只负责渲染它选出来的那一行。
+ *
+ * 入参写 `unknown` 而不是 `boolean | undefined`：应答里的这一位只有类型声明、没有运行时校验
+ * （lib/rebuild-shape.ts），把形状收紧在声明上等于假定畸形值不会出现，而这里的严格判等正是
+ * 为了不让 `null` / `"false"` / `0` 这类值被 falsy 判断误收成「未就绪」。调用方交来的仍是
+ * `boolean | undefined`，收紧的一侧由它自己保证。
  */
-export function daemonNoteKey(
-  ready: boolean | undefined,
-): "daemonReadyNote" | "daemonOfflineNote" | undefined {
+export function daemonNoteKey(ready: unknown): "daemonReadyNote" | "daemonOfflineNote" | undefined {
   let key: "daemonReadyNote" | "daemonOfflineNote" | undefined;
   if (ready === true) {
     key = "daemonReadyNote";
@@ -294,7 +297,7 @@ const REBUILD_POLL_SCHEMA = z.object({
  *  - `stopping`：取消已发出、进程还没收完 ⇒ 仍在跑，绝不能渲染成失败；
  *  - `failed`：注册表侧判定失败（生产者的 done 被拒、或收尾抛错），此时没有退出码可读。
  */
-export function parseRebuildPoll(body: Record<string, unknown>, t: CardText): RebuildPoll {
+export function parseRebuildPoll(body: unknown, t: CardText): RebuildPoll {
   const parsed = REBUILD_POLL_SCHEMA.safeParse(body);
   const { status, exitCode, output } = parsed.success ? parsed.data : {};
   const outputText = output ?? "";
@@ -315,8 +318,9 @@ export function parseRebuildPoll(body: Record<string, unknown>, t: CardText): Re
   } else if (typeof exitCode === "number" && Number.isFinite(exitCode)) {
     reason = t("rebuildExitCode", { exitCode });
   } else {
-    // status 是旧 host/畸形应答里的未知词（或缺席）且没有可读的退出码：拼
-    // 「退出码 undefined」这类文案只会误导排查，回落到通用失败文案。
+    // 走到这里的两种成因：status 是旧 host/畸形应答里的未知词（或缺席），
+    // 以及 status 认得（如 completed）但退出码缺席/畸形。共同点是"拿不到可判定的结果"，
+    // 所以只说这一句 —— 拼「退出码 undefined」或断言"status 无法识别"都会指错排查方向。
     reason = t("rebuildExitUnknown");
   }
   return { phase: "error", output: outputText.length > 0 ? `${reason}\n${outputText}` : reason };

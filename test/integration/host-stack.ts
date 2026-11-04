@@ -37,6 +37,7 @@ import {
 } from "@deepseek-ai/dsh-tool-executor-native";
 import { ToolCallId as brandToolCallId } from "@deepseek-ai/dsh-llm/brand";
 import { ApprovalService } from "@deepseek-ai/dsh-user-approval";
+import type { ApprovalRequestEvent } from "@deepseek-ai/dsh-user-approval/types";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
 import { LocalSubprocessRuntime } from "@deepseek-ai/dsh-subprocess-local";
 import { LocalBashExecutor } from "@deepseek-ai/dsh-bash-local";
@@ -102,6 +103,33 @@ function textOf(outcome: ToolOutcome): string {
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text ?? "")
     .join("\n");
+}
+
+/**
+ * 一条 describe 名下的清理登记。
+ *
+ * 按 describe 拆而不是全文件共享一份数组：`afterAll` 必须写在 describe 里（本仓 lint 的
+ * `vitest/require-top-level-describe` 报 "All hooks must be wrapped in a describe block"），
+ * 而它跑在该 describe 结束的那一刻（实测：第一组登记的数组长度为 1，第二组建完后仍读到 1，
+ * 即第一组的 `splice(0)` 已经跑完）。于是一条共享数组配上单条 afterAll 时，后面那些
+ * describe 登记的目录没有人收——本机 `zg-guard-*` 就是这样攒到几千份。
+ */
+export type Cleanups = (() => void)[];
+
+/** 建一枚临时目录并登记到指定 describe 名下。 */
+export function makeTempDir(cleanups: Cleanups, prefix: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  cleanups.push(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return dir;
+}
+
+/** 收一条 describe 名下的登记（后建的先拆）。 */
+export function drainCleanups(cleanups: Cleanups): void {
+  for (const cleanup of cleanups.splice(0).toReversed()) {
+    cleanup();
+  }
 }
 
 /** 起一台真实宿主。所有服务都是官方件；只有 settings 是上面的最小替身。 */
@@ -260,16 +288,23 @@ export async function startHost(
       controller.abort();
     }
   };
-  const patchApproval = (outcome: "allowed-once" | "rejected" | "unavailable"): unknown[] => {
-    const asked: unknown[] = [];
+  const patchApproval = (
+    outcome: "allowed-once" | "rejected" | "unavailable",
+  ): ApprovalRequestEvent[] => {
+    const asked: ApprovalRequestEvent[] = [];
     const service = (
-      ctx as unknown as { approval?: { request: (request: unknown) => Promise<unknown> } }
+      ctx as unknown as {
+        approval?: { request: (request: ApprovalRequestEvent) => Promise<unknown> };
+      }
     ).approval;
     if (service === undefined) {
-      return asked;
+      // 不装 approval 时静默返回一份空名册，会让 `expect(asked).toStrictEqual([])` 恒成立——
+      // 那条断言想钉的是「一次都没问」，而它当时连问没问都读不到。这里直接抛，
+      // 要求调用方把服务装起来（`startHost({ approval: true })`）。
+      throw new Error("宿主没装 approval：patchApproval 无从记录「有没有被问」");
     }
     const ownRequest = service.request;
-    service.request = async (request: unknown) => {
+    service.request = async (request: ApprovalRequestEvent) => {
       asked.push(request);
       return outcome;
     };
@@ -319,7 +354,7 @@ export interface Host {
   agentOf: (cwd: string, id?: string) => BatchAgent;
   call: (name: string, args: unknown, agent?: BatchAgent) => Promise<ToolOutcome>;
   textOf: (outcome: ToolOutcome) => string;
-  patchApproval: (outcome: "allowed-once" | "rejected" | "unavailable") => unknown[];
+  patchApproval: (outcome: "allowed-once" | "rejected" | "unavailable") => ApprovalRequestEvent[];
   /** 只卸载本插件（模拟宿主重载那一行）；在册的调用信号随之 abort，不等同于 dispose 整台宿主。 */
   unload: () => Promise<void>;
   dispose: () => Promise<void>;
@@ -348,6 +383,13 @@ export function canMakeUnreadableFile(): boolean {
   }
   return !(typeof process.getuid === "function" && process.getuid() === 0);
 }
+
+/**
+ * 本包的 root 判据只认以 `/` 开头的 POSIX 绝对路径（lib/cli.ts 的 assertAbsoluteRoot）；
+ * win32 的 os.tmpdir() 交回盘符形态（`C:\...`），凡是要在盘上造真实工作区 root 的用例
+ * 一律按它跳过——跳过的是「Windows 宿主不在支持面」这条已知边界，不是给用例打洞。
+ */
+export const realRootUnavailable = process.platform === "win32";
 
 /**
  * 真 zg CLI 在不在 PATH 上。真宿主（integration）与端到端（e2e）两层要**真 spawn** zg（不是
@@ -426,12 +468,6 @@ export function registerDummyTools(host: Host, names: readonly string[]): void {
 }
 
 /**
- * 一枚**假 zg**（真进程、真 spawn、可真杀），用来把后台重建的生命周期钉成确定性事实：
- * 真 zg 的时长取决于模型加载与文件数，测不出「卸载时进程被收掉」与「超时杀进程」这两条。
- * 它按 zg 的命令面回应（`--version` / `index` / `status`），时长由 `ms` 调，pid 落地到
- * `pidFile` 供测试断言进程真的死了。
- */
-/**
  * 把一段 node 脚本装成临时目录里的假 zg，并把该目录前置到 PATH；返回卸载函数。
  *
  * **PATH 必须用 path.delimiter 拼**：CI 矩阵含 windows-latest（.github/workflows/ci.yml 的
@@ -460,29 +496,70 @@ function installFakeBin(script: string): { cleanup: () => void } {
   };
 }
 
+/**
+ * 一枚**假 zg**（真进程、真 spawn、可真杀），用来把后台重建的生命周期钉成确定性事实：
+ * 真 zg 的时长取决于模型加载与文件数，测不出「卸载时进程被收掉」与「超时杀进程」这两条。
+ * 它按 zg 的命令面回应（`--version` / `index` / 其余），时长由 `ms` 调，重建进程的 pid 落地到
+ * `pidFile` 供测试断言进程真的死了。
+ *
+ * 其余命令在**同根重建还活着**时按真 zg 的形状失败（非零退出 + `Code: …LOCK.BUSY` + 明细点名
+ * `ownerOperation: index.rebuild`），空闲时才回一句未配置并 0 退出。少了这一支，检索那条
+ * 「等重建落定后重试」的路径在假件上根本不会被走到：假件对任何命令都 0 退出，删掉等待臂
+ * 也照样绿。
+ */
 export function installFakeZg(options: { ms?: number; pidFile: string }): () => void {
   const script = `#!/usr/bin/env node
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 const argv = process.argv.slice(2);
 if (argv.includes("--version")) {
   process.stdout.write("0.2.2\\n");
   process.exit(0);
 }
-writeFileSync(${JSON.stringify(options.pidFile)}, String(process.pid));
+const pidFile = ${JSON.stringify(options.pidFile)};
+// 名册里那枚 pid 只由重建进程写：它是「同根有没有一次重建在跑」的凭据，被别条命令覆盖就
+// 等于把锁的主人名册掉了。自然结束时收掉，否则后面的进程号可能落在一个已被回收的 pid 上。
+const liveOwnerPid = () => {
+  if (!existsSync(pidFile)) {
+    return 0;
+  }
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return 0;
+  }
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return 0;
+  }
+};
 const ms = Number(process.env.ZG_FAKE_MS ?? ${String(options.ms ?? 400)});
 const step = Math.max(20, Math.floor(ms / 4));
 const started = Date.now();
 if (argv[0] === "index") {
+  writeFileSync(pidFile, String(process.pid));
   process.stderr.write("Scanning files...\\n");
   process.stderr.write("Preparing local/potion-code-16m-v2\\n");
   const pump = setInterval(() => {
     if (Date.now() - started >= ms) {
       clearInterval(pump);
+      rmSync(pidFile, { force: true });
       process.stdout.write("files\\t2 scanned, 2 added\\n");
       process.stderr.write("Indexing complete\\n");
       process.exit(0);
     }
   }, step);
+} else if (liveOwnerPid() !== 0) {
+  // 同根有重建在跑 ⇒ 按真 zg 的实测失败形状回：非零退出 + Error/Code/Details 三段，
+  // 明细点名占锁方的操作名（rebuild 与别的占用者由本包的分类器分开判）。
+  const owner = liveOwnerPid();
+  process.stderr.write("Error: the workspace index is locked by another operation\\n");
+  process.stderr.write("Code: ZVEC_GREP.ENGINE.LOCK.BUSY\\n");
+  process.stderr.write("Details:\\n");
+  process.stderr.write("  ownerOperation: index.rebuild\\n");
+  process.stderr.write("  ownerPid: " + String(owner) + "\\n");
+  process.stderr.write("  lock: " + pidFile + ".lock\\n");
+  process.exit(1);
 } else {
   process.stdout.write("? Workspace index is not configured\\n");
   process.exit(0);
@@ -503,6 +580,13 @@ if (argv[0] === "index") {
 }
 
 /**
+ * 假 zg 倒环境时用的那两位：被读的宿主环境变量名，与写进 dump 文件的字段名。
+ * 测试侧读它也从这里取 —— 改了键名只会让断言拿到一条看不出原因的 null。
+ */
+export const DUMP_ENV_KEY_NAME = "ZG_TEST_EMBED_KEY";
+export const DUMP_SECRET_FIELD = "SECRET_NAME";
+
+/**
  * 一枚只把子进程环境倒到文件的**假 zg**：验证本包经环境变量下发的那三项（HF 镜像 / 远程
  * 端点 / 凭据）真的到得了 zg 子进程。特别是凭据：官方 subprocess 层会把名字命中
  * /KEY|PASSWORD|SECRET|TOKEN/i 的继承变量刷掉（scrubbedParentEnv），所以密钥必须由插件
@@ -515,7 +599,7 @@ writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({
   HF_ENDPOINT: process.env.HF_ENDPOINT ?? null,
   ZVEC_GREP_ENDPOINT: process.env.ZVEC_GREP_ENDPOINT ?? null,
   ZVEC_GREP_API_KEY: process.env.ZVEC_GREP_API_KEY ?? null,
-  SECRET_NAME: process.env.ZG_TEST_EMBED_KEY ?? null,
+  ${JSON.stringify(DUMP_SECRET_FIELD)}: process.env[${JSON.stringify(DUMP_ENV_KEY_NAME)}] ?? null,
   TERM: process.env.TERM ?? null,
 }));
 process.stdout.write("0.2.2\\n");

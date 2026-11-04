@@ -11,7 +11,7 @@
 // test/build-host.test.ts 那几条「依赖必须外部化」的断言正是靠检索这些字符串来判的——
 // 省下体积的代价是废掉两道真门禁，不划算。
 import { strict as assert } from "node:assert";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "vitest";
 
@@ -24,17 +24,35 @@ const HOST_BUDGET_BYTES = 240_000;
 // client.js（实测增加约 9 KB），预算按迁移后的实量重定。
 const CLIENT_BUDGET_BYTES = 80_000;
 
-/** 产物文件名与预算的对照。 */
-const BUDGETS: readonly (readonly [string, number])[] = [
-  ["host.js", HOST_BUDGET_BYTES],
-  ["client.js", CLIENT_BUDGET_BYTES],
+/** 下限：闸门只管「别超」时，构建异常只写出空文件或残片会让 `bytes <= budget` 恒真。
+ *  取值远低于当期实测（host.js 227,142 B / client.js 65,390 B），正常演进不会撞到；
+ *  撞到它就说明产物不是「变快了」而是「变没了」。 */
+const HOST_FLOOR_BYTES = 120_000;
+const CLIENT_FLOOR_BYTES = 40_000;
+
+/** 产物文件名与「下限 / 上限」的对照。 */
+const BUDGETS: readonly (readonly [string, number, number])[] = [
+  ["host.js", HOST_FLOOR_BYTES, HOST_BUDGET_BYTES],
+  ["client.js", CLIENT_FLOOR_BYTES, CLIENT_BUDGET_BYTES],
 ];
 
 describe("产物体积", () => {
   // 用 it.each 而不是手写循环：两条预算断言形状完全相同，手写循环多一层缩进，且新增一条
   // 预算时容易忘了把它塞进某个数组的某个分支里。
-  it.each(BUDGETS)("%s 不超过 %s 字节预算", (file, budget) => {
-    const bytes = readFileSync(path.join(pkgDir, file)).byteLength;
+  it.each(BUDGETS)("%s 体积落在 %s–%s 字节之间", (file, floor, budget) => {
+    const target = path.join(pkgDir, file);
+    // 先认「在不在」：缺产物时报的是这条门禁的话，而不是裸 ENOENT 堆栈 ——
+    // 后者分不清「没构建」与「构建坏了」，而这两种的下一步动作完全不同。
+    assert.ok(
+      existsSync(target),
+      `${file} 不在包根：这道门比的是已构建产物，先跑本仓的 build（见 README 的开发口径）。`,
+    );
+    const bytes = readFileSync(target).byteLength;
+    assert.ok(
+      bytes >= floor,
+      `${file} 实测 ${bytes.toLocaleString("en-US")} B，低于下限 ` +
+        `${floor.toLocaleString("en-US")} B：产物像是被截断或只剩残片，先确认 build 跑完了。`,
+    );
     assert.ok(
       bytes <= budget,
       `${file} 实测 ${bytes.toLocaleString("en-US")} B，超出预算 ` +

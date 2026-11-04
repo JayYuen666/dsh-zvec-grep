@@ -1,6 +1,29 @@
 # Changelog
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
+
+## 0.1.11
+
+这一版补上 search-first 门禁对命令替换与壳层包装的识别，给索引探测加显式失效通道，把状态读面按部署形态收口，并让发布链与产物门禁各自多一道判据；宿主开发基线抬到 `0.2.2-alpha.3`，支持窗口改为 `^0.2.1-rc.5 || ^0.2.2-alpha.3`。
+
+### Changed
+
+- **宿主与元数据**：devDependencies / catalog / overrides 全量抬到 `0.2.2-alpha.3`（cordis `4.0.6-alpha.2`、schemastery `3.18.6-alpha.2`）；peer 与 engines 的支持窗口改为 `^0.2.1-rc.5 || ^0.2.2-alpha.3`；shared 抬到 `0.2.3`。
+- **search-first 门禁**（`lib/search-predicates.ts`）：`$(...)` 命令替换与 `bash -c '…'` / `sh -c` / `zsh -lc` 等壳层包装里的 grep/rg 也纳入词法判据，嵌套最多两层。
+- **索引探测失效**（`host.ts`）：`zg_index` 前台落定后当场清掉该根的探测缓存，drop/重建不再等 60 秒 TTL；门禁与 `findIndexRoot` 同一拍看到新状态。
+- **状态读面**（`host.ts`、`lib/card-logic.ts`、`src/ui-messages.ts`）：`zg_status` 的守护进程注文按 `clientMode` 收口（direct 部署不再发空头承诺）；卡片就绪位只认 `true`/`false`，畸形 `status` 或缺退出码统一落到「没有可判定的结果」。
+- **构建与发布链**：`build-client` / `build-host` 直接复用 shared 的 `singleEntryChunk` 与包名同源校验；CI 与 publish 的 pnpm 补丁版本单点声明，发布 job 按 build 登记的 tarball 名/版本核对，registry 自检 URL 从 package.json 现取；产物体积门补下限，防止截断产物混过上限。action 钉版抬到 `pnpm/action-setup` v6.1.1 与 `github/codeql-action` v4.39.2。
+- **文档**：中英 README 重写搜索门禁、root 判据、卡片就绪位、随包文件与覆盖率分母；`docs/DETAIL.zh.md` 同步 `rebuildWaitMs` 默认值与冲突旗标。
+
+### Fixed
+
+- **argv 守卫**（`lib/argv-guard.ts`）：单值/数组入口对非字符串坏值单独报「字符串或字符串数组」，不再误报成「必须是字符串数组」。
+- **卡片读面**（`lib/card-logic.ts`、`src/client-entry.ts`）：`roots()` 的探测失败折成 `false`；重建输入占位与镜像地址走 locale 常量。
+- **契约门禁**：`test/schema-coverage.ts` 认正则字面量与 `as const`/`satisfies` 尾巴，避免把类型标注当成设置字段；两份 README 的 dsh 窗口与 badge 新增与 `engines.dsh` 同源的用例，`bump-manifests` 只改 package.json 时本仓会当场红。
+
+### Added
+
+- **测试夹具**：`test/cjk-residue.test.ts`（中文残留字符类的独立判据）、`test/host-freshness.test.ts`（产物新鲜度夹具的形状判据）、`test/schema-coverage-parsing.test.ts`（正则/字面量解析边界）、`test/embedding-cache.ts`（按模型定位真实缓存落点）、`test/sync-write-support.ts`（写锁用例共用支撑）。
 
 ## 0.1.10
 

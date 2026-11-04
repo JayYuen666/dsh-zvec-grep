@@ -81,7 +81,8 @@ const REBUILD_JOB_KIND = "zvec-grep-rebuild";
  * disposal, or an explicit remove"），而注册表又随宿主活着、不随本插件卸载而死 ⇒ 这条
  * 裁剪是本包的责任。
  */
-const REBUILD_HISTORY_MAX = 10;
+/** 状态查询的历史窗口：只保留最近 N 条已结束的重建（404 文案里的 {maxJobs} 取它）。 */
+export const REBUILD_HISTORY_MAX = 10;
 
 /** 卡片视图的尾部长度（打标文案在 lib/messages.ts，随语言走）。 */
 const JOB_OUT_VIEW_CHARS = 4000;
@@ -621,8 +622,11 @@ export async function spawnIndexWrite(
 /**
  * 把起来的那条进程登记进官方注册表与本包侧表，交回宿主签发的 id。
  *
- * 三种失败（注册表换人 / 同名不同命 / start 抛错）都**先把那条进程杀掉**再交回错误：
+ * 两类失败（注册表缺席 / start 或登记抛错）都**先把那条进程杀掉**再交回错误：
  * 此刻作业没进名册，没人能通过 job 工具收它，不杀就是一条孤儿 zg 占着这棵树的写锁。
+ * （没有「同 id 撞车」那一臂：jobId 由宿主签发，见 records.set 前的注释。）
+ * start 之后 get 抛错时同样先杀——但那条作业可能已登记进官方注册表，本包侧表
+ * 看不见它，要等注册表自身的 prune 兜底。
  * 同样地，本函数不释放占位——那件事由调用方做。
  * @param routes 本次注册的共享依赖（jobsOf 现读、侧表引用）
  * @param root 已过前置校验的工作区（写进侧表供卡片回显）

@@ -369,28 +369,17 @@ export interface SearchFirstDeps {
   findIndexDepth?: number;
 }
 
-/**
- * search-first 门禁（硬约束）：拦截对象为
- * - bash/pwsh：命令串里出现 grep/rg 检索调用（isGrepRgCommand），且目标未被
- *   hasExternalTarget 判定为索引根之外；
- * - 原生 grep 工具：检索目标位于索引根之内（按索引根判，理由见 buildSearchFirstReason）。
- * 会话工作区（含祖先）存在 zg 索引且当前无可用解锁额度（从未 zg_search、配额
- * 用尽或已过期）→ 拒绝并给出可行动出路。解锁额度按「会话 × 索引根」计，
- * 每次成功的 zg_search 重置为 N 次、M 分钟有效——保证语义检索频率与 grep
- * 用量成正比，而不是一次放行终身豁免。
- * 已知近似：bash 自由文本无法可靠区分模式与相对路径 token，hasExternalTarget
- * 只认明确的路径形状，`../` 形态的模式词可能被误判为外部目标而放行（漏拦，
- * 安全方向）；混合目标（如 `rg foo /repo/src /tmp/x`）整体放行。
- */
-
-/**
- * 索引根已定后的门禁裁决：无索引根 / 检索索引根之外 / 有可扣额度 → 放行
- * （undefined）；否则返回拦截文案。放行会触发 consumeGrep 副作用。
- * 两个拦截面的「之内/之外」都以**索引根**为准（不是会话工作区）：会话开在索引根的
- * 子目录时，`../sibling` 或 `/repo/other` 相对 cwd 出界、相对索引根却在界内——shell 面
- * 的 hasExternalTarget 本来就按索引根判，原生 grep 面若按 cwd 判，同样的目标会从
- * 工具面绕过门禁，两个面各说各话。
- */
+// search-first 门禁（硬约束）：拦截对象为
+// - bash/pwsh：命令串里出现 grep/rg 检索调用（isGrepRgCommand），且目标未被
+//   hasExternalTarget 判定为索引根之外；
+// - 原生 grep 工具：检索目标位于索引根之内（按索引根判，理由见 buildSearchFirstReason）。
+// 会话工作区（含祖先）存在 zg 索引且当前无可用解锁额度（从未 zg_search、配额
+// 用尽或已过期）→ 拒绝并给出可行动出路。解锁额度按「会话 × 索引根」计，
+// 每次成功的 zg_search 重置为 N 次、M 分钟有效——保证语义检索频率与 grep
+// 用量成正比，而不是一次放行终身豁免。
+// 已知近似：bash 自由文本无法可靠区分模式与相对路径 token，hasExternalTarget
+// 只认明确的路径形状，`../` 形态的模式词可能被误判为外部目标而放行（漏拦，
+// 安全方向）；混合目标（如 `rg foo /repo/src /tmp/x`）整体放行。
 
 /** 门禁一次裁决的目标面：shell 面给命令串（文本面判），原生 grep 面给检索目标（路径面判）。 */
 type SearchScope =
@@ -467,6 +456,14 @@ function gateReasonAt(
   return reason;
 }
 
+/**
+ * 索引根已定后的门禁裁决：无索引根 / 检索索引根之外 / 有可扣额度 → 放行
+ * （undefined）；否则返回拦截文案。放行会触发 consumeGrep 副作用。
+ * 两个拦截面的「之内/之外」都以**索引根**为准（不是会话工作区）：会话开在索引根的
+ * 子目录时，`../sibling` 或 `/repo/other` 相对 cwd 出界、相对索引根却在界内——shell 面
+ * 的 hasExternalTarget 本来就按索引根判，原生 grep 面若按 cwd 判，同样的目标会从
+ * 工具面绕过门禁，两个面各说各话。
+ */
 function buildSearchFirstReason(
   cwd: string,
   scope: SearchScope,

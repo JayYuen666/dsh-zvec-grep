@@ -211,7 +211,7 @@ export function createRebuildRegistry(
     }
     entries.delete(key);
     entry.settle();
-    // 回落到阈值以下就重新武装告警：下一次真越阈值还要再报一次。
+    // 回落到阈值以内（等于阈值也算）就重新武装告警：下一次真越阈值还要再报一次。
     if (entries.size <= maxTracked) {
       crowded = false;
     }

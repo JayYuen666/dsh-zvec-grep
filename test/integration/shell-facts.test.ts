@@ -7,16 +7,26 @@ import { describe, it, expect, afterAll } from "vitest";
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { startHost, installEnvDumpZg, zgAvailable, TEST_EMBEDDING } from "./host-stack.ts";
+import {
+  startHost,
+  installEnvDumpZg,
+  zgAvailable,
+  TEST_EMBEDDING,
+  drainCleanups,
+  makeTempDir,
+  realRootUnavailable,
+  DUMP_ENV_KEY_NAME,
+  DUMP_SECRET_FIELD,
+} from "./host-stack.ts";
+import type { Cleanups, Host } from "./host-stack.ts";
+import { embeddingCached } from "../embedding-cache.ts";
 
-const cleanups: (() => void)[] = [];
-
-/** 宿主进程里装凭据的那个变量名（配置里只记名字、值现读）。 */
-const ENV_KEY_NAME = "ZG_TEST_EMBED_KEY";
-/** 密钥值（两条用例共用同一个，断言里也只引用它一次）。 */
+/** 宿主进程里装凭据的那个变量名（配置里只记名字、值现读；假件读的是同一枚）。 */
+const ENV_KEY_NAME = DUMP_ENV_KEY_NAME;
+/** 密钥值：两条用例都从这里取，断言里不再另写字面量。 */
 const FORWARDED_KEY = "sk-forwarded";
 
 /**
@@ -25,27 +35,35 @@ const FORWARDED_KEY = "sk-forwarded";
  * 这台机器编一个答案——否则没起 daemon 的开发机上这条必红，起了 daemon 的机器上又恒绿。
  * 不用同步 API：本包的 node/no-sync 只开写盘那一组。
  */
-async function daemonReady(): Promise<boolean> {
+async function daemonReady(timeoutMs = 10_000): Promise<boolean> {
   const child = spawn("zg", ["server", "status", "--check-ready"]);
   // 就绪报告是给人看的状态表，本用例只取退出码；不排空两路流，子进程会挂着不退出。
   child.stdout.resume();
   child.stderr.resume();
-  const signals: unknown[] = await once(child, "close");
-  return signals[0] === 0;
-}
-
-/** 本地 embedding 权重是否已缓存（否则 zg index 要联网下载）。 */
-function indexable(): boolean {
-  const models = path.join(homedir(), ".zvec-grep", "models");
-  return (
-    existsSync(path.join(models, "hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf")) ||
-    existsSync(path.join(models, "model2vec", "minishlab--potion-code-16M-v2"))
-  );
+  // 不用 events.once：它对 'error' 直接 reject。而「PATH 上有 zg 但不可执行」（EACCES/ENOENT）与「守护进程没起」是同一档事实——未就绪，不该红成一次抛错。
+  // 装在对象里：回调里的赋值不参与 TS 的控制流收窄，读出来仍是 boolean 而不是字面量 false。
+  const state = { failed: false };
+  child.once("error", () => {
+    state.failed = true;
+  });
+  // 守护进程挂住时 close 永不来：到点自己收，而不是等 600s 的用例超时替我们收尾。
+  const killer = setTimeout(() => {
+    child.kill("SIGKILL");
+  }, timeoutMs);
+  try {
+    const [code] = (await once(child, "close")) as [unknown, unknown];
+    return !state.failed && code === 0;
+  } catch {
+    // 'error' 会让 once 以原始错误 reject（PATH 上有 zg 但不可执行就是这一支）：归进未就绪。
+    return false;
+  } finally {
+    clearTimeout(killer);
+  }
 }
 
 /** 临时工作区。 */
-function workspace(files: Record<string, string> = {}): string {
-  const dir = mkdtempSync(path.join(tmpdir(), "zg-exec-"));
+function workspace(cleanups: Cleanups, files: Record<string, string> = {}): string {
+  const dir = makeTempDir(cleanups, "zg-exec-");
   for (const [name, body] of Object.entries({
     "auth.ts": "export function authService() { return 1; }\n",
     ...files,
@@ -54,20 +72,13 @@ function workspace(files: Record<string, string> = {}): string {
     mkdirSync(path.dirname(target), { recursive: true });
     writeFileSync(target, body);
   }
-  cleanups.push(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
   return dir;
 }
 
 /** 一枚独立的 dump 文件（假 zg 往里写子进程环境）。 */
-function dumpFile(): string {
-  const dir = mkdtempSync(path.join(tmpdir(), "zg-env-"));
-  const file = path.join(dir, "env.json");
-  cleanups.push(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-  return file;
+function dumpFile(cleanups: Cleanups): string {
+  const dir = makeTempDir(cleanups, "zg-env-");
+  return path.join(dir, "env.json");
 }
 
 /** 读回假 zg 记下的子进程环境。 */
@@ -75,28 +86,36 @@ function readEnv(file: string): Record<string, string | null> {
   return JSON.parse(readFileSync(file, "utf8")) as Record<string, string | null>;
 }
 
-describe.skipIf(!zgAvailable())("真实宿主：凭据经环境变量下发到 zg 子进程", () => {
+// 这一组全程用 installEnvDumpZg 的假件应答，与机器上装没装真 zg 无关 —— 它钉的是
+// 「密钥必须显式转发、继承面被官方层擦掉」这条安全事实，按真 zg 在场与否门控会让
+// 干净 runner 上这两条永久不执行。
+describe.skipIf(realRootUnavailable)("真实宿主：凭据经环境变量下发到 zg 子进程", () => {
+  const cleanups: Cleanups = [];
+
   afterAll(() => {
-    delete process.env["ZG_TEST_EMBED_KEY"];
-    for (const cleanup of cleanups.splice(0).toReversed()) {
-      cleanup();
-    }
+    // 赋值清空而不是 delete：本仓 lint 的 `typescript/no-dynamic-delete` 不许按计算键删属性。
+    // 空串对本包等同「没配」——lib/zg-config.ts 只转发 trim 之后非空的那一份。
+    process.env[ENV_KEY_NAME] = "";
+    drainCleanups(cleanups);
   });
 
   it("镜像端点与密钥都到了子进程，而密钥名本身被官方层擦掉", async () => {
-    const dump = dumpFile();
+    const dump = dumpFile(cleanups);
     const restore = installEnvDumpZg(dump);
     process.env[ENV_KEY_NAME] = FORWARDED_KEY;
-    const host = await startHost({
-      config: {
-        hfEndpoint: "https://mirror.example.com/models/",
-        allowRemoteEmbedding: true,
-        remoteEmbeddingEndpoint: "https://api.example.com/v1",
-        remoteEmbeddingApiKeyFrom: "ZG_TEST_EMBED_KEY",
-      },
-    });
-    const ws = workspace();
+    // startHost 也可能抛（配置校验、官方件装载）。原先它在 try 之外：抛时 try 还没进，
+    // restore 不执行 ⇒ PATH 永久留着这枚假 zg，后面每条用例的 `zg` 都落到 dump 脚本上。
+    let host: Host | undefined;
     try {
+      host = await startHost({
+        config: {
+          hfEndpoint: "https://mirror.example.com/models/",
+          allowRemoteEmbedding: true,
+          remoteEmbeddingEndpoint: "https://api.example.com/v1",
+          remoteEmbeddingApiKeyFrom: ENV_KEY_NAME,
+        },
+      });
+      const ws = workspace(cleanups);
       const outcome = await host.call("zg_status", {}, host.agentOf(ws));
       assert.ok(!outcome.isError, host.textOf(outcome));
       const env = readEnv(dump);
@@ -104,24 +123,25 @@ describe.skipIf(!zgAvailable())("真实宿主：凭据经环境变量下发到 z
       assert.equal(env["HF_ENDPOINT"], "https://mirror.example.com/models");
       assert.equal(env["ZVEC_GREP_ENDPOINT"], "https://api.example.com/v1");
       // 密钥：官方层擦掉了名字命中 /KEY/ 的继承变量，只有本包显式转发的那一份到得了子进程。
-      assert.equal(env["SECRET_NAME"], null);
-      assert.equal(env["ZVEC_GREP_API_KEY"], "sk-forwarded");
+      assert.equal(env[DUMP_SECRET_FIELD], null);
+      assert.equal(env["ZVEC_GREP_API_KEY"], FORWARDED_KEY);
       // argv 里绝不出现密钥（进程列表/作业 label 都看得见 argv）。
       const commands = host.shellCalls.map((row) => row.request.command).join("\n");
       expect(commands).not.toContain(FORWARDED_KEY);
     } finally {
       restore();
-      await host.dispose();
+      await host?.dispose();
     }
   }, 60_000);
 
   it("远程 embedding 关着（默认）时端点与密钥都不下发", async () => {
-    const dump = dumpFile();
+    const dump = dumpFile(cleanups);
     const restore = installEnvDumpZg(dump);
     process.env[ENV_KEY_NAME] = FORWARDED_KEY;
-    const host = await startHost();
-    const ws = workspace();
+    let host: Host | undefined;
     try {
+      host = await startHost();
+      const ws = workspace(cleanups);
       const outcome = await host.call("zg_status", {}, host.agentOf(ws));
       assert.ok(!outcome.isError, host.textOf(outcome));
       const env = readEnv(dump);
@@ -129,15 +149,21 @@ describe.skipIf(!zgAvailable())("真实宿主：凭据经环境变量下发到 z
       assert.equal(env["ZVEC_GREP_API_KEY"], null);
     } finally {
       restore();
-      await host.dispose();
+      await host?.dispose();
     }
   }, 60_000);
 });
 
-describe.skipIf(!zgAvailable())("真实执行器：超时口径", () => {
+describe.skipIf(realRootUnavailable || !zgAvailable())("真实执行器：超时口径", () => {
+  const cleanups: Cleanups = [];
+
+  afterAll(() => {
+    drainCleanups(cleanups);
+  });
+
   it("searchTimeoutMs=1 时官方执行器真的杀掉进程，回执说的是超时而不是退出码", async () => {
     const host = await startHost({ config: { searchTimeoutMs: 1 } });
-    const ws = workspace();
+    const ws = workspace(cleanups);
     try {
       const outcome = await host.call("zg_search", { query: "authService" }, host.agentOf(ws));
       assert.ok(outcome.isError);
@@ -154,8 +180,11 @@ describe.skipIf(!zgAvailable())("真实执行器：超时口径", () => {
 });
 
 /** 建一个真索引的工作区（本地 embedding，离线可建）。 */
-async function indexedWorkspace(files: Record<string, string>): Promise<string> {
-  const dir = workspace(files);
+async function indexedWorkspace(
+  cleanups: Cleanups,
+  files: Record<string, string>,
+): Promise<string> {
+  const dir = workspace(cleanups, files);
   const host = await startHost({
     config: { indexTimeoutMs: 300_000, defaultEmbedding: TEST_EMBEDDING },
   });
@@ -168,13 +197,13 @@ async function indexedWorkspace(files: Record<string, string>): Promise<string> 
   return dir;
 }
 
-describe.skipIf(!zgAvailable() || !indexable())(
+describe.skipIf(realRootUnavailable || !zgAvailable() || !embeddingCached(TEST_EMBEDDING))(
   "真实执行器：stdout 上限与降级提示（索引通道）",
   () => {
+    const cleanups: Cleanups = [];
+
     afterAll(() => {
-      for (const cleanup of cleanups.splice(0).toReversed()) {
-        cleanup();
-      }
+      drainCleanups(cleanups);
     });
 
     it("输出超过 stdoutMaxBytes 时截尾被打标", async () => {
@@ -187,7 +216,7 @@ describe.skipIf(!zgAvailable() || !indexable())(
         ).join("\n");
         files[`src/mod-${index}.ts`] = `${body}\nexport const v${index} = ${index};\n`;
       }
-      const ws = await indexedWorkspace(files);
+      const ws = await indexedWorkspace(cleanups, files);
       const host = await startHost({
         config: {
           stdoutMaxBytes: 20_000,
@@ -219,7 +248,7 @@ describe.skipIf(!zgAvailable() || !indexable())(
       // 旧行为是让命令照发、由 zg 静默把刷新关掉、只在 stderr 留一行
       // `warning: --refresh background requires Server mode; Direct mode uses --refresh off`。
       // 退出码照旧 0、命中照旧出——唯独「后台在刷新」是假的，而那是本包该拒的那一类。
-      const ws = await indexedWorkspace({});
+      const ws = await indexedWorkspace(cleanups, {});
       const host = await startHost({
         config: { clientMode: "direct", defaultEmbedding: TEST_EMBEDDING },
       });
@@ -248,7 +277,10 @@ describe.skipIf(!zgAvailable() || !indexable())(
       // 这一档的答案取决于这台机器上守护进程在不在，所以断言跟着真探测走，而不是替它编一个。
       // 两臂都是判据：缺席时必须拒（旧行为是静默降级成 off），就绪时才允许把 background 发出去。
       const ready = await daemonReady();
-      const ws = await indexedWorkspace({});
+      // 这条 TOCTOU 是本用例的固有形状：期望值由宿主之外的一次读决定，而宿主自己还会再读一次。
+      // 兜法是在调用之后重读一次并要求和第一次一致——不一致就直接点名「这台机器的就绪态在两次读之间变了」，
+      // 而不是让后面那组 `命令发没发出去` 的断言替它报红。
+      const ws = await indexedWorkspace(cleanups, {});
       const host = await startHost({ config: { defaultEmbedding: TEST_EMBEDDING } });
       try {
         const outcome = await host.call(
@@ -282,6 +314,12 @@ describe.skipIf(!zgAvailable() || !indexable())(
         );
         assert.ok(probe !== undefined, "这一档要读守护进程的真实就绪态");
         expect(probe.spec.workdir).toBe(tmpdir());
+        const readyAfter = await daemonReady();
+        assert.equal(
+          readyAfter,
+          ready,
+          `这台机器的守护进程就绪态在两次读之间变了（先 ${String(ready)} 后 ${String(readyAfter)}）：上面那组断言的期望值不再成立`,
+        );
       } finally {
         await host.dispose();
       }

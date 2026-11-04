@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-zvec-grep/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-zvec-grep/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D22.12-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.3-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.5-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -33,32 +33,33 @@
 
 ## <img src="https://api.iconify.design/lucide/file-text.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 目录
 
-- [它做什么](#它做什么)
-- [安装](#安装)
-  - [shared 的版本下限](#shared-的版本下限)
-- [确认它真的在工作](#确认它真的在工作)
-- [它不提供什么](#它不提供什么)
-- [在 dsh 里启用](#在-dsh-里启用)
-- [提供给模型的工具](#提供给模型的工具)
-  - [zg_search](#zg_search)
-  - [zg_index](#zg_index)
-  - [zg_status](#zg_status)
+- [ 目录](#-目录)
+- [ 它做什么](#-它做什么)
+- [ 安装](#-安装)
+  - [ shared 的版本下限](#-shared-的版本下限)
+- [ 确认它真的在工作](#-确认它真的在工作)
+- [ 它不提供什么](#-它不提供什么)
+- [ 在 dsh 里启用](#-在-dsh-里启用)
+- [ 提供给模型的工具](#-提供给模型的工具)
+  - [zg\_search](#zg_search)
+  - [zg\_index](#zg_index)
+  - [zg\_status](#zg_status)
   - [rg 开关](#rg-开关)
   - [root 判据](#root-判据)
-- [search-first 门禁](#search-first-门禁)
-- [设置项](#设置项)
+- [ search-first 门禁](#-search-first-门禁)
+- [ 设置项](#-设置项)
   - [远程 embedding](#远程-embedding)
   - [显式 root 前的确认](#显式-root-前的确认)
-- [支持面](#支持面)
-- [外部依赖](#外部依赖)
-- [守护进程](#守护进程)
-- [对外接口](#对外接口)
-- [后台作业面](#后台作业面)
-- [数据与隐私](#数据与隐私)
-- [已知边界](#已知边界)
-- [常见问题](#常见问题)
-- [开发](#开发)
-- [许可](#许可)
+- [ 支持面](#-支持面)
+- [ 外部依赖](#-外部依赖)
+- [ 守护进程](#-守护进程)
+- [ 对外接口](#-对外接口)
+- [ 后台作业面](#-后台作业面)
+- [ 数据与隐私](#-数据与隐私)
+- [ 已知边界](#-已知边界)
+- [ 常见问题](#-常见问题)
+- [ 开发](#-开发)
+- [ 许可](#-许可)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
 
@@ -77,10 +78,10 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-zvec-grep`。包在公共 npm registry 上，不需要凭据，也不需要 scoped-registry 配置行。
 
 - **Node.js `>= 22.12`**（纯 ESM；正是这个下限让 `require()` 一枚 ESM 入口成为可能，`engines.node` 因此声明）。
-- **宿主 `dsh` 在 `0.2.1-rc.3` / `0.2.2-alpha.2` 这条线上。** 宿主读 `engines.dsh`（`^0.2.1-rc.3`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.1-rc.3` 的都通过；`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时最近的三个已发布宿主版本上逐版取证，窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
-- **按契约，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.1-rc.3`），`devDependencies` 里的精确钉版才是防「第二份宿主类型面」的编译期纪律——那不是宿主会去读的声明。
+- **宿主 `dsh` 在 `0.2.1-rc.5` 或 `0.2.2-alpha.3` 这条线上。** 宿主读 `engines.dsh`（`^0.2.1-rc.5 || ^0.2.2-alpha.3`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.1-rc.5` 的都通过宿主装载门；`0.2.2` 预发布线上，npm 的严格 peer 解析从 `0.2.2-alpha.3` 起算。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **按契约，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.1-rc.5 || ^0.2.2-alpha.3`），`devDependencies` 里的精确钉版才是防「第二份宿主类型面」的编译期纪律——那不是宿主会去读的声明。
 - **值导入都是必需 peer。** `@deepseek-ai/schemastery` 是宿主 fork（只有它的 `resolve` 认 `.volatile()` 字段）；`@deepseek-ai/dsh-typert-protocol` 提供 `TypertRemoteService` 这个要 `extends` 的类；`@deepseek-ai/dsh-scope` 提供步骤准入判定用的 `scopeOf`；shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`。四者都落 peer 加同版精确钉的 devDependencies——缺一枚就是装载期 `ERR_MODULE_NOT_FOUND`，不是优雅降级。`dependencies` 里是 `@jayyuen66/dsh-plugin-shared` 与 `zod`（后者版本走伞根 catalog，供设置卡的 strict codec 校验）。
-- **随包发什么**：`host.js`、`client.js`、`cordis.patch.yml`、`icon.svg`、两份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`。产物由 `prepack` 现产，不入库。
+- **随包发什么**：`host.js`、`client.js`、`cordis.patch.yml`、`icon.svg`、两份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`locale/zh.json` + `locale/en.json`、`docs/`（两份 DETAIL）。产物由 `prepack` 现产，不入库。
 
 ### <img src="https://api.iconify.design/lucide/arrow-down-to-line.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> shared 的版本下限
 
@@ -100,7 +101,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 - **没有 CLI 子命令。** `dsh zvec-grep …` 不存在。
 - **不碰守护进程的生命周期。** `zg server on` 是用户的动作；本包只读就绪态。
 - **不依赖 ripgrep。** rg 只出现在门禁判据里。
-- **不向宿主数据目录写任何东西。** 唯一的落盘形状是被检索 root 下由 zg 写入的 `.zvec-grep/` 目录。
+- **不向宿主数据目录写任何东西。** 落盘的都是 zg 的事：检索根下的 `.zvec-grep/` 索引与清单、zg 的全局 home `~/.zvec-grep`（config / 锁 / 模型）、以及按 `hfEndpoint` 下载的 embedding 权重缓存。
 - 必需的服务面：settings / shell / tools / systemPrompt / timer（全在 `inject` 里）。宿主 `jobs` 服务可选——没有它时重建路径拒绝且不 spawn，三枚工具照常工作。
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
@@ -142,7 +143,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 ### rg 开关
 
 - `rg` 留空：工作区**及其向上各级**都没有索引时自动改走穷举匹配，并在结果前声明「这是逐行字面匹配，不是语义排序」。`rg=true` 强制；`rg=false` 拒绝改道（zg 报 `WORKSPACE_INDEX_NOT_FOUND`）。
-- 穷举检索**不发放** grep/rg 配额：它不读索引。冲突旗标（`preview` / `refresh` / `symbol-type` / `prefer-symbol` / `fuse` / `fts` / `vector`、`trace`）在构造期拒绝并列出；没有 `hits:` 计数行，命中摘要自动不出。
+- 穷举检索**不发放** grep/rg 配额：它不读索引。冲突旗标（`preview` / `refresh` / `symbol-type` / `prefer-symbol` / `fuse` / `fts` / `vector`、`trace`，以及非空 `queries`——穷举通道只认单条 `query`）在构造期拒绝并列出；没有 `hits:` 计数行，命中摘要自动不出。
 
 ### root 判据
 
@@ -203,7 +204,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 - direct 与 server 是**两种能力面**，不是快慢之分：direct 每次查询都冷加载 embedding 模型；增量刷新（watcher）、`refresh=background` 与常驻模型池只在 server 模式下存在。上游对 `auto` 只做就绪探测、不拉起 daemon。
 - 本包也不拉——`zg server on` 会留下 detached 进程与 token 文件，那是用户的决定。本包做的是把差异**显式化**：按 60 秒 TTL 缓存 `zg server status --check-ready` 的退出码（探测失败按未就绪收口，绝不外抛基础设施故障），据此收口 `refresh=background`，并在 `zg_status` 输出尾与卡片各回显一行。探测只由 `roots()` 读面发出。
-- 卡片的 `serverReady` 只可能是 `true` / `false`；探测答不出时该臂什么都不显示，而不是说成「未就绪」。想要红利就在终端里跑 `zg server on`。
+- 卡片的 `serverReady` 在卡片层只可能是 `true` / `false`——探测失败按未就绪收口，就绪行恒渲染。`undefined` 只会出现在旧快照的 `roots()` 原始载荷里（那一次探测压根没跑），实时卡片把它折成 `false`。想要红利就在终端里跑 `zg server on`。
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 对外接口
 
@@ -211,7 +212,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 | 方法 | 入参 | 回执 |
 | --- | --- | --- |
-| `roots()` | - | `{ roots, serverReady }`——观测白名单加就绪行；探测答不出时 `serverReady` 为 `undefined` |
+| `roots()` | - | `{ roots, serverReady }`——观测白名单加就绪行；探测失败折成 `false`（`undefined` 只标记旧快照里那次探测没跑过） |
 | `rebuild({ root })` | 一个绝对 root | `{ ok: true, jobId, reused? }` 或 `{ ok: false, error, status }` |
 | `status({ jobId })` | 本包发的作业号 | `{ status, exitCode, root, output }`（有沙箱时带 `sandbox`）或 `{ ok: false, error, status: 404 \| 503 }` |
 
@@ -232,7 +233,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 | 口径 | 内容 |
 | --- | --- |
-| 写盘 | 本包不写任何文件。唯一落盘形状是被检索 root 下由 zg 写入的 `.zvec-grep/` 索引目录；宿主数据目录里什么都不落 |
+| 写盘 | 本包不写任何文件。落盘形状归 zg：检索根下的 `.zvec-grep/` 索引目录、全局 home `~/.zvec-grep`（config/锁/模型）与 embedding 权重缓存；宿主数据目录里什么都不落 |
 | 本包读什么 | 索引探测：一次存在性检查加读一次清单 |
 | 网络 | 只有 zg 按 hfEndpoint 下载 embedding 权重。远程 embedding 默认关闭、属部署决定 |
 | 密钥排除 | 默认排除、大小写不敏感、且排在你的路径规则之后：`*.pem` / `*.key` / `*.p12` / `*.pfx` / `*.keystore` / `*.jks` / `*.ppk` / `id_rsa*` / `id_ed25519*`（excludeSecrets=false 可关）。**无扩展名**的密钥文件不覆盖——走 ignoreFiles 声明 |
@@ -270,7 +271,7 @@ pnpm run check   # 类型检查（三个 tsconfig 程序）→ lint → 两个 b
 ```
 
 - 测试分三层：`test/*.test.ts`（单测 + mock 宿主上下文）、`test/integration/*`（真宿主服务，经 `ctx.tools.execute()` / 真 `fetch` 驱动）、`test/e2e/zg-cli.test.ts`（无插件无替身——构造出的命令行直喂**真 zg CLI**）。宿主契约的缺陷出在中间层：mock 上下文只会同意本包已经相信的事。
-- 覆盖率四项 **100%**，分母是选入的面（`host.ts` + `lib/**`）；客户端半（`src/**`）刻意在分母外，经 bundle 覆盖。
+- 覆盖率四项 **100%**，分母是选入的面（`host.ts` + `lib/**`，以及卡片侧两个可单测源文件 `src/ui-messages.ts` / `src/rebuild-reader.ts`）；只有纯浏览器入口 `src/client-entry.ts` 在分母外，经 bundle 覆盖。
 - `host.js` / `client.js` 不入库；`prepare` / `prepack` 现产，两条测试拿磁盘产物与内存构建逐字节比。发布物不手改。
 - manifest 门（`test/publish-manifest.test.ts`）守发布面：入口目标被 `files` 覆盖、宿主包不进 `dependencies`、`dsh-*` 精确钉、产物无本机路径。`test/dist-size.test.ts` 设体积预算，`test/readme-parity.test.ts` 钉两份 README 的结构对等。
 

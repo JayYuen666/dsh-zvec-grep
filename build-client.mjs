@@ -21,6 +21,31 @@ export { singleEntryChunk } from "@jayyuen66/dsh-plugin-shared/lib/build-artifac
 
 const root = import.meta.dirname;
 
+/**
+ * 包名同源的一次核对，两次调用共用这一份判据。
+ *
+ * 比的是**带引号的字面量原文**，不 `JSON.parse`：包名不需要转义，而 JSON.parse 会把合法 JS、
+ * 非法 JSON 的转义（`\/`、`\x41`、`\u{…}`、行继续符）抛成 SyntaxError，先坏掉的是判据本身，
+ * 报出来的不再是「两者不同源」这句写好的话。正则只认双引号声明：源码改用单引号或反引号时走
+ * 「找不到声明」那一条红，不会静默通过。
+ * 捕获组命名（lint 要求）但按位置取值：`groups` 是索引签名，括号访问与点号访问两条规则互相
+ * 打架，位置索引对两边都成立。
+ * @param {{source: string, pattern: RegExp, want: string, where: string, miss: string, harm: string}} check
+ * 一份待核对的声明：`source` 是承载它的那份文本，`pattern` 捕获带引号的字面量原文，
+ * `want` 是 `JSON.stringify(package.json.name)`，`where`/`miss`/`harm` 供两条报错点名对象与后果。
+ */
+function assertSameName({ source, pattern, want, where, miss, harm }) {
+  const literal = pattern.exec(source)?.[1];
+  if (literal === undefined) {
+    throw new Error(miss);
+  }
+  if (literal !== want) {
+    throw new Error(
+      `build-client：${where} 是 ${literal}，package.json 的 name 是 ${want}——两者不同源，${harm}`,
+    );
+  }
+}
+
 // 外置清单 = 既有 react 家族 + zod（宿主 `PLATFORM_MODULES` 里本卡值导入的第三方运行时）。
 // 不复用 shared 的默认清单、也不 import 它的新导出：消费者 CI 装的是 registry 上那份 shared，
 // 新导出在它发布之前不存在。zod 内联会打进每份 client.js，并让同一页面出现两份 zod 身份。
@@ -37,41 +62,27 @@ export async function buildClient() {
     verifyName: async ({ pkgName, body, readSource }) => {
       // 槽位 key 写死在 src 的 BUNDLE_PKG，外壳 id 取自 package.json.name，两者不同源。
       // 宿主按包名逐字匹配模块表键，对不上就是整张卡静默不渲染，而改名在别的环节没有症状。
-      // 所以判据必须读 BUNDLE_PKG 的声明值本身：产物里包名一共出现多次（外壳 id、BUNDLE_PKG 的
-      // 声明与引用），拿 includes 去判会被其中任意一处满足，而这个不变量要的正是「这几处同源」。
-      // 捕获组命名（lint 要求）但按位置取值：`groups` 是索引签名，括号访问与点号访问两条
-      // 规则互相打架，位置索引对两边都成立。
-      const declared = /(?:const|let|var)\s+BUNDLE_PKG\s*=\s*(?<literal>"(?:[^"\\]|\\.)*")/u.exec(
-        body,
-      );
-      const literal = declared?.[1];
-      if (literal === undefined) {
-        throw new Error(
-          "build-client：产物里找不到 BUNDLE_PKG 的声明，src/client-entry.ts 的槽位 key 无从核对。",
-        );
-      }
-      if (JSON.parse(literal) !== pkgName) {
-        throw new Error(
-          `build-client：src 的 BUNDLE_PKG 是 ${literal}，package.json 的 name 是 ${JSON.stringify(pkgName)}——两者不同源，槽位 key 与模块表键会对不上。`,
-        );
-      }
+      // 所以判据必须读声明值本身：产物里包名一共出现多次（外壳 id、BUNDLE_PKG 的声明与引用），
+      // 拿 includes 去判会被其中任意一处满足，而这个不变量要的正是「这几处同源」。
+      const want = JSON.stringify(pkgName);
+      assertSameName({
+        source: body,
+        pattern: /(?:const|let|var)\s+BUNDLE_PKG\s*=\s*(?<literal>"(?:[^"\\]|\\.)*")/u,
+        want,
+        where: "src 的 BUNDLE_PKG",
+        miss: "build-client：产物里找不到 BUNDLE_PKG 的声明，src/client-entry.ts 的槽位 key 无从核对。",
+        harm: "槽位 key 与模块表键会对不上。",
+      });
       // $mount 的 package 位（src/rebuild-reader.ts 的 PACKAGE_NAME）与槽位 key 是同一个包名，
       // 但各自持有一份字面量：对不上时既不报错也不生效，只表现为运行期「命名空间未提供」。
-      // 故构建期把第二份声明也纳入同一道同源校验，改包名时这里当场红。
-      const reader = await readSource(path.join("src", "rebuild-reader.ts"));
-      const readerDeclared =
-        /(?:const|let|var)\s+PACKAGE_NAME\s*=\s*(?<literal>"(?:[^"\\]|\\.)*")/u.exec(reader);
-      const readerLiteral = readerDeclared?.[1];
-      if (readerLiteral === undefined) {
-        throw new Error(
-          "build-client：src/rebuild-reader.ts 里找不到 PACKAGE_NAME 的声明，$mount 的 package 位无从核对。",
-        );
-      }
-      if (JSON.parse(readerLiteral) !== pkgName) {
-        throw new Error(
-          `build-client：src/rebuild-reader.ts 的 PACKAGE_NAME 是 ${readerLiteral}，package.json 的 name 是 ${JSON.stringify(pkgName)}——两者不同源，$mount 会静默挂不上。`,
-        );
-      }
+      assertSameName({
+        source: await readSource(path.join("src", "rebuild-reader.ts")),
+        pattern: /(?:const|let|var)\s+PACKAGE_NAME\s*=\s*(?<literal>"(?:[^"\\]|\\.)*")/u,
+        want,
+        where: "src/rebuild-reader.ts 的 PACKAGE_NAME",
+        miss: "build-client：src/rebuild-reader.ts 里找不到 PACKAGE_NAME 的声明，$mount 的 package 位无从核对。",
+        harm: "$mount 会静默挂不上。",
+      });
     },
   });
 }

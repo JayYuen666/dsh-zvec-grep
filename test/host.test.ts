@@ -7,7 +7,7 @@
 // （root 现在要过 existsSync 预检，桩路径 /ws 会被判「目录不存在」），
 // 对应同步方法名已列入 oxlint.config.ts 的 node/no-sync ignores。可控延迟用
 // Promise.withResolvers（运行时 Node≥22 可用；lib=ES2024 无该静态成员故类型借道 cast）。
-import { describe, it, beforeAll, vi } from "vitest";
+import { describe, it, beforeAll, afterAll, vi, onTestFinished } from "vitest";
 import assert from "node:assert/strict";
 import {
   existsSync,
@@ -33,11 +33,14 @@ import plugin, {
   INDEX_PROBE_CACHE_MAX,
   INDEX_PROBE_TTL_MS,
 } from "../host.ts";
+import { REBUILD_HISTORY_MAX } from "../lib/rebuild-remote.ts";
 import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import { MESSAGES, fill } from "../lib/messages.ts";
 import { MINIMUM_ZG_VERSION } from "../lib/zg-version.ts";
 import { SECRET_EXCLUDE_GLOBS } from "../lib/argv-guard.ts";
 import { LOCK_BUSY_CODE } from "../lib/zg-errors.ts";
+import { CJK_RESIDUE } from "./cjk-residue.ts";
+import { codeBlankingStrings } from "./sync-write-support.ts";
 import type {
   RebuildRoots,
   RebuildSnapshot,
@@ -139,13 +142,19 @@ const FAKE_KEY = "sk-forwarded";
  * （本仓 lint 明令禁止），而前者正是官方 scrubbedParentEnv 清理同名变量的写法。
  */
 function withEnv(name: string, value: string): () => void {
+  // 保存原值而不是只删：进程环境里本就存在同名变量（CI 预设）时，只删会把
+  // 用例结束后该变量的「原本就在」这一事实抹掉，污染后续用例。
+  const original = process.env[name];
   process.env[name] = value;
   return () => {
-    Reflect.deleteProperty(process.env, name);
+    if (original === undefined) {
+      Reflect.deleteProperty(process.env, name);
+    } else {
+      process.env[name] = original;
+    }
   };
 }
 
-/** 在 root 下造出一个「真建过索引」的索引库（目录 + manifest）。 */
 /**
  * 在 root 下造出一个「真建过索引」的索引库（目录 + 清单）。
  *
@@ -200,8 +209,6 @@ function registryDefaults(row: Partial<RegistryDefaults> = {}): RegistryDefaults
 const HOST_DEFAULTS = registryDefaults();
 const RING_RETAIN_BYTES = HOST_DEFAULTS.retainBytes;
 const VIEW_CHARS = 4000;
-/** host.ts 的 REBUILD_HISTORY_MAX：已结束记录的历史窗口（本包政策，不是宿主默认）。 */
-const HISTORY_MAX = 10;
 /** 注册表容量（宿主默认，按 owner 计；本包作业一律未拥有 ⇒ 共用这一桶）。 */
 const LIVE_CAP = HOST_DEFAULTS.maxConcurrentJobsPerOwner;
 /**
@@ -885,7 +892,75 @@ const realRootUnavailable = process.platform === "win32";
 
 // ── 真实临时工作区（root 存在性预检）──────────────────────────────────────
 
-const createdDirs: string[] = [];
+/** 把一个已经存在的目录挂给当前用例回收（`mkdirSync` 造出来的兄弟目录走这一道）。 */
+function trackDir(dir: string): string {
+  onTestFinished(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return dir;
+}
+
+/**
+ * 用例级临时目录：一造出来就挂给**正在跑的那条用例**回收。
+ *
+ * 为什么不是文件级登记表 + afterAll：vitest 的 afterAll 只在它所属 describe 跑完时触发
+ * （实测：把钩子挂在文件里第一个 describe 上，后面套件登记的项一条都收不到）。此前那份写法
+ * 就是这么一个早退的钩子——一次 `vitest run test/host.test.ts` 在 os.tmpdir() 留下 228 枚
+ * `zvec-*` 目录。挂在用例上才与「谁造的谁收」对齐，也才容得下 `-t` 只跑某几条的形态。
+ */
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  return trackDir(dir);
+}
+
+/**
+ * 套件级工作区（整条 describe 共用一枚）。`onTestFinished` 在 beforeAll 里没有「当前用例」，
+ * 实测抛 `Hook onTestFinished() can only be called inside a test`，所以这两枚改由所在
+ * describe 的 afterAll 收尾：用了它就必须就地配一个 afterAll。
+ */
+function wsForSuite(prefix = "zvec-root-"): string {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  makeIndexed(dir);
+  return dir;
+}
+
+// 回收口那两条用例之间传话用的容器。用 const 数组而不是 let：require-hook 不允许测试文件里
+// 出现顶层可变声明，而这里要证的正是「上一条用例结束时被删掉」这条时序，与钩子无关。
+const recycleProbe: string[] = [];
+
+describe("临时目录回收口", () => {
+  it("mkdtempSync 只出现在 tempDir 与 wsForSuite 这两个创建口", () => {
+    // 判据是「创建口名单」而不是数量：用例可以随便加，这两处的形状是写死的；
+    // 再多一处直接 mkdtempSync 就是再多一个可能没人负责回收的入口。
+    const source = codeBlankingStrings(readFileSync(new URL(import.meta.url), "utf8"));
+    const created = source
+      .split("\n")
+      .filter((line) => /\bmkdtempSync\(/u.test(line))
+      .map((line) => line.trim());
+    assert.deepEqual(created, [
+      "const dir = mkdtempSync(path.join(tmpdir(), prefix));",
+      "const dir = mkdtempSync(path.join(tmpdir(), prefix));",
+    ]);
+  });
+
+  it("tempDir 造的目录在本条用例里仍然在场", () => {
+    recycleProbe.push(tempDir("zvec-probe-"));
+    const [probed] = recycleProbe;
+    assert.ok(probed !== undefined && existsSync(probed), "用例还没结束就被删 ⇒ root 无从存在");
+  });
+
+  // 上一条用例一结束就该被收走。这两条一起把「挂在用例上」这件事钉住：
+  // 只查创建口名单的那条判据看不见 trackDir 被掏空，而 tmpdir 的存量只能人工数。
+  it("上一条用例的临时目录此刻已经不在", () => {
+    const [probed] = recycleProbe;
+    assert.ok(probed !== undefined, "前一条用例没登记探针目录，这条判据就无从判起");
+    assert.equal(
+      existsSync(probed),
+      false,
+      "onTestFinished 没跑到就是往临时目录里堆没人收的工作区",
+    );
+  });
+});
 
 /** 索引通道的缺省命令行：既有断言反复引用，抽成常量避免三处硬编码漂移。 */
 const INDEXED_SEARCH_COMMAND =
@@ -893,9 +968,7 @@ const INDEXED_SEARCH_COMMAND =
 
 /** 一个真实存在但**没有** zg 索引的目录（穷举检索路径的前提）。 */
 function bareWs(name = "bare"): string {
-  const created = mkdtempSync(path.join(tmpdir(), `zvec-${name}-`));
-  createdDirs.push(created);
-  return created;
+  return tempDir(`zvec-${name}-`);
 }
 
 /**
@@ -1076,9 +1149,12 @@ function jobIdAt(ctx: MockCtx, index: number): string | null {
 /** 起一个重建 job，返回 { jobId, proc, status }。 */
 async function startJob(ctx: MockCtx, root: string): Promise<{ jobId: string; proc: MockProc }> {
   trackRoot(ctx, root);
+  // 按序取**本次新增**的那一枚，而不是 [0]：同一 ctx 上第二次调用时 [0] 是旧进程，
+  // 断言/清理会作用在错误的 proc 上（"卸载 effect" 用例曾为此手工按下标补偿）。
+  const before = ctx.shell.startedProcs.length;
   const value = await postRebuild(ctx, root);
   assert.ok(value.ok, replyText(value));
-  const [proc] = ctx.shell.startedProcs;
+  const proc = ctx.shell.startedProcs[before];
   assert.ok(proc, "expected a started process");
   return { jobId: value.jobId, proc };
 }
@@ -1322,7 +1398,12 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
     );
     // 占位交还了吗？把时钟推过门槛的 TTL，让第二次调用真的重新探一次版本——
     // 只有占位已交还，它才可能走到「起一条重建」而不是被「已有一条重建在进行中」挡回。
-    vi.useFakeTimers({ now: Date.now() });
+    // 只假 Date：这条用例要推的是版本门槛的 TTL（host.ts 的 now 注进去就是 Date.now），
+    // 而不是任何定时器。全套假时钟会把同一 ctx 里的真实 setTimeout/setImmediate 一并冻住——
+    // 实测在 `vi.useFakeTimers({ now })` 里 `await new Promise(r => setTimeout(r, 10))`
+    // 直接挂到超时，而 `toFake: ["Date"]` 既让那 10ms 真的走完、也让 advanceTimersByTime
+    // 把 Date.now 推足 60000ms。
+    vi.useFakeTimers({ now: Date.now(), toFake: ["Date"] });
     try {
       ctx.shell.zgVersionResult = undefined;
       vi.advanceTimersByTime(11 * 60_000);
@@ -1757,8 +1838,13 @@ const GROUP_LINE_2 = "Q2 [supplemental]: parse a config file";
 describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
   let ctx: MockCtx;
   let root: string;
+  // 整套件共用一枚工作区：它造在 beforeAll，挂不上任何一条用例，由本 describe 自己收。
   beforeAll(() => {
-    root = ws();
+    root = wsForSuite();
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
   });
 
   it("构造命令、workdir=root、透传 stdout", async () => {
@@ -2360,8 +2446,13 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
 
 describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
   let root: string;
+  // 同上：beforeAll 造的那一枚由本 describe 收尾（onTestFinished 在这一刻没有「当前用例」）。
   beforeAll(() => {
-    root = ws("index");
+    root = wsForSuite("zvec-index-");
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
   });
 
   it("zg_index 缺 confirm 在 required 层即拒绝，不产生副作用", async () => {
@@ -2748,6 +2839,34 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
     assert.ok(out.text.includes("is not ready"), "要把 zg 的原始判据一并交回");
   });
 
+  it("clientMode=direct：状态报告不带守护进程注文（server 能力对该部署不存在）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { clientMode: "direct" });
+    const root = ws("direct-status");
+    ctx.shell.runResults.push(okRun("READY"));
+    const out = (await toolOf(ctx, "zg_status").execute(
+      { root, checkReady: true },
+      execOf(root),
+    )) as { text: string };
+    assert.equal(out.text, "READY", "direct 部署不发就绪注文");
+    assert.ok(!out.text.includes(MESSAGES.zh.serverUnavailableNote), "未就绪文案同样不发");
+  });
+
+  it("clientMode=server 且守护进程缺席：保留出路提示（refresh=background 不可用）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { clientMode: "server" });
+    const root = ws("server-status");
+    ctx.shell.runResults.push(okRun("READY"));
+    const out = (await toolOf(ctx, "zg_status").execute(
+      { root, checkReady: true },
+      execOf(root),
+    )) as { text: string };
+    assert.ok(
+      out.text.endsWith(MESSAGES.zh.serverUnavailableNote),
+      "server 部署缺席时出路提示照旧",
+    );
+  });
+
   it("未就绪但 stdout 为空：仍按失败抛（不凭空造一份报告）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3121,7 +3240,12 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     assert.equal(replyCode(res), 404);
     // 文案里的历史窗口数字必须真在句子出现（卡片只有这一行可看）。
     assert.match(replyText(res), /已移出历史窗口/u);
-    assert.match(replyText(res), /10 条/u, "404 要把窗口大小告诉用户");
+    // 窗口大小取实现导出的常量构造正则：写死 10 会在实现调参时红在与被测逻辑无关的字面量上。
+    assert.match(
+      replyText(res),
+      new RegExp(`${String(REBUILD_HISTORY_MAX)} 条`, "u"),
+      "404 要把窗口大小告诉用户",
+    );
     assert.match(replyText(res), /请重新发起重建/u, "要给可行动下一步，不是裸 404");
   });
 
@@ -3168,7 +3292,13 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     // （用户要做的是去收作业，不是读一句 "background job limit reached"）。
     assert.match(replyText(refused), /后台作业已满/u);
     assert.match(replyText(refused), /job_kill/u, "要给出可行动的下一步，而不是只说「失败」");
-    assert.match(replyText(refused), /10 条/u, "宿主给的上限数字要原样带出来");
+    // 数字跟着 LIVE_CAP 走而不是写死 10：本文件开头那条门律就是不抄宿主默认值，
+    // 期望值取官方 schema 现解出来的那一枚（与被测消息的 `{limit}` 同一来源，
+    // 不是从消息拼装那一段派生）。宿主哪天改容量，这里跟着动；写死 10 会红在无关字面量上。
+    assert.ok(
+      replyText(refused).includes(`${String(LIVE_CAP)} 条`),
+      `宿主给的上限数字要原样带出来（现解为 ${String(LIVE_CAP)} 条）`,
+    );
     assert.ok(
       !replyText(refused).includes("background job limit reached"),
       "宿主英文原话不得整句混进中文卡片（双语口径）",
@@ -3189,18 +3319,18 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     // 起满历史窗口并逐条落定（落定的作业不占并发桶，所以能一路起满）
-    await startRebuilds(ctx, "history", HISTORY_MAX);
+    await startRebuilds(ctx, "history", REBUILD_HISTORY_MAX);
     await settleRebuilds(ctx, 0);
     await expectStatus(ctx, jobIdAt(ctx, 1), 200);
-    // 不变量：**本 kind 在册记录（含进行中的那条）不超过 HISTORY_MAX 条**。裁剪发生在 start
-    // 之前，剪到只剩 HISTORY_MAX-1 条已落定 ⇒ 新起的这条落定后正好 HISTORY_MAX 条，与卡片
+    // 不变量：**本 kind 在册记录（含进行中的那条）不超过 REBUILD_HISTORY_MAX 条**。裁剪发生在 start
+    // 之前，剪到只剩 REBUILD_HISTORY_MAX-1 条已落定 ⇒ 新起的这条落定后正好 REBUILD_HISTORY_MAX 条，与卡片
     // 文案「只保留最近 10 条已结束的重建」同一口径。（判据的时点是**新作业落定之后**，
     // 不是剪完那一刻——只看后者会误判成"留 9 条差一格"。）
     await startRebuilds(ctx, "history", 1);
-    assert.equal(ctx.shell.startedProcs.length, HISTORY_MAX + 1);
+    assert.equal(ctx.shell.startedProcs.length, REBUILD_HISTORY_MAX + 1);
     await expectStatus(ctx, jobIdAt(ctx, 1), 404, "第 11 次启动把最老的已落定记录移出");
     await expectStatus(ctx, jobIdAt(ctx, 2), 200);
-    await expectStatus(ctx, jobIdAt(ctx, HISTORY_MAX + 1), 200);
+    await expectStatus(ctx, jobIdAt(ctx, REBUILD_HISTORY_MAX + 1), 200);
     // 侧表也必须跟着走：prune 里 `records.delete` 漏掉的话，这条幽灵会一直钉着 proc，
     // 并在卸载那一臂被当成在跑的作业再 kill 一次（下面那条断言就是这一行的牙齿）。
     const [evicted] = ctx.shell.startedProcs;
@@ -3211,7 +3341,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     assert.equal(evicted.killCount, 0, "已被移出历史的记录不该再被卸载臂动到");
     // 淘汰历史是"移出名册"，不是"杀掉进程"：那十条已落定的进程一条都不许被动过。
     assert.equal(
-      ctx.shell.startedProcs.slice(0, HISTORY_MAX).every((proc) => proc.killCount === 0),
+      ctx.shell.startedProcs.slice(0, REBUILD_HISTORY_MAX).every((proc) => proc.killCount === 0),
       true,
       "淘汰历史记录不需要、也不允许杀进程",
     );
@@ -3553,16 +3683,13 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("unload");
-    // startJob 的 proc 取的是 startedProcs[0]（单作业助手的形状），第二条要自己按序取
     const { proc: settledProc } = await startJob(ctx, root);
     settledProc.status = "completed";
     settledProc.exitCode = 0;
     settledProc.resolveDone();
     await settledTick();
-    await startJob(ctx, root);
-    // startJob 只回第一条的 proc，第二条按位取（解构而不是下标：oxlint prefer-destructuring）
-    const [, runningProc] = ctx.shell.startedProcs;
-    assert.ok(runningProc, "第二条重建应已起进程");
+    const { proc: runningProc } = await startJob(ctx, root);
+    assert.notEqual(runningProc, settledProc, "第二条重建应另起一条进程，而不是复用已落定那条");
     assert.equal(ctx.jobs.list().length, 2);
     for (const dispose of ctx.effectDisposers) {
       dispose();
@@ -3968,6 +4095,29 @@ describe("索引探测缓存 createIndexProbeCache", () => {
     assert.deepEqual(probed, ["/repo", "/repo"]);
   });
 
+  it("invalidate：drop/重建成功后缓存当场失效，不等 TTL（变异判据：去掉调用即红）", () => {
+    let indexed = true;
+    const clock = 1000;
+    const probed: string[] = [];
+    const cached = createIndexProbeCache(
+      (dir) => {
+        probed.push(dir);
+        return indexed;
+      },
+      () => clock,
+    );
+    assert.equal(cached("/repo"), true, "索引在场：正向条目进缓存");
+    indexed = false;
+    // zg_index drop/重建落定：显式失效该根
+    cached.invalidate("/repo");
+    assert.equal(cached("/repo"), false, "失效后下一跳立即真探到新状态");
+    assert.deepEqual(probed, ["/repo", "/repo"], "失效不走 TTL，真探一次");
+    // 其余根的条目不受牵连
+    indexed = true;
+    assert.equal(cached("/other"), true);
+    assert.equal(cached("/repo"), false, "只清了被点名的根");
+  });
+
   it("LRU：容量有界，超限淘汰最旧；命中即触摸，被用过的条目活得最久", () => {
     const probed: string[] = [];
     // 时钟冻结 ⇒ 无 TTL 干扰；容量压到 2 让淘汰这一臂真的走到。
@@ -4081,8 +4231,7 @@ describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
   let tmp: string;
 
   function setup(settings?: Record<string, unknown>): (exec: GuardExec) => string | undefined {
-    tmp = mkdtempSync(path.join(tmpdir(), "zvec-grep-gate-"));
-    createdDirs.push(tmp);
+    tmp = tempDir("zvec-grep-gate-");
     makeIndexed(tmp);
     ctx = makeCtx();
     if (settings) {
@@ -4106,8 +4255,7 @@ describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
     // 探测若只看目录存在，一个祖先恰好是 zg 全局 home 的工作区会被误判成已建索引——
     // 门禁随即在无索引可搜的情况下拦下 grep，而 zg_search 也答不出东西。
     // 分界是 workspace manifest：只有它在场才说明这个工作区真建过索引。
-    tmp = mkdtempSync(path.join(tmpdir(), "zvec-grep-gate-homeonly-"));
-    createdDirs.push(tmp);
+    tmp = tempDir("zvec-grep-gate-homeonly-");
     mkdirSync(path.join(tmp, ZG_INDEX_DIR));
     writeFileSync(path.join(tmp, ZG_INDEX_DIR, "config.json"), "{}\n");
     ctx = makeCtx();
@@ -4223,8 +4371,7 @@ describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
 
   it("无索引的 root：zg_search 成功也不发放解锁", async () => {
     const guard = setup();
-    const plain = mkdtempSync(path.join(tmpdir(), "zvec-grep-plain-"));
-    createdDirs.push(plain);
+    const plain = tempDir("zvec-grep-plain-");
     ctx.shell.runResults.push(okRun("HITS"));
     await searchTool().execute({ root: plain, query: "x" }, execOf(plain));
     const reason = guard({
@@ -4285,8 +4432,7 @@ describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
 
   it("无索引目录不拦（真实 existsSync）", () => {
     const guard = setup();
-    const plain = mkdtempSync(path.join(tmpdir(), "zvec-grep-plain-"));
-    createdDirs.push(plain);
+    const plain = tempDir("zvec-grep-plain-");
     assert.equal(
       guard({
         name: "bash",
@@ -4363,8 +4509,7 @@ describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
     // 0.1.7 的默认值住在 schema 的 .default()，正常装载下 enforceSearchFirst 恒为
     // boolean。这里刻意把 volatile 引用背后的值清空（= 条目没被投影 / 宿主退化），
     // 锁死「读不到」不等于「用户关了门禁」——静默放行检索顺序违规才是更坏的失败。
-    tmp = mkdtempSync(path.join(tmpdir(), "zvec-grep-gate-empty-"));
-    createdDirs.push(tmp);
+    tmp = tempDir("zvec-grep-gate-empty-");
     makeIndexed(tmp);
     ctx = makeCtx();
     ctx.settingsValue = {};
@@ -4407,7 +4552,7 @@ describe.skipIf(realRootUnavailable)("host 侧文案双语", () => {
     applyTo(ctx);
     const search = toolOf(ctx, "zg_search");
     assert.ok(search.description.includes("Semantic/hybrid search"), "英文工具描述");
-    assert.doesNotMatch(JSON.stringify(search.parameters), /[\u4E00-\u9FFF]/u);
+    assert.doesNotMatch(JSON.stringify(search.parameters), CJK_RESIDUE);
     const properties = search.parameters["properties"] as Record<string, { description: string }>;
     assert.match(properties["root"]?.description ?? "", /Absolute workspace path/u);
     assert.match(ctx.sections[0]?.text ?? "", /must call zg_search first/u);
@@ -4432,7 +4577,7 @@ describe.skipIf(realRootUnavailable)("host 侧文案双语", () => {
       (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         assert.match(message, /is not installed or not on PATH/u);
-        assert.doesNotMatch(message, /[\u4E00-\u9FFF]/u, "英文回显不得混进中文");
+        assert.doesNotMatch(message, CJK_RESIDUE, "英文回显不得混进中文");
         return true;
       },
     );
@@ -4519,7 +4664,7 @@ async function microTicks(count: number): Promise<undefined> {
 
 /** 造一个带索引库的临时工作区（供重建期门禁用例）。 */
 function makeIndexedTemp(): string {
-  const dir = mkdtempSync(path.join(tmpdir(), "zvec-grep-idx-"));
+  const dir = tempDir("zvec-grep-idx-");
   makeIndexed(dir);
   return dir;
 }
@@ -5326,11 +5471,10 @@ describe.skipIf(realRootUnavailable)("root 授权", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     // 造一对真实存在、且其中一个是另一个名字前缀的目录（/fo… 与 /fo…-x）。
-    const base = mkdtempSync(path.join(tmpdir(), "zvec-fo-"));
-    createdDirs.push(base);
-    const prefixed = `${base}-x`;
+    // 两枚都要单独登记：`-x` 那枚是 base 的**兄弟**而不是子目录，收 base 收不到它。
+    const base = tempDir("zvec-fo-");
+    const prefixed = trackDir(`${base}-x`);
     mkdirSync(prefixed, { recursive: true });
-    createdDirs.push(prefixed);
     await assert.rejects(() => searchIn(ctx, prefixed, base), /未获授权/u);
   });
 

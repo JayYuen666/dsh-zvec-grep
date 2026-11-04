@@ -25,6 +25,13 @@ concurrency:
 # 门槛只需要读代码。写成白名单而不是省略：省略会拿到仓库默认权限，而默认可能是读写。
 permissions:
   contents: read
+# pnpm 取具体补丁版本而不是主版本 12：`version: 12` 让每次运行拿上游最新的 12.x，补丁差在安装树的
+# 解法上是可观察的行为差异（本族各仓 cordis.patch.yml 就记着 pnpm 某个小版本的 add 缺陷）。取值与
+# 伞根 packageManager 同源，也是各仓 lockfile 当期由之生成的那一枚。口径：九仓 CI 都在 workflow 级
+# env 里写这枚字面值；唯一例外是 dsh-lesson-loop，它的 package.json 自带 packageManager，由
+# pnpm/action-setup 自己读，再写 env 就成了两份真源。
+env:
+  PNPM_VERSION: 12.11.2
 jobs:
   gate:
     name: gate (${{ matrix.os }}, node ${{ matrix.node }})
@@ -53,9 +60,9 @@ jobs:
           # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       # registry-url 留空：本仓 CI 不发布，装依赖走包自己的 .npmrc（@jayyuen66 指向公共 npm）。
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -142,9 +149,9 @@ jobs:
           # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
@@ -173,6 +180,12 @@ jobs:
         run: |
           set -euo pipefail
           tarball="$(find /tmp/pkg/pnpm -name '*.tgz' -print -quit)"
+          # 空值单独立一条红：`set -u` 不判空串，否则失败点落在 `npm install ""` 上，
+          # 读起来像产物装不上，而不是 pnpm pack 没产出 tgz。
+          if [ -z "$tarball" ]; then
+            echo "::error::/tmp/pkg/pnpm 下没有 tgz——pnpm pack 没产出可安装的包"
+            exit 1
+          fi
           mkdir -p /tmp/probe && cd /tmp/probe
           npm init -y >/dev/null
           # 不传 --legacy-peer-deps：那正是本包 peer 面（宿主包一律 peer + dev，不进
@@ -232,6 +245,11 @@ jobs:
           # 单引号是刻意的：脚本体里有 JS 模板串，交给 shell 展开就坏了。
           set -euo pipefail
           tarball="$(find /tmp/pkg/pnpm -name '*.tgz' -print -quit)"
+          # 同 npm 侧探针：取不到就是打包环节的红，不能让 pnpm 去装一个空串。
+          if [ -z "$tarball" ]; then
+            echo "::error::/tmp/pkg/pnpm 下没有 tgz——pnpm pack 没产出可安装的包"
+            exit 1
+          fi
           mkdir -p /tmp/probe-pn && cd /tmp/probe-pn
           npm init -y >/dev/null
           # 这个目录之后由 pnpm 管，装依赖也得用 pnpm：在 pnpm 布局的项目里跑 `npm install`
@@ -247,12 +265,25 @@ jobs:
           if (typeof plugin?.apply !== "function") throw new Error("pnpm 布局下入口装载失败：缺 apply");
           const require = createRequire(import.meta.url);
           const pkgDir = path.dirname(require.resolve(NAME + "/package.json"));
-          const patch = path.join(pkgDir, "cordis.patch.yml");
-          if (!existsSync(patch)) throw new Error("pnpm 布局下 cordis.patch.yml 没随包发出");
-          if (!readFileSync(patch, "utf8").includes("- id: zvec-grep")) {
-            throw new Error("pnpm 布局下 cordis.patch.yml 缺注册行");
+          // 路径与 id 都从 manifest 取，不写死 cordis.patch.yml / zvec-grep：改名后这条判据会
+          // 红着提醒，而不是继续拿旧名字放过。
+          const manifest = require(NAME + "/package.json");
+          const patchRel = manifest.dsh?.bundle?.patch;
+          if (!patchRel) throw new Error("package.json 缺 dsh.bundle.patch：宿主不会把它 reconcile 进层栈");
+          const patch = path.join(pkgDir, patchRel);
+          if (!existsSync(patch)) throw new Error(`bundle patch 没随包发出：${patchRel}`);
+          // 判的是「有没有一条按裸包名引用本包」，不是「文件里出现过这个串」：`.../settings`
+          // 这类子路径条目天然包含完整包名，用 includes 判会被它满足，而宿主 client-modules
+          // 只扫描裸包名条目的 dsh.client 声明。
+          const names = readFileSync(patch, "utf8")
+            .split(/\r?\n/u)
+            .map((line) => /^[ \t]*name:[ \t]*(?:"([^"]*)"|(\S+))[ \t]*$/u.exec(line))
+            .filter((hit) => hit !== null)
+            .map((hit) => hit[1] ?? hit[2]);
+          if (!names.includes(NAME)) {
+            throw new Error(`bundle patch 没有按裸包名引用 ${NAME} 的条目`);
           }
-          console.log("pnpm 布局下入口与 patch 文件均就位");
+          console.log("pnpm 布局下入口与 bundle patch 均就位");
           '
 
   # 来源证明是给「这次运行打出来的这份产物」出的第三方可验凭据，不是多一步验证：

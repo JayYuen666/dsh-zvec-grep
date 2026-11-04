@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-zvec-grep/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-zvec-grep/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%3E%3D22.12-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.3-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.1--rc.5-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -77,10 +77,10 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 Remove with `dsh plugin --profile web remove @jayyuen66/dsh-zvec-grep`. The package is on the public npm registry; no credentials, no scoped-registry line.
 
 - **Node.js `>= 22.12`** (ESM-only; that floor is what makes `require()` of an ESM entry work, hence `engines.node`).
-- **Host `dsh` on the `0.2.1-rc.3` / `0.2.2-alpha.2` line.** The host reads `engines.dsh` (`^0.2.1-rc.3`) and it **decides alone** - with that field present, compatibility is judged before `peerDependencies` is ever consulted, prereleases included. Any `0.2.x` at or above `0.2.1-rc.3` passes; `0.3.0` and later need the risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: this package is verified against the three most recently released host versions at publish time and re-verified once the window moves, so the version number in this bullet is not a standing promise.
-- **No `@deepseek-ai/*` under `dependencies`, by contract** (`test/publish-manifest.test.ts`). Profiles install with `nodeLinker: hoisted` and `autoInstallPeers: false`, so a host package there becomes a real second copy; `@deepseek-ai/dsh-tools` keys its scheduler with a plain `Symbol`, so **every native tool call throws** in that profile while build, typecheck and coverage stay green. The `@deepseek-ai/dsh*` peers carry the same support-window range (`^0.2.1-rc.3`), while the exact pins in `devDependencies` are the compile-time discipline against a second host type surface - not a claim the host consults.
+- **Host `dsh` on the `0.2.1-rc.5` or `0.2.2-alpha.3` line.** The host reads `engines.dsh` (`^0.2.1-rc.5 || ^0.2.2-alpha.3`) and it **decides alone** - with that field present, compatibility is judged before `peerDependencies` is ever consulted, prereleases included. Any `0.2.x` at or above `0.2.1-rc.5` passes the host gate; on the `0.2.2` prerelease line, strict npm peer resolution starts at `0.2.2-alpha.3`. `0.3.0` and later need the risk grant `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <exact> --accept-risk`. The support window rolls: at publish time this package is checked against every released host version inside the window - the judgement is the host's `--dump-config` layer line for this package, while the settings card and its namespace calls are verified once in full on the release's development baseline - and re-verified once the window moves, so the version number in this bullet is not a standing promise.
+- **No `@deepseek-ai/*` under `dependencies`, by contract** (`test/publish-manifest.test.ts`). Profiles install with `nodeLinker: hoisted` and `autoInstallPeers: false`, so a host package there becomes a real second copy; `@deepseek-ai/dsh-tools` keys its scheduler with a plain `Symbol`, so **every native tool call throws** in that profile while build, typecheck and coverage stay green. The `@deepseek-ai/dsh*` peers carry the same support-window range (`^0.2.1-rc.5 || ^0.2.2-alpha.3`), while the exact pins in `devDependencies` are the compile-time discipline against a second host type surface - not a claim the host consults.
 - **Value imports are required peers.** `@deepseek-ai/schemastery` is the host fork (only its `resolve` wraps `.volatile()` fields); `@deepseek-ai/dsh-typert-protocol` provides `TypertRemoteService`, a class to `extends`; `@deepseek-ai/dsh-scope` provides `scopeOf` for the step-admission lookup; shared's `lib/text` value-imports `@deepseek-ai/dsh-output-retention`. Each sits in `peerDependencies` plus the same exact pin in `devDependencies` - missing one is `ERR_MODULE_NOT_FOUND` at load, not a graceful downgrade. `dependencies` holds `@jayyuen66/dsh-plugin-shared` and `zod` (the latter versioned through the umbrella catalog, used by the settings card's strict codecs).
-- **What ships**: `host.js`, `client.js`, `cordis.patch.yml`, `icon.svg`, both READMEs, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`. Artifacts are rebuilt by `prepack`, never committed.
+- **What ships**: `host.js`, `client.js`, `cordis.patch.yml`, `icon.svg`, both READMEs, `CHANGELOG.md`, `THIRD_PARTY_NOTICES.md`, `locale/zh.json` + `locale/en.json`, and `docs/` (both DETAIL files). Artifacts are rebuilt by `prepack`, never committed.
 
 ### <img src="https://api.iconify.design/lucide/arrow-down-to-line.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Shared version floor
 
@@ -100,7 +100,7 @@ If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entr
 - **No CLI subcommand.** `dsh zvec-grep …` does not exist.
 - **No daemon lifecycle.** `zg server on` is the user's action; this package only reads readiness.
 - **No ripgrep dependency.** rg appears only inside the gate predicate.
-- **Nothing written to the host data directory.** The only on-disk shape is zg's own `.zvec-grep/` under the indexed root.
+- **Nothing written to the host data directory.** What lands on disk is zg's business, not this package's: its index/manifest `.zvec-grep/` under the searched root, its global home `~/.zvec-grep` (config, locks, models), and embedding weights fetched per `hfEndpoint`. This package itself writes nothing.
 - Required surfaces: `settings` / `shell` / `tools` / `systemPrompt` / `timer` (all in `inject`). The host `jobs` service is optional - without it the rebuild paths refuse and spawn nothing; the three tools keep working.
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
@@ -142,7 +142,7 @@ Output is plain text; timeouts 5 min (search) / 10 min (index) / 60 s (status); 
 ### The rg switch
 
 - `rg` unset: with no index in the workspace **or any ancestor**, the search falls back to exhaustive matching with a prepended note ("literal line matches, not semantic ranking"). `rg=true` forces it; `rg=false` refuses the fallback (zg then reports `WORKSPACE_INDEX_NOT_FOUND`).
-- Exhaustive search grants **no** grep/rg quota: it reads no index. Flag conflicts (`preview` / `refresh` / `symbol-type` / `prefer-symbol` / `fuse` / `fts` / `vector`, `trace`) are refused at assembly time with the conflicts listed; there is no hit summary (no `hits:` lines to count).
+- Exhaustive search grants **no** grep/rg quota: it reads no index. Flag conflicts (`preview` / `refresh` / `symbol-type` / `prefer-symbol` / `fuse` / `fts` / `vector`, `trace`, plus a non-empty `queries` - the exhaustive channel takes a single `query` as the pattern) are refused at assembly time with the conflicts listed; there is no hit summary (no `hits:` lines to count).
 
 ### Root rules
 
@@ -152,7 +152,7 @@ Output is plain text; timeouts 5 min (search) / 10 min (index) / 60 s (status); 
 ## <img src="https://api.iconify.design/lucide/ban.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> The search-first gate
 
 - **What counts as searching**: after quote/comment-aware tokenising of a bash/pwsh command string, grep/egrep/fgrep/rg at a command position, plus the native grep tool. `--help` / `--version`, `echo "grep x"` and commit messages do not.
-- **Quota per "session x index root"**: each successful `zg_search` re-arms `grepBudgetPerSearch` calls valid for `unlockWindowMin` minutes; the index root is the root itself or its nearest indexed ancestor (up to 8 levels up).
+- **Quota per "session x index root"**: each successful, **index-reading** `zg_search` re-arms `grepBudgetPerSearch` calls valid for `unlockWindowMin` minutes (an exhaustive lexical fallback also "succeeds" but grants no quota); the index root is the root itself or its nearest indexed ancestor (up to 8 levels up). The gate yields only when the host supplies a step-admission view (`toolSet`) without `zg_search` in it - hosts that provide no admission info keep the plain criteria.
 - **Partitioning uses the root session** (walked up `header.parentSession`): the main agent and its subagents **share one quota**. Degradation never throws - a missing parent stops at the last known hop, a cycle stops before the first repeat.
 - **Step admission stands the gate down**: when the host supplies a `toolSet` and this step's view does not admit `zg_search` (a restricted subagent or a conditional-tool step), grep/rg are not blocked - requiring a call this step cannot make is a dead end. Hosts without step admission keep the old criterion.
 - **"Indexed" means `<root>/.zvec-grep/manifest.json` exists *and* parses** with `manifestVersion` strictly 1 and `rootPaths` covering this directory (normalized equality, `/private` prefix stripped on macOS). The directory name alone is not enough - it is also zg's global home (`~/.zvec-grep`), and an existence-only check misreads a truncated or foreign manifest as "indexed", deadlocking both search and the gate.
@@ -203,7 +203,7 @@ Off by default: `allowRemoteEmbedding=false`, `remoteEmbeddingEndpoint=""`, `rem
 
 - Direct and server are **two capability surfaces**, not a speed knob: direct cold-loads the embedding model on every query; watcher-driven incremental refresh, `refresh=background` and a resident model pool exist only in server mode. Upstream probes readiness for `auto` but never starts a daemon.
 - This package does not start one either - `zg server on` leaves a detached process and a token file, which is the user's decision. It makes the difference **explicit** instead: the exit code of `zg server status --check-ready` is cached for 60 s (a failed probe counts as "not ready", never an infrastructure error), gates `refresh=background`, and is echoed once in `zg_status` output and once on the card. Only the `roots()` read issues the probe.
-- The card's `serverReady` is only ever `true` / `false`; when the probe cannot answer, that arm renders nothing rather than "not ready". To get the benefits, run `zg server on` in a terminal.
+- The card's `serverReady` is `true` / `false` at the card layer — a failed or erroring probe counts as `false` ("probe failure means not ready"), so the readiness line always renders. `undefined` only survives inside the raw `roots()` payload of an older card snapshot; the live card folds it to `false`. To get the benefits, run `zg server on` in a terminal.
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Public interface
 
@@ -211,7 +211,7 @@ One official Typert Remote namespace, `zvecGrepRebuild`, installed on the apply 
 
 | Method | Input | Reply |
 | --- | --- | --- |
-| `roots()` | - | `{ roots, serverReady }` - observed whitelist plus the readiness line; `serverReady` is `undefined` when the probe cannot answer |
+| `roots()` | - | `{ roots, serverReady }` - observed whitelist plus the readiness line; the probe folds failure to `false` (`undefined` only marks an older snapshot where the probe never ran) |
 | `rebuild({ root })` | an absolute root | `{ ok: true, jobId, reused? }` or `{ ok: false, error, status }` |
 | `status({ jobId })` | a job id from this package | `{ status, exitCode, root, output }` (plus `sandbox` when present) or `{ ok: false, error, status: 404 \| 503 }` |
 
@@ -232,7 +232,7 @@ A "rebuild workspace" run is one **unowned** job in the host's `ctx.jobs` (`kind
 
 | Aspect | Content |
 | --- | --- |
-| Written to disk | Nothing by this package. The only on-disk shape is the `.zvec-grep/` index directory under the searched root, written by zg; nothing lands in the host data directory |
+| Written to disk | Nothing by this package. zg owns the disk shapes: the `.zvec-grep/` index directory under the searched root, its global home `~/.zvec-grep` (config/locks/models) and the embedding-weight cache; nothing lands in the host data directory |
 | What it reads | The index probe: one existence check plus one manifest read |
 | Network | Only the embedding-weight download driven by `hfEndpoint`, performed by zg. Remote embedding is off by default and is a deployment decision |
 | Secret exclusion | Excluded by default, case-insensitively and after your own path rules: `*.pem` / `*.key` / `*.p12` / `*.pfx` / `*.keystore` / `*.jks` / `*.ppk` / `id_rsa*` / `id_ed25519*` (excludeSecrets=false to allow). Extensionless key files are not covered - declare them via ignoreFiles |
@@ -270,7 +270,7 @@ pnpm run check   # typecheck (three tsconfig programs) → lint → both bundle 
 ```
 
 - Tests come in three tiers: `test/*.test.ts` (unit + mocked host context), `test/integration/*` (real host services driven through `ctx.tools.execute()` / actual `fetch`), and `test/e2e/zg-cli.test.ts` (no plugin, no mock - the built command lines against the **real zg CLI**). Host-contract bugs surface in the middle tier: a mocked context can only agree with what this package already believes.
-- Coverage is **100%** across four metrics over the opted-in surface (`host.ts` + `lib/**`); the client half (`src/**`) is deliberately outside the denominator and is exercised through the bundle.
+- Coverage is **100%** across four metrics over the opted-in surface (`host.ts` + `lib/**` + the two card-side sources `src/ui-messages.ts` / `src/rebuild-reader.ts`); only the pure browser entry `src/client-entry.ts` stays outside the denominator and is exercised through the bundle.
 - `host.js` / `client.js` are not committed; `prepare` / `prepack` rebuild them and two tests compare the on-disk bundle against an in-memory build byte for byte. Never hand-edit the bundles.
 - Manifest gates (`test/publish-manifest.test.ts`) guard the published surface: entry targets covered by `files`, host packages out of `dependencies`, `dsh-*` pinned exactly, no local paths in artifacts. `test/dist-size.test.ts` budgets bundle bytes; `test/readme-parity.test.ts` keeps both READMEs structurally in sync.
 

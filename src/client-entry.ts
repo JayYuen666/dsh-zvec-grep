@@ -61,7 +61,7 @@ import {
 import type { CardFields, CardSnapshot, SettingScope } from "../lib/card-logic.ts";
 import { createRebuildReader } from "./rebuild-reader.ts";
 import type { RebuildReader } from "./rebuild-reader.ts";
-import { UI_MESSAGES } from "./ui-messages.ts";
+import { EMBEDDING_MIRROR_URL, UI_MESSAGES } from "./ui-messages.ts";
 import type { LocaleNs, Translate, UiMessages } from "./ui-messages.ts";
 import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 
@@ -249,7 +249,7 @@ function buildRebuildField(deps: CardDeps): ReactNode {
     className: "dsu-input zgc-rebuildInput",
     value: root,
     list: ROOT_OPTIONS_ID,
-    placeholder: "/absolute/path/to/workspace",
+    placeholder: t("rebuildInputPlaceholder"),
     onChange: (ev: { target: { value: string } }) => {
       setRoot(ev.target.value);
     },
@@ -319,7 +319,7 @@ function buildIndexSection(deps: CardDeps): ReactNode {
     ...splitHint(t("endpointHint")),
     field: "hfEndpoint",
     value: fields.hfEndpoint,
-    placeholder: "https://modelscope.cn/models",
+    placeholder: EMBEDDING_MIRROR_URL,
     monospace: true,
     disabled: !editable,
     onChange: (next: string): void => {
@@ -633,7 +633,8 @@ function ZgCard(props: CardSlotProps): ReactNode {
     for (const key of keys) {
       const draft = touched[key];
       if (draft === undefined) {
-        // unset 语义：defaultLimit 清空 → 回组合层（BUILTIN_BASE / 行 config）默认
+        // unset 语义：defaultLimit 清空 → 回默认值（行 config 里给的那一份优先，其次 schema
+        // 的 .default()，值源在 lib/limits.ts）
         ops.push(props.unset(key));
       } else {
         pushFieldWrite(ops, key, draft, props.set);

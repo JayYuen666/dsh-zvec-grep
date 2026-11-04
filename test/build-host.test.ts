@@ -21,9 +21,7 @@ describe("buildHost()", () => {
     assert.equal(
       onDisk,
       built,
-      onDisk === built
-        ? "fresh"
-        : `[${pkgName}] host.js 已过期：host.ts（或其依赖）变更后未重建。请运行：cd ${pkgDir} && node build-host.mjs`,
+      `[${pkgName}] host.js 已过期：host.ts（或其依赖）变更后未重建。请运行：cd ${pkgDir} && node build-host.mjs`,
     );
   });
 
@@ -63,8 +61,10 @@ describe("buildHost()", () => {
         `shared/${subpath} 必须外部化（裸说明符形式留在产物里）`,
       );
     }
-    // 自有 lib/cli.ts 的转义器要"在产物内"（内联成功）而不是留成相对说明符
-    assert.ok(out.includes("shq"), "lib/cli.ts 须已并入单文件产物");
+    // 自有 lib/cli.ts 的转义器要"在产物内"（内联成功）而不是留成相对说明符：
+    // 三个字符的子串匹配几乎恒真（标识符/路径都可能撞上），这里锚定函数定义本身。
+    assert.ok(out.includes("function shq("), "lib/cli.ts 的转义器须已并入单文件产物");
+    assert.ok(!/from\s*["']\.\/lib\/cli/u.test(out), "lib/cli 不得留成相对说明符");
   });
 
   it("产物 host.js：不残留 ./x.ts 形态的相对说明符", async () => {
@@ -82,8 +82,10 @@ describe("换装的产物面（ctx.jobs 只有类型面）", () => {
     // 消费方的 node_modules 里解析得到，而它只在 devDependencies 里。
     // 判据只看 `from "…"` 位置：源码注释会随 rolldown 一起进产物，整串匹配会被注释误伤
     // （第一版就是这么把自己判红的）。
+    // 负向先行（dsh-jobs(?![\w-])）让两条断言各自独立可败：否则 -local 说明符
+    // 总是先被第一条吞掉，第二条永远只剩「已通过」的那一半信息。
     assert.ok(
-      !/from\s*["']@deepseek-ai\/dsh-jobs/u.test(out),
+      !/from\s*["']@deepseek-ai\/dsh-jobs(?![\w-])/u.test(out),
       "dsh-jobs 只能是类型面：产物里出现它的运行时说明符即值导入",
     );
     assert.ok(

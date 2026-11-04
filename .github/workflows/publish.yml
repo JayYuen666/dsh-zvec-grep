@@ -15,6 +15,10 @@ permissions:
 # 优先级方向别读反：本包在 npmjs 上配好 trusted publisher 之后，OIDC 赢过 NODE_AUTH_TOKEN
 # （pnpm 的 publish_options.rs 原话："OIDC takes precedence over a configured static token"），
 # 交换成功时静态 secret 根本不被读到；只有交换失败（没配、权限不足、配置过期）才回落到它。
+# 与 ci.yml 同一枚取值：门禁 certify 的那棵树与发布装的树要由同一个 pnpm 解出。GitHub Actions 没有
+# 跨文件的 env，抬版本时与 ci.yml 那份一起动。
+env:
+  PNPM_VERSION: 12.11.2
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -43,13 +47,18 @@ jobs:
           # 本仓的 workflow 不用 git 写动词，token 没必要留在 .git/config 里：
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+          # 与本仓 ci.yml 同一位置对齐：pnpm 缓存按 lockfile 命中。少了它，每次发布都全量装
+          # 这个体量的 devDependencies（cache 只做依赖缓存，不改 pnpm install 的判据）。
+          cache: pnpm
+      # 这里刻意**不写** registry-url：它的作用是把带 `${NODE_AUTH_TOKEN}` 占位的
+      # RUNNER_TEMP/.npmrc 用 NPM_CONFIG_USERCONFIG 指过来，而本 job 从不发布、也不配那枚
+      # token（占位在 build job 里没有读者）。registry-url 留在下面 publish job 那一处。
       # 静态 token 是 OIDC 失败时的兜底，不是发布的前提：仓库里没有这枚 secret 是正常状态，
       # 走 trusted publishing 的仓库本来就不该长期存它。所以这一步在值为空时放行，只把
       # 凭据本身不跨步骤传递：步骤输出会落成 RUNNER_TEMP 下的文件，同 job 后续步骤
@@ -142,14 +151,25 @@ jobs:
           fi
           # 本包自身也要查：只查依赖的话，「版本号没进 main 就触发 workflow」这个最常见的
           # 失败模式预检根本发现不了，只能等 publish 自己以版本冲突收尾。
-          self=$(curl -s -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/@jayyuen66%2fdsh-zvec-grep")
+          # 两条 curl 都带超时并就地判读：registry 半开连接时没有 --max-time 就只能等 job 的
+          # 分钟上限被杀，日志里留不下任何线索。名字从 package.json 取——写死的第二份与改名
+          # 不会同时红，旧名 404 会被下面读成「首发（正常）」，预检从此静默失准。
+          export SELF_URL SHARED_URL
+          SELF_URL="https://registry.npmjs.org/$(node -p "encodeURIComponent(require('./package.json').name)")"
+          SHARED_URL="https://registry.npmjs.org/$(node -p "
+            const deps = Object.keys(require('./package.json').dependencies ?? {});
+            const shared = deps.find((k) => k.startsWith('@jayyuen66/dsh-plugin-shared'));
+            if (!shared) { throw new Error('package.json 的 dependencies 里没有 @jayyuen66/dsh-plugin-shared'); }
+            encodeURIComponent(shared);
+          ")"
+          self=$(curl -s --max-time 20 --retry 3 --retry-connrefused -o /dev/null -w "%{http_code}" "$SELF_URL")
           echo "读本包：HTTP $self"
           case "$self" in
             404) echo "判读：首发（正常）";;
             200) echo "判读：已发过——确认 package.json 的 version 比 registry 上的新，否则 publish 会撞版本冲突";;
             *) echo "预检失败：本包读取返回 $self"; exit 1;;
           esac
-          code=$(curl -s -o /dev/null -w "%{http_code}" "https://registry.npmjs.org/@jayyuen66%2fdsh-plugin-shared")
+          code=$(curl -s --max-time 20 --retry 3 --retry-connrefused -o /dev/null -w "%{http_code}" "$SHARED_URL")
           echo "读 @jayyuen66/dsh-plugin-shared：HTTP $code"
           echo "判读：200=依赖库已公开，可以发；404=shared 还没发到 npmjs，先发它（本包 pnpm install 会因此取不到依赖）"
           [ "$code" = "200" ] || exit 1
@@ -162,10 +182,24 @@ jobs:
       # prepack 会重建 host.js 与 client.js（本包不产 .d.ts），产物不入库也发得出去。
       # 打包只在本 job 做一次：发布 job 拿到的就是这份字节，它自己不再跑任何仓库或依赖的代码。
       - name: 打包发布物
+        id: pack
         run: |
           set -euo pipefail
           mkdir -p /tmp/pkg
           pnpm pack --pack-destination /tmp/pkg
+          # 把「本 job 交出去的那份字节是什么」登记成 outputs：发布 job 不检出仓库，它只能拿
+          # 自己解包出来的东西与这份登记比。名字或版本对不上，说明 artifact 被换过或打包配置
+          # 跑偏 —— 脏产物一旦上 registry，版本号占了就撤不回，只能弃号。
+          tarball="$(find /tmp/pkg -name '*.tgz' -print -quit)"
+          tar -xzOf "$tarball" package/package.json > "$RUNNER_TEMP/packed-build.json"
+          node -e '
+            const fs = require("node:fs");
+            const packed = require(process.env.RUNNER_TEMP + "/packed-build.json");
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT,
+              "pkg_name=" + packed.name + "\npkg_version=" + packed.version + "\n",
+            );
+          '
       - name: 留存 tarball 供发布 job 使用
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -176,6 +210,8 @@ jobs:
     # 只交结论、不交凭据：静态 token 是否可用由预检判定，发布 job 据此决定导不导出 NODE_AUTH_TOKEN。
     outputs:
       use_static: ${{ steps.precheck.outputs.use_static }}
+      pkg_name: ${{ steps.pack.outputs.pkg_name }}
+      pkg_version: ${{ steps.pack.outputs.pkg_version }}
   publish:
     needs: build
     runs-on: ubuntu-latest
@@ -191,9 +227,9 @@ jobs:
       # 发布者本人，就是这条路的痕迹：归属仍在 maintainers 与 repository 上，改不动也不必改。
       id-token: write
     steps:
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
-          version: 12
+          version: ${{ env.PNPM_VERSION }}
       # registry-url 必须配：它把 `${NODE_AUTH_TOKEN}` 占位写进 RUNNER_TEMP/.npmrc 并用
       # NPM_CONFIG_USERCONFIG 指过去，发布步的静态 token 兜底走的就是这条机制。
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -206,6 +242,9 @@ jobs:
           name: dist-tarball
           path: /tmp/pkg
       - name: 校验 tarball（发布对象就是它，不再二次打包）
+        env:
+          EXPECT_NAME: ${{ needs.build.outputs.pkg_name }}
+          EXPECT_VERSION: ${{ needs.build.outputs.pkg_version }}
         run: |
           set -euo pipefail
           # 只信任 build job 传来的那份字节：数目必须恰好一枚，多了少了都是意外。
@@ -219,6 +258,13 @@ jobs:
           name="$(node -p 'require(process.env.RUNNER_TEMP + "/packed.json").name')"
           version="$(node -p 'require(process.env.RUNNER_TEMP + "/packed.json").version')"
           echo "发布物：$name@$version"
+          # 与 build job 登记的那份逐项比对。「恰好一枚 tarball」+「里面有 package.json」
+          # 只能证明解得开，证明不了它是本仓这一版：包名/版本对不上就直接停，
+          # 别让脏产物走到 npm publish 那一步（版本占用不可撤销）。
+          if [ "$name" != "$EXPECT_NAME" ] || [ "$version" != "$EXPECT_VERSION" ]; then
+            echo "::error::tarball 是 $name@$version，与 build job 登记的 $EXPECT_NAME@$EXPECT_VERSION 不符——拒绝发布"
+            exit 1
+          fi
           # 读 tarball 自己的版本（发布 job 不检出仓库），先判 registry 上有没有同名版本：
           # 已存在时 pnpm 也会拒，但这里的报错能点名是哪个版本，而不是一句冲突。
           encoded="${name/\//%2f}"

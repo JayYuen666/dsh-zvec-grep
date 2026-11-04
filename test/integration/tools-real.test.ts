@@ -13,25 +13,26 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import assert from "node:assert/strict";
-import { existsSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertSupportedJsonSchema } from "@deepseek-ai/dsh-tools";
-import { startHost, canMakeUnreadableFile, zgAvailable, TEST_EMBEDDING } from "./host-stack.ts";
+import {
+  startHost,
+  canMakeUnreadableFile,
+  zgAvailable,
+  TEST_EMBEDDING,
+  installFakeZg,
+  makeTempDir,
+} from "./host-stack.ts";
+import type { Host, ShellCall } from "./host-stack.ts";
+import { embeddingCached } from "../embedding-cache.ts";
+import { DEFAULT_EMBEDDING } from "../../lib/embedding-catalog.ts";
 
 const cleanups: (() => void)[] = [];
 
 /** 预检用例里那条"不存在"的忽略文件名（多处引用，提成常量免得字面量重复触发 sonarjs）。 */
 const MISSING_IGNORE = "does-not-exist.ignore";
-
-/** 本地 embedding 权重是否已缓存（否则 zg index 要联网下载 ⇒ 跳过索引路径用例）。 */
-function localModelCached(): boolean {
-  const models = path.join(homedir(), ".zvec-grep", "models");
-  return (
-    existsSync(path.join(models, "hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf")) ||
-    existsSync(path.join(models, "model2vec", "minishlab--potion-code-16M-v2"))
-  );
-}
 
 /** 建一个带源文件的临时工作区，并登记清理。 */
 function workspace(files: Record<string, string> = {}): string {
@@ -51,6 +52,37 @@ function workspace(files: Record<string, string> = {}): string {
   return dir;
 }
 
+/**
+ * 以该前缀递进官方执行器的命令行名单（`host.shellCalls` 是台架记下的真实请求，不是文案）。
+ */
+function commandsSent(host: Host, prefix: string): string[] {
+  return host.shellCalls
+    .filter((row) => row.request.command.startsWith(prefix))
+    .map((row) => row.request.command);
+}
+
+/**
+ * 该前缀的第一条请求。缺席时红在「没递出这条命令」并带上实际递过的前缀，
+ * 而不是红在一次可选链读出的 `undefined`（那只能说明断言拿到的不是字符串）。
+ */
+function firstCall(host: Host, prefix: string): ShellCall {
+  const call = host.shellCalls.find((row) => row.request.command.startsWith(prefix));
+  if (call === undefined) {
+    const seen = [
+      ...new Set(
+        host.shellCalls.map((row) => row.request.command.split(" ").slice(0, 2).join(" ")),
+      ),
+    ];
+    assert.fail(`本应递出以 ${prefix} 开头的命令，实际递过的是 ${JSON.stringify(seen)}`);
+  }
+  return call;
+}
+
+/** 「一条都不该递」的判据：红时把命中的命令行原样打出来，便于定位是哪条路径起错了进程。 */
+function expectNoCommand(host: Host, prefix: string): void {
+  assert.deepEqual(commandsSent(host, prefix), [], `不该递出以 ${prefix} 开头的命令`);
+}
+
 describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
   afterAll(() => {
     for (const cleanup of cleanups.splice(0).toReversed()) {
@@ -62,7 +94,8 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
       const host = await startHost();
       try {
         const names = host.ctx.tools.schemas().map((row) => row.name);
-        expect(names).toStrictEqual(["zg_search", "zg_index", "zg_status"]);
+        // 契约是「登记这三枚、且只有这三枚」；登记顺序不是本用例的承诺（顺序变了不该红）。
+        expect(names.toSorted()).toStrictEqual(["zg_index", "zg_search", "zg_status"]);
         for (const name of names) {
           const definition = host.ctx.tools.get(name);
           assert.ok(definition !== undefined, name);
@@ -75,7 +108,9 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
           assert.equal(typeof definition.output.render, "function", name);
         }
         // 闭集枚举与单值/多值并集都从同一份名单来：参数面里的枚举必须与取值器同源。
-        const search = host.ctx.tools.get("zg_search")?.parameters as {
+        const searchTool = host.ctx.tools.get("zg_search");
+        assert.ok(searchTool !== undefined, "zg_search 没经官方注册面登记");
+        const search = searchTool.parameters as {
           properties: Record<string, { enum?: string[]; items?: { enum?: string[] } }>;
         };
         expect(search.properties["preview"]?.enum).toStrictEqual(["none", "short", "full"]);
@@ -113,8 +148,7 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
         const outcome = await host.call("zg_search", { query: "authService" }, agent);
         assert.ok(!outcome.isError, host.textOf(outcome));
         // 版本探测之外的第一条前台请求就是这次检索。
-        const call = host.shellCalls.find((row) => row.request.command.startsWith("zg query"));
-        assert.ok(call !== undefined);
+        const call = firstCall(host, "zg query");
         expect(call.spec.command).toContain("--limit 3");
         expect(call.spec.timeoutMs).toBe(4321);
         expect(call.spec.stdoutMaxBytes).toBe(400_000);
@@ -153,8 +187,7 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
         expect(text).toContain("auth.ts");
         assert.match(text, /1:\s*export function authService/u);
         // 命令侧：--rg 在，索引侧旗标不在。
-        const call = host.shellCalls.find((row) => row.request.command.startsWith("zg query"));
-        assert.ok(call !== undefined);
+        const call = firstCall(host, "zg query");
         expect(call.spec.command).toContain("--rg");
         expect(call.spec.command).toContain("'authService'");
         expect(call.spec.command).not.toContain("--preview");
@@ -173,8 +206,8 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
       try {
         const outcome = await host.call("zg_search", { query: "authService" }, host.agentOf(ws));
         assert.ok(!outcome.isError, host.textOf(outcome));
-        const call = host.shellCalls.find((row) => row.request.command.startsWith("zg query"));
-        expect(call?.spec.command).toContain("--mode direct");
+        const call = firstCall(host, "zg query");
+        expect(call.spec.command).toContain("--mode direct");
       } finally {
         await host.dispose();
       }
@@ -198,8 +231,12 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
     }, 60_000);
 
     it("默认 embedding 原样进命令行（不换默认、不偷偷回落）", async () => {
-      // 这条只起进程不建索引：不加载模型权重（并行跑全套时的内存大户），
-      // 却把「设置默认值 → 命令行」这条链路钉住。
+      // 这条要钉的是「设置默认值 → 命令行」这一截，与权重无关：真起一次 zg index 时上游会
+      // 加载默认那枚模型（实测 stderr 打 `Preparing local/qwen3-embedding-0.6b`，本机有权重所以
+      // 只是慢，缺权重的机器会转成一次几百 MB 下载）。故进程换成假件：仍是真 spawn、真 argv、
+      // 真执行器记录，但不加载权重，也不受缓存与环境摆布。
+      const fakeDir = makeTempDir(cleanups, "zg-int-fake-");
+      const restoreFake = installFakeZg({ ms: 20, pidFile: path.join(fakeDir, "zg.pid") });
       const host = await startHost();
       const ws = workspace();
       try {
@@ -209,15 +246,14 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
           host.agentOf(ws),
         );
         assert.ok(!outcome.isError, host.textOf(outcome));
-        const call = host.shellCalls.find((row) => row.request.command.startsWith("zg index"));
-        // 设置卡默认值（DEFAULT_EMBEDDING）逐字出现在命令行上；本测试文件另有一组用例
-        // 显式覆盖它（TEST_EMBEDDING），免得几个并行 zg 进程同时加载几百 MB 权重。
-        expect(call?.spec.command).toContain("--embedding");
-        expect(call?.spec.command).toMatch(/--embedding 'local\/[a-z0-9.-]+'/u);
+        // 设置卡默认值逐字出现在命令行上（不是「任一 local 模型」那种放过）。
+        const call = firstCall(host, "zg index");
+        expect(call.spec.command).toContain(`--embedding '${DEFAULT_EMBEDDING}'`);
       } finally {
         await host.dispose();
+        restoreFake();
       }
-    }, 120_000);
+    }, 60_000);
 
     it("root 不存在时前置归因，不把 spawn 失败说成「zg 没装」", async () => {
       const host = await startHost();
@@ -228,9 +264,7 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
         assert.ok(outcome.isError);
         assert.match(host.textOf(outcome), /不存在|no such/iu);
         // 没有目录就不该发出命令：existsSync 预检在 resolve 之前。
-        expect(
-          host.shellCalls.filter((row) => row.request.command.startsWith("zg status")),
-        ).toStrictEqual([]);
+        expectNoCommand(host, "zg status");
       } finally {
         await host.dispose();
       }
@@ -252,9 +286,7 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
         assert.ok(outcome.isError);
         expect(host.textOf(outcome)).toContain(MISSING_IGNORE);
         // 一条 zg 都不该起来（起了一次就是一次被弄坏的工作区）。
-        expect(
-          host.shellCalls.filter((row) => row.request.command.startsWith("zg index")),
-        ).toStrictEqual([]);
+        expectNoCommand(host, "zg index");
       } finally {
         await host.dispose();
       }
@@ -270,8 +302,8 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
           host.agentOf(ws),
         );
         assert.ok(!outcome.isError, host.textOf(outcome));
-        const call = host.shellCalls.find((row) => row.request.command.startsWith("zg index"));
-        expect(call?.spec.command).toContain("--ignore-file '.zvecignore'");
+        const call = firstCall(host, "zg index");
+        expect(call.spec.command).toContain("--ignore-file '.zvecignore'");
       } finally {
         await host.dispose();
       }
@@ -280,11 +312,11 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
     it("绝对路径的 ignore 文件按原样递过去（预检不把它改成相对 root）", async () => {
       const host = await startHost();
       const ws = workspace();
-      const outside = path.join(tmpdir(), `zg-ignore-${Math.random().toString(36).slice(2)}`);
+      // 目录由 mkdtemp 给（不靠 Math.random 的姓名，并行进程不会互相覆盖），
+      // 且登记在写文件之前：写失败时留下的是一枚空目录，而不是没人收的孤儿文件。
+      const outsideDir = makeTempDir(cleanups, "zg-ignore-");
+      const outside = path.join(outsideDir, "external.ignore");
       writeFileSync(outside, "*.log\n");
-      cleanups.push(() => {
-        rmSync(outside, { force: true });
-      });
       try {
         const outcome = await host.call(
           "zg_index",
@@ -292,8 +324,8 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
           host.agentOf(ws),
         );
         assert.ok(!outcome.isError, host.textOf(outcome));
-        const call = host.shellCalls.find((row) => row.request.command.startsWith("zg index"));
-        expect(call?.spec.command).toContain(`--ignore-file '${outside}'`);
+        const call = firstCall(host, "zg index");
+        expect(call.spec.command).toContain(`--ignore-file '${outside}'`);
       } finally {
         await host.dispose();
       }
@@ -329,14 +361,13 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
           { confirm: true, drop: true, ignoreFiles: [MISSING_IGNORE] },
           host.agentOf(ws),
         );
+        assert.ok(outcome.isError, host.textOf(outcome));
         expect(host.textOf(outcome)).toContain("drop 与这些索引侧参数互斥");
         expect(host.textOf(outcome)).toContain("ignoreFiles");
         // 绝不是那句存在性误拒（预检被 drop 跳过，没读 ignoreFiles）。
         expect(host.textOf(outcome)).not.toContain(MISSING_IGNORE);
         // 没有任何 `zg index` 命令被构造出去（版本门槛的探测调用不算——它在占位之前）。
-        expect(
-          host.shellCalls.filter((row) => row.request.command.startsWith("zg index")),
-        ).toHaveLength(0);
+        expectNoCommand(host, "zg index");
       } finally {
         await host.dispose();
       }
@@ -366,9 +397,7 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
           // 与"不存在"共用那句「不是一份存在且当前进程可读的文件」文案（点名成因覆盖面）。
           expect(text).toContain("存在且当前进程可读");
           // 一条 zg 都不该起来（起了一次就是一次被弄坏的工作区）。
-          expect(
-            host.shellCalls.filter((row) => row.request.command.startsWith("zg index")),
-          ).toStrictEqual([]);
+          expectNoCommand(host, "zg index");
         } finally {
           chmodSync(target, 0o644);
           await host.dispose();
@@ -378,7 +407,7 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
     );
   });
 
-  describe.skipIf(!localModelCached())("真实宿主：索引通道（本地 embedding）", () => {
+  describe.skipIf(!embeddingCached(TEST_EMBEDDING))("真实宿主：索引通道（本地 embedding）", () => {
     it("zg_index 真建索引 → 新的 apply 会话走索引通道 → 命中摘要按真输出解析", async () => {
       const ws = workspace();
       const builder = await startHost({ config: { defaultEmbedding: TEST_EMBEDDING } });
@@ -406,19 +435,19 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
         expect(text).toContain("1 个查询组");
         // 走的是索引通道：没有改道声明，也没有 --rg。
         expect(text).not.toContain("穷举词法检索");
-        const call = fresh.shellCalls.find((row) => row.request.command.startsWith("zg query"));
-        expect(call?.spec.command).not.toContain("--rg");
-        expect(call?.spec.command).toContain("--refresh wait");
+        const call = firstCall(fresh, "zg query");
+        expect(call.spec.command).not.toContain("--rg");
+        expect(call.spec.command).toContain("--refresh wait");
       } finally {
         await fresh.dispose();
       }
     }, 300_000);
 
-    it("建完索引前搜过一次的话，建完后的那一次检索仍照旧改道（负向探测缓存 60s）", async () => {
-      // 这条钉的是**已知取舍**而不是期望行为：zg_index 是运行期动作，而探测缓存的负向条目
-      // TTL 是 60s。于是"先搜过一次（那时没有索引）→ 建索引 → 再搜"会拿到一条已经过时的
-      // `尚无 zg 索引` 声明 + rg 结果，而索引明明已经在盘上。改动这个缓存策略（例如索引成功
-      // 后主动作废条目）必须让这条先红。
+    it("建完索引后的那一次检索走索引通道（zg_index 成功即失效探测缓存，不等 60s TTL）", async () => {
+      // 历史形态（已修）：探测缓存的负向条目只等 TTL 过期，"先搜（无索引）→ zg_index →
+      // 再搜"会拿到过时的 `尚无 zg 索引` 声明 + rg 结果——模型被卡在既搜不到也 grep 不了
+      // 的窗口里。现在 zg_index 前台落定即 invalidate 该根的缓存条目，下一次检索必须
+      // 走索引通道（不再改道穷举、不再带陈旧声明）。
       const host = await startHost({ config: { defaultEmbedding: TEST_EMBEDDING } });
       const ws = workspace();
       try {
@@ -429,14 +458,14 @@ describe.skipIf(!zgAvailable())("真实宿主：工具执行面", () => {
 
         const built = await host.call("zg_index", { confirm: true }, agent);
         assert.ok(!built.isError, host.textOf(built));
-        const index = host.shellCalls.find((row) => row.request.command.startsWith("zg index"));
-        expect(index?.spec.command).toContain("--embedding");
+        const index = firstCall(host, "zg index");
+        expect(index.spec.command).toContain("--embedding");
 
         const after = await host.call("zg_search", { query: "authService" }, agent);
         assert.ok(!after.isError, host.textOf(after));
-        expect(host.textOf(after)).toContain("穷举词法检索");
-        // 此刻盘上已经有索引：这条声明与事实不符（缓存陈旧），把现象钉在这里。
-        expect(host.textOf(after)).toContain("尚无 zg 索引");
+        // 索引已在盘上：不再改道穷举，陈旧的负向声明随失效一并消失。
+        expect(host.textOf(after)).not.toContain("穷举词法检索");
+        expect(host.textOf(after)).not.toContain("尚无 zg 索引");
       } finally {
         await host.dispose();
       }

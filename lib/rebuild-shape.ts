@@ -36,9 +36,11 @@ export interface RebuildStarted {
 }
 
 /**
- * 旧 HTTP 面留给拒绝应答的语义码，逐字取自构造点的实发值（lib/rebuild-remote.ts 的
- * 400/403/404/409/500/503）。收敛成字面量联合而不是裸 `number`：构造点误填别的数字
- * 在编译期就红，而不是带着一个没人认识的码上线。客户端只读 error，测试用它保语义。
+ * 拒绝应答的语义码，字面沿用自本包还没有 Remote 数据面时那套 HTTP 应答（本包现在不自建
+ * HTTP 路由，这些码随 Typert Remote 的拒绝回执返回），逐字取自构造点的实发值
+ * （lib/rebuild-remote.ts 的 400/403/404/409/500/503）。收敛成字面量联合而不是裸 `number`：
+ * 构造点误填别的数字在编译期就红，而不是带着一个没人认识的码上线。客户端只读 error，
+ * 测试用它保语义。
  */
 export type RebuildRefusedStatus = 400 | 403 | 404 | 409 | 500 | 503;
 

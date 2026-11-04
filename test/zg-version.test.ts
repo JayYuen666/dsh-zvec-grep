@@ -37,6 +37,8 @@ describe("parseZgVersion", () => {
 
   it("前后空白一律容忍（某些 shell 会把它包进引号回显）", () => {
     assert.deepEqual(ver("  1.10.3  \n"), { major: 1, minor: 10, patch: 3 });
+    // 带引号的形态属于「读不懂」⇒ fail-open 放行：这是设计取舍，写死在这里。
+    assert.equal(parseZgVersion('"0.2.2"\n'), undefined, "引号不剥：读不懂按放行");
   });
 
   it("v 前缀容忍：老 zg 若输出 v0.1.0，门槛要拦得住它而不是当成「读不懂」放行", () => {
@@ -48,6 +50,8 @@ describe("parseZgVersion", () => {
     // 10 个 9 的分量若被解析成 Infinity/巨数，「版本极大」会静默通过门槛——fail-open。
     assert.equal(parseZgVersion("9999999999.0.0"), undefined);
     assert.equal(parseZgVersion("1.99999999999.0"), undefined);
+    // 正向边界：9 位分量恰好合法（\d{1,9} 被误改成 {1,8} 时这条红）。
+    assert.deepEqual(ver("123456789.0.0"), { major: 123_456_789, minor: 0, patch: 0 });
   });
 
   it("多段版本号（1.2.3.4）不认：宁可读不懂也不猜", () => {
@@ -64,6 +68,9 @@ describe("parseZgVersion", () => {
     for (const text of ["0x1.2.3", "01.2.3x", "..", "0..2"]) {
       assert.equal(parseZgVersion(text), undefined, `不该认：${JSON.stringify(text)}`);
     }
+    // 前导零（无尾随杂字）被正则接受并按十进制归一：01.2.3 解析成 1.2.3，不是八进制。
+    // 这一口径写死在这里——将来若改成正则拒前导零，这条会红着提醒同步。
+    assert.deepEqual(ver("01.2.3"), { major: 1, minor: 2, patch: 3 });
   });
 });
 
@@ -85,6 +92,11 @@ describe("versionAtLeast", () => {
   it("次段优先于修订段：0.3.0 > 0.2.99", () => {
     assert.equal(versionAtLeast(ver("0.3.0"), ver("0.2.99")), true);
   });
+
+  it("修订段也是数值比：0.2.10 > 0.2.9（字符串比会判反）", () => {
+    assert.equal(versionAtLeast(ver("0.2.10"), ver("0.2.9")), true);
+    assert.equal(versionAtLeast(ver("0.2.9"), ver("0.2.10")), false);
+  });
 });
 
 describe("tooOldZgVersion", () => {
@@ -104,7 +116,10 @@ describe("tooOldZgVersion", () => {
   });
 
   it("读不懂的一律按「探测不到」放行，绝不拿猜出来的版本去拦真实用户", () => {
-    for (const text of ["", "not a version", "0.2.1-rc.1"]) {
+    // 「读不懂」含极老但形态不匹配的输出（0.1.0-rc.1、带包名前缀）——这些形态
+    // fail-open 是设计取舍：门槛的职责是拦「确知太老」，不是逼人修 shell 输出。
+    // 将来若把「读不懂」改判为拒绝，这组用例会红着提醒同步。
+    for (const text of ["", "not a version", "0.2.1-rc.1", "zvec-grep 0.1.0", "0.1.0-rc.1\n"]) {
       assert.equal(tooOldZgVersion(text), undefined, `读不懂就放行：${JSON.stringify(text)}`);
     }
   });
@@ -114,12 +129,15 @@ describe("tooOldZgVersion", () => {
   });
 
   it("门槛常量与比较用的字面量同源（改一处必须改两处，这里钉住）", () => {
-    // MINIMUM_ZG_VERSION 是给用户看的字符串，MINIMUM 是拿来比的对象；两者不同步的话
-    // 文案会报一个与实际判定不符的版本号。
-    assert.equal(
-      formatZgVersion(parseZgVersion(MINIMUM_ZG_VERSION) ?? { major: 0, minor: 0, patch: 0 }),
-      MINIMUM_ZG_VERSION,
+    // MINIMUM_ZG_VERSION 是给用户看的字符串，也是 tooOldZgVersion 内部比较的对象。
+    // 解析失败不能伪装成 0.0.0：那个兜底会让「lib 门槛或正则漂了」表现成
+    // 「0.0.0 !== 0.2.2」，根因不可见。先钉解析成功，再比同源。
+    const parsedMinimum = parseZgVersion(MINIMUM_ZG_VERSION);
+    assert.ok(
+      parsedMinimum !== undefined,
+      `MINIMUM_ZG_VERSION（${MINIMUM_ZG_VERSION}）解析失败：lib 侧门槛或正则漂了`,
     );
+    assert.equal(formatZgVersion(parsedMinimum), MINIMUM_ZG_VERSION);
     assert.equal(tooOldZgVersion(MINIMUM_ZG_VERSION), undefined);
   });
 });

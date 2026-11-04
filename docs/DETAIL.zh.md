@@ -5,7 +5,7 @@
 ## 设置卡上改的是什么
 
 - **检索模型** — `defaultEmbedding`（默认 `local/qwen3-embedding-0.6b`，约 640 MB）只作用于**新建**的索引；已有索引沿用它自己的模型，要换得先重建。`defaultLimit`（1–50，默认 10）是每组结果返回多少条命中。
-- **网络与索引** — `hfEndpoint` 默认指向 ModelScope 镜像（`https://modelscope.cn/models`）；留空就是 huggingface.co，而这个环境通常连不上，所以默认值应当保留。`enforceSearchFirst`（默认开）在已建索引的工作区里拦住 `grep` / `rg`。`grepBudgetPerSearch`（默认 3）是一次成功的 `zg_search` 解锁多少次直查，`unlockWindowMin`（默认 10）是这份解锁维持几分钟。有效期在每次取用配额时现判，窗口一过就不再放行直查、不需要重启；分片表按会话数封顶 256，超出时先淘汰最久未用的那一份。本步骤的工具准入不含 `zg_search` 时，门禁让路，不强迫模型去调一个本步骤调不动的工具。
+- **网络与索引** — `hfEndpoint` 默认指向 ModelScope 镜像（`https://modelscope.cn/models`）；留空就是 huggingface.co，而这个环境通常连不上，所以默认值应当保留。`enforceSearchFirst`（默认开）在已建索引的工作区里拦住 `grep` / `rg`。`grepBudgetPerSearch`（默认 3）是一次**走索引的** `zg_search` 解锁多少次直查（无索引时自动改走穷举词法的检索同样成功，但不发配额），`unlockWindowMin`（默认 10）是这份解锁维持几分钟。配额按「会话 × 索引根」记账（索引根是 root 或最近的含索引祖先，最多上溯 8 层），不是全局一份；「让路」只在宿主提供了步骤准入（`toolSet`）且该视图不含 `zg_search` 时成立——不提供准入信息的宿主仍按原判据拦截。有效期在每次取用配额时现判，窗口一过就不再放行直查、不需要重启；分片表按会话数封顶 256，超出时先淘汰最久未用的那一份。该索引根上有活跃重建时，门禁临时放行且**不消耗配额**：重建持着写锁，这期间语义检索必然失败，门禁不能再把直查一起堵死。本步骤的工具准入不含 `zg_search` 时，门禁让路，不强迫模型去调一个本步骤调不动的工具。
 
 这些每次调用现读，改完不需要重启宿主。
 
@@ -15,7 +15,7 @@
 
 ## 要重启的值
 
-十项部署值刻意不进设置卡：`searchTimeoutMs`（300000）、`statusTimeoutMs`（60000）、`indexTimeoutMs`（600000）、`stdoutMaxBytes`（400000）、`rebuildWaitMs`、`clientMode`（`auto` / `direct` / `server`）、`allowRemoteEmbedding`（false）、`remoteEmbeddingEndpoint`、`remoteEmbeddingApiKeyFrom`、`requireApprovalForExplicitRoot`（false）。
+十项部署值刻意不进设置卡：`searchTimeoutMs`（300000）、`statusTimeoutMs`（60000）、`indexTimeoutMs`（600000）、`stdoutMaxBytes`（400000）、`rebuildWaitMs`（120000）、`clientMode`（`auto` / `direct` / `server`）、`allowRemoteEmbedding`（false）、`remoteEmbeddingEndpoint`、`remoteEmbeddingApiKeyFrom`、`requireApprovalForExplicitRoot`（false）。这十项在卡上没有入口，能生效的只有下一段那条注册行 `config:`；优先级是注册行 `config:` > 代码里的 `.default()`。
 
 「工作区内容能不能离开本机」被当成部署决定，而不是给模型选的开关，所以远程嵌入那三枚既不在卡上也不在工具参数里；即便开了，`zg` 自己仍要求 `--allow-remote` 或 `zg auth grant`。这些值都写在**自己 profile 的 `cordis.yml`** 里本插件注册行的 `config:` 块（随包那份 `cordis.patch.yml` 只带 `id` / `name` 两行），改值随重启生效。
 
@@ -25,4 +25,4 @@
 
 ## 更完整的说明
 
-错误码表、参数守卫与后台作业面都写在随包 README（`README.md` / `README.zh-CN.md`）。
+参数守卫、`root` 判据与后台作业面都写在随包 README（`README.md` / `README.zh-CN.md`）。README 没有独立的错误码表：`zg` 不在 PATH 上按 `exit 127` 归到「未安装」（见「外部依赖」一节），其余失败按工具回执里的 `reason` 读。

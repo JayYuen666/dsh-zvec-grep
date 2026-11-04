@@ -7,6 +7,7 @@ import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { MESSAGES, fill } from "../lib/messages.ts";
 import type { ZvecGrepMessages } from "../lib/messages.ts";
+import { CJK_RESIDUE } from "./cjk-residue.ts";
 
 /** 模板里的 {占位符} 名字集合：只认花括号包住的词（英文整条文案里的裸词不是占位符）。 */
 function placeholders(template: string): Set<string> {
@@ -66,10 +67,33 @@ describe("两语字典同源", () => {
       assert.ok(MESSAGES.zh[key].length > 0, `zh.${key} 为空`);
       assert.ok(MESSAGES.en[key].length > 0, `en.${key} 为空`);
     }
-    assert.doesNotMatch(
-      `${MESSAGES.en.gateReason}${MESSAGES.en.notInstalledFailure}`,
-      /[\u4E00-\u9FFF]/u,
-    );
+    // 全量遍历而不是抽查两条：en 侧现量 138 条，混进中文（多半是从 zh 复制后没翻完）的
+    // 那一条只有在这里被点名才会被拦住；抽查写法等于让其余条目无人看守。
+    for (const key of KEYS) {
+      assert.doesNotMatch(MESSAGES.en[key], CJK_RESIDUE, `en.${key} 残留中文`);
+    }
+  });
+
+  it("每条模板按自己的占位符名喂 fill：替换都落到位，不留花括号", () => {
+    // 全字典遍历而不是只盯 gateReason。这里**不按「有没有认出占位符」过滤条目**：
+    // 写坏的占位符（`{stat e}` 这种带空格的）正是 placeholders() 认不出来的那些，
+    // 一过滤就等于放过它 —— 所以对每条都断「填完之后文本里不该再有裸花括号」。
+    // 这一条证的是**字典侧**的替换；调用方传的键名对不对，字典自己看不见 ——
+    // 那一条由下面用字面实参钉住的 gateReason 用例覆盖（它是真调用点的那一组名字）。
+    for (const key of KEYS) {
+      for (const text of [MESSAGES.zh[key], MESSAGES.en[key]]) {
+        const names = [...placeholders(text)];
+        const args: Record<string, string> = {};
+        for (const name of names) {
+          args[name] = `«${name}»`;
+        }
+        const filled = fill(text, args);
+        assert.doesNotMatch(filled, /[{}]/u, `填完仍有花括号：${key} 里有认不出或没被替换的占位符`);
+        for (const name of names) {
+          assert.ok(filled.includes(`«${name}»`), `${key} 的 {${name}} 没被替换成实参`);
+        }
+      }
+    }
   });
 
   it("带变量的模板都真用了 fill（占位符名与实参同名）", () => {
@@ -103,11 +127,17 @@ describe("root 参数描述与实际放行范围一致", () => {
   });
 
   it("三条放行路径在两语文案里都点名了", () => {
-    for (const name of ["zh", "en"] as const) {
-      const text = MESSAGES[name].rootSearchDescription;
-      assert.match(text, /本会话已登记|already registered/u, `${name} 缺「已登记」这条`);
-      assert.match(text, /上级或下级|parents or children/u, `${name} 缺「上级或下级」这条`);
-    }
+    // 按语言各判各的短语：交替正则（/本会话已登记|already registered/）会让 en 文案里混进
+    // 中文短语也通过，与上面那条「en 不残留中文」的全量遍历口径不一致。
+    // 三条路径都点：少断一条，模型就会以为某条合法路径被拒而绕路（用例名承诺的是三条）。
+    const zh = MESSAGES.zh.rootSearchDescription;
+    assert.match(zh, /会话工作区本身/u, "zh 缺「会话工作区本身」这条");
+    assert.match(zh, /上级或下级/u, "zh 缺「上级或下级」这条");
+    assert.match(zh, /本会话已登记/u, "zh 缺「本会话已登记」这条");
+    const en = MESSAGES.en.rootSearchDescription;
+    assert.match(en, /the workspace itself/iu, "en 缺 the workspace itself 这条");
+    assert.match(en, /parents or children/iu, "en 缺 parents or children 这条");
+    assert.match(en, /already registered/iu, "en 缺 already registered 这条");
   });
 });
 
@@ -116,8 +146,14 @@ describe("hitCapped 只陈述计数，不推断是否还有更多", () => {
   // 「某组 count === limit」只说明这一组取满了，不能据此宣称还有未显示的命中。
   it("zh / en 都不出现「可能还有 / more may exist」这类推断措辞", () => {
     for (const name of ["zh", "en"] as const) {
-      assert.doesNotMatch(MESSAGES[name].hitCapped, /可能还有/u, `zh 仍含「可能还有」`);
-      assert.doesNotMatch(MESSAGES[name].hitCapped, /more may exist/iu, `en 仍含 "more may exist"`);
+      // 两个措辞对两种语言都查（zh 里混进英文推断句、en 里混进中文推断句都算回归），
+      // 提示里的语言名跟着循环变量走 —— 硬编码成「zh 仍含…」会在 en 命中时指错方向。
+      assert.doesNotMatch(MESSAGES[name].hitCapped, /可能还有/u, `${name} 仍含「可能还有」`);
+      assert.doesNotMatch(
+        MESSAGES[name].hitCapped,
+        /more may exist/iu,
+        `${name} 仍含 "more may exist"`,
+      );
     }
   });
 

@@ -27,6 +27,19 @@ const PROBE_FLAGS = new Set(["--help", "--version", "-V"]);
  * 包装/前缀命令：其首个实参本身就是「被执行的命令」，同样算命令位
  * （`git grep`、`… | xargs grep TODO`、`env rg foo` 都是真检索）。
  */
+/**
+ * 壳层包装命令：它们 `-c` 后面那一枚参数本身就是「要被执行的命令」，
+ * 不看进去就等于 `bash -c 'grep -r secret /'` 凭一层引号绕过门禁。
+ *
+ * 与 SEARCH_PREFIX_WORDS 分开列：那里的包装是「首个实参是被执行的命令」，
+ * 这里要多走一步——先认 `-c` 这类旗标，再把它后面那枚参数当脚本递归判一次。
+ */
+const SHELL_WRAPPER_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "csh", "fish"]);
+/** 壳层旗标里「其后一枚参数是脚本」的那些：`-c`、`-lc`、`-xc`（只认以 c 收尾的短旗标）。 */
+const SHELL_SCRIPT_FLAG = /^-[^c]*c$/u;
+/** 递归深度上限：一层脚本里的再一层脚本够了；更深的不判（也不该有）。 */
+const MAX_SHELL_DEPTH = 2;
+
 const SEARCH_PREFIX_WORDS = new Set([
   "git",
   "xargs",
@@ -271,6 +284,20 @@ function consumeGroupChar(char: string, state: { buffer: string; atCommand: bool
   }
 }
 
+/**
+ * `$(` 是命令替换的开头：`$` 已经是 buffer 的全部（引号外）时，这一对字符不是词内展开。
+ *
+ * 不拆开的话 `$(grep x y)` 只能切出一枚 `$(grep` token——它对不上任何检索命令名，
+ * 门禁就凭一层括号放行（与注释里那几条“实测过的绕过形态”同一类）。`${DIR}/src` 不受影响：
+ * 那里跟在 `$` 后面的是 `{`，仍按词内展开并进当前 token。
+ */
+function isCommandSubstitutionOpen(
+  char: string,
+  state: { quote: string; buffer: string },
+): boolean {
+  return char === "(" && state.quote === "" && state.buffer === "$";
+}
+
 /** 引号外、词首的 `#` 起为注释（整段跳到行尾）。 */
 function isCommentStart(char: string, state: { quote: string; buffer: string }): boolean {
   return state.quote === "" && char === "#" && state.buffer.length === 0;
@@ -414,6 +441,11 @@ function tokenizeShell(command: string): ShellToken[] {
     } else if (COMMAND_BREAK_CHARS.has(char)) {
       flush();
       markCommandBreak(command, index, char, state);
+    } else if (isCommandSubstitutionOpen(char, state)) {
+      // 丢掉那个孤零零的 `$`（flush 空 buffer 不动命令位），随后按控制符断开。
+      state.buffer = "";
+      flush();
+      markCommandBreak(command, index, char, state);
     } else if (GROUP_CHARS.has(char)) {
       consumeGroupChar(char, state);
     } else if (REDIRECT_CHARS.has(char)) {
@@ -450,6 +482,27 @@ function commandPositionIndexes(tokens: ShellToken[]): number[] {
     }
   }
   return out;
+}
+
+/** 取壳层包装那条 `-c` 脚本参数（`bash -c '…'` 里引号内那一整枚 token）。 */
+function shellScriptArguments(tokens: ShellToken[]): string[] {
+  const scripts: string[] = [];
+  for (const [index, token] of tokens.entries()) {
+    // 空脚本（`bash -c ''`）切不出 token，那一枚 script 直接是 undefined，无需再判长度。
+    const flag = tokens[index + 1];
+    const script = tokens[index + 2];
+    if (
+      token.atCommand &&
+      SHELL_WRAPPER_NAMES.has(baseName(token.text)) &&
+      flag !== undefined &&
+      script !== undefined &&
+      SHELL_SCRIPT_FLAG.test(flag.text) &&
+      !script.atCommand
+    ) {
+      scripts.push(script.text);
+    }
+  }
+  return scripts;
 }
 
 /**
@@ -492,19 +545,28 @@ function hasPathOperand(tokens: ShellToken[], from: number): boolean {
  *   - shell 关键字（`for … ; do grep`、`if … ; then rg`）不是控制符，其后的
  *     grep 不在命令位。壳层赋值（`VAR=1 grep x`）**不**属此列：commandPositionIndexes
  *     把 `VAR=1` 当「跳过但不断链」处理。
+ *   - 嵌套只认壳层包装名单里 `-c` 后面那一段，且最多看进去两层；名单外的前缀
+ *     （`watch -n 5 grep`）与 `awk 'BEGIN{system("grep x y")}'` 一类不递归。
  */
-export function isGrepRgCommand(command: string): boolean {
+export function isGrepRgCommand(command: string, depth = 0): boolean {
   const tokens = tokenizeShell(command);
   if (tokens.some((token) => PROBE_FLAGS.has(token.text))) {
     return false;
   }
-  return commandPositionIndexes(tokens).some((index) => {
+  const direct = commandPositionIndexes(tokens).some((index) => {
     const token = tokens[index];
     if (token === undefined || !GREP_COMMAND_NAMES.has(baseName(token.text))) {
       return false;
     }
     return !(token.piped && !hasPathOperand(tokens, index));
   });
+  if (direct) {
+    return true;
+  }
+  if (depth >= MAX_SHELL_DEPTH) {
+    return false;
+  }
+  return shellScriptArguments(tokens).some((script) => isGrepRgCommand(script, depth + 1));
 }
 
 /**

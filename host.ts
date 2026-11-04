@@ -1468,9 +1468,16 @@ export function createIndexProbeCache(
   now: () => number = Date.now,
   ttlMs: number = INDEX_PROBE_TTL_MS,
   max: number = INDEX_PROBE_CACHE_MAX,
-): (dir: string) => boolean {
+): ((dir: string) => boolean) & { invalidate: (dir: string) => void } {
   const cache = new Map<string, IndexProbeEntry>();
-  return (dir: string): boolean => {
+  /** 显式失效通道：zg_index 的 drop / 重建成功会真删真建 `.zvec-grep/`，缓存的
+   *  `result: true` 若只等 TTL 过期，60 秒内门禁仍按「已建索引」拦 grep/rg，
+   *  findIndexRoot 也仍走索引通道（实际会以 WORKSPACE_INDEX_NOT_FOUND 失败）——
+   *  模型被卡在既搜不到也 grep 不了的窗口里。 */
+  const invalidate = (dir: string): void => {
+    cache.delete(dir);
+  };
+  const cached = (dir: string): boolean => {
     const at = now();
     const hit = cache.get(dir);
     if (hit !== undefined && at - hit.probedAt < ttlMs) {
@@ -1485,6 +1492,8 @@ export function createIndexProbeCache(
     evictAged(cache, max, (entry) => entry.probedAt + ttlMs, at);
     return result;
   };
+  cached.invalidate = invalidate;
+  return cached;
 }
 
 /**
@@ -1661,7 +1670,7 @@ interface PluginRuntime {
   ledger: RootLedger;
   unlocks: UnlockLedger;
   /** 索引探测的按目录缓存（同一 apply 内 guard 与 zg_search 共用一份，见 createIndexProbeCache）。 */
-  indexProbe: (dir: string) => boolean;
+  indexProbe: ((dir: string) => boolean) & { invalidate: (dir: string) => void };
   /**
    * 活跃重建的统一状态源。设置卡重建读面、前台索引工具、模型侧后台索引、检索等待与门禁
    * 放行都读它，不再各自判断「这条树上是不是已经在重建」。
@@ -2075,6 +2084,10 @@ async function runIndexTool(
       stdoutMaxBytes: config.stdoutMaxBytes,
       messages,
     });
+    // 前台 zg_index 落定（建/重建/drop 都真删真建 .zvec-grep/）：该根的探测缓存当场
+    // 失效——`result: true` 的条目若只等 TTL 过期，60 秒内门禁仍按「已建索引」拦
+    // grep/rg，而 findIndexRoot 已走不到索引，模型被卡在既搜不到也 grep 不了的窗口里。
+    runtime.indexProbe.invalidate(root);
     return { text };
   } finally {
     // 工具侧的重建是前台的：命令返回即落定，占位随之交还（含超时/被中止/失败）。
@@ -2173,10 +2186,18 @@ async function runStatusTool(
   // zg_search 的门槛和设置卡引导读面共用同一份探测结果。
   // 只在这条「真读了状态」的出口上补：上面那条「正在重建中」的合成投影刻意不起任何进程，
   // 在那里插一发探测会破掉它自己的契约。
-  const daemonNote = (await runtime.serverGate.ready())
-    ? messages.serverReadyNote
-    : messages.serverUnavailableNote;
-  return { text: `${text}\n${daemonNote}` };
+  // 注文按部署的 clientMode 收口：direct 部署没有 server 能力，「可走 server 模式」
+  // 是空头承诺——不发注文。auto 保持两臂（就绪 ⇒ server 能力成立；未就绪 ⇒ 实际
+  // 直连冷加载，那行出走提示正是给这份部署的）；server + 缺席保留出路提示
+  // （「按直连」那半句与 server 部署不符，但可行动的部分是 `zg server on`）。
+  const mode = readClientMode(config, messages);
+  const ready = await runtime.serverGate.ready();
+  // direct 部署不发注文（server 能力不存在）；auto/server 两臂照旧。
+  let daemonNote: string | null = null;
+  if (mode !== "direct") {
+    daemonNote = ready ? messages.serverReadyNote : messages.serverUnavailableNote;
+  }
+  return daemonNote === null ? { text } : { text: `${text}\n${daemonNote}` };
 }
 function registerStatusTool(runtime: PluginRuntime, registered: ZvecGrepMessages): void {
   define(runtime.host, {

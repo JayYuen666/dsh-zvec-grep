@@ -254,6 +254,7 @@ export interface ZvecGrepMessages {
   readonly limitOutOfRange: string;
   /** 非字符串数组：`{name}`。 */
   readonly mustBeStringArray: string;
+  readonly mustBeStringOrArray: string;
   /** 数组超条数：`{name}`、`{maxItems}`、`{actual}`。 */
   readonly tooManyItems: string;
   /** 数组含非字符串项：`{name}`、`{received}`。 */
@@ -524,6 +525,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     limitInvalid: "limit 必须是非负整数（省略则用默认值）",
     limitOutOfRange: "limit 超出允许范围 {min}–{max}（省略则用默认值）",
     mustBeStringArray: "{name} 必须是字符串数组",
+    mustBeStringOrArray: "必须是字符串或字符串数组",
     tooManyItems: "{name} 最多 {maxItems} 项（实际 {actual}）",
     nonStringItem: "{name} 含非字符串项（{received}）",
     commandTooLong: "zg 命令总长 {length} 字节，超过 {maxBytes} 字节上限，请缩小检索范围",
@@ -862,6 +864,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "current session workspace)",
     limitInvalid: "limit must be a non-negative integer (omit it to use the default)",
     limitOutOfRange: "limit is out of the allowed range {min}–{max} (omit it to use the default)",
+    mustBeStringOrArray: "must be a string or an array of strings",
     mustBeStringArray: "{name} must be an array of strings",
     tooManyItems: "{name} allows at most {maxItems} items (actual {actual})",
     nonStringItem: "{name} contains a non-string item ({received})",

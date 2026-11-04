@@ -10,7 +10,9 @@
 // （引用 + 维度，见 src/client-entry.ts），所以「哪档模型多大、要什么后端」是**选型说明**
 // 而不是文案：它写在下面的分组注释里，不另立一张没有消费者的双语字典。
 
-export type LocalEmbeddingBackend = "llama-cpp" | "transformers-js" | "model2vec";
+/** 本地后端白名单（单一来源）：联合类型由它推导，测试与运行时判据共用同一份。 */
+export const LOCAL_EMBEDDING_BACKENDS = ["llama-cpp", "transformers-js", "model2vec"] as const;
+export type LocalEmbeddingBackend = (typeof LOCAL_EMBEDDING_BACKENDS)[number];
 
 /** 字段全 readonly：候选清单是不可变数据，消费者改写条目会造出「卡片显示的维度与
  *  zg 实际索引维度不一致」这类无报错的漂移，约束必须落在类型上。 */

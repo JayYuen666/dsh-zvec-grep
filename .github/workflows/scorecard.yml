@@ -14,13 +14,19 @@ on:
   schedule:
     - cron: "23 4 * * 1"
   push:
+    # 分支名在这里只能是静态字符串：过滤器位置不提供任何 context，表达式写法会被 actionlint 判成
+    # `context "github" is not allowed here`，因此做不到与下面 if: 里那个
+    # github.event.repository.default_branch 同源。默认分支若改名，这一行要手工跟着改，
+    # 否则 push 这个入口静默失效（schedule 与两个手动入口仍在，体检不会完全停）。
     branches: [main]
-# 四个入口（push / schedule / branch_protection_rule / workflow_dispatch）会撞在一起：
-# main 上的一次 push 与周度 cron 各自跑同一份 analysis、往 code scanning 传同名 category
-# 的结果，后传的覆盖前一份。所以按事件名分组、且不取消——体检结果不该因为又一次运行而
-# 被判成「没量过」。这与 ci.yml / codeql.yml 的分组口径一致。
+# 四个入口（push / schedule / branch_protection_rule / workflow_dispatch）会在同一个 ref 上
+# 撞车：两份 analysis 往 code scanning 传同名 category 的结果，后传的覆盖前一份，中间还夹着
+# 一次可能失败的并发上传；OIDC 换 token 与公有 API 的发布额度也被无谓重复消耗。
+# 所以组键按 ref 聚合，让同一 ref 的分析排成一队，并**不**取消——体检结果不该因为又一次运行
+# 而被判成「没量过」。(早先把 event_name 放进组键，正好让四个入口各自成组并行，把要防的覆盖
+# 变成了默认行为；那条口径与这里的目的相反。)
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 # 工作流级全只读；两个写权限只挂在 analysis job 上。
 permissions: read-all
@@ -30,7 +36,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # publish_results: true 只在默认分支生效，所以在非默认分支上不跑这条。
-    if: github.event.repository.default_branch == github.ref_name
+    # 判据比的是完整 ref 而不是 github.ref_name：ref_name 是短名，名为 `main` 的 tag 与 main
+    # 分支在它眼里一样，在那种 ref 上手跑会过判并让 OIDC 发布出错误来源的结果。
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     permissions:
       security-events: write
       id-token: write
@@ -56,6 +64,6 @@ jobs:
           path: results.sarif
           retention-days: 5
       - name: Upload to code-scanning
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
         with:
           sarif_file: results.sarif
