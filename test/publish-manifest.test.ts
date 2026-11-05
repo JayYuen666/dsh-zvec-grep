@@ -732,7 +732,24 @@ describe("发布态运行期依赖面（装出去之后才炸的那一类）", (
     }
     const { manifest } = await readSurface();
     const provided = new Set(Object.keys(hostRanges(manifest)));
-    const missing = [...needed].filter((name) => !provided.has(name)).toSorted();
+    // shared 自己的普通依赖会随它一起装出去（例如纯解析器 dsh-fs-patch），
+    // 不需要消费者再在 peer ∪ dev 里重复提供；只要求 shared 没有声明的那部分。
+    const sharedManifestPath = createRequire(import.meta.url).resolve(
+      "@jayyuen66/dsh-plugin-shared/package.json",
+    );
+    const sharedManifest: unknown = JSON.parse(await readFile(sharedManifestPath, "utf8"));
+    const sharedDependencies =
+      sharedManifest !== null &&
+      typeof sharedManifest === "object" &&
+      "dependencies" in sharedManifest &&
+      sharedManifest.dependencies !== null &&
+      typeof sharedManifest.dependencies === "object"
+        ? Object.keys(sharedManifest.dependencies)
+        : [];
+    const shippedByShared = new Set(sharedDependencies);
+    const missing = [...needed]
+      .filter((name) => !provided.has(name) && !shippedByShared.has(name))
+      .toSorted();
     expect(
       missing,
       `这些宿主包是 shared 产物的运行期值导入，本包没提供：装出去即 ERR_MODULE_NOT_FOUND`,

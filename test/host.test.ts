@@ -560,9 +560,14 @@ function volatileFormOf(node: SchemaNode): string[] | null {
  *  写死会让测试与包体漂移。 */
 function patchEntryId(): string {
   const yml = readFileSync(fileURLToPath(new URL("../cordis.patch.yml", import.meta.url)), "utf8");
-  const match = /^\s*-\s+id:\s*(?<id>\S+)\s*$/mu.exec(yml);
-  const id = match?.groups?.["id"];
-  assert.ok(typeof id === "string" && id.length > 0, "cordis.patch.yml 里没有裸 `- id:` 条目");
+  const id = Array.from(
+    yml.matchAll(/^\s*-\s+id:\s*(?<id>\S+)\s*$/gmu),
+    (row) => row.groups?.["id"] ?? "",
+  ).find((candidate) => candidate !== "" && candidate !== "shared");
+  assert.ok(
+    typeof id === "string" && id.length > 0,
+    "cordis.patch.yml 里没有本包的裸 `- id:` 条目",
+  );
   return id;
 }
 

@@ -21,7 +21,7 @@ import type {
   RemoteResult,
   TypertCodec,
 } from "@deepseek-ai/dsh-typert-protocol";
-import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+import { isRecord } from "@jayyuen66/dsh-plugin-shared/client";
 import { z } from "zod";
 
 import type {

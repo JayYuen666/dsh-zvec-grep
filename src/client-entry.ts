@@ -35,7 +35,6 @@ import {
   LIMIT_MIN,
   WINDOW_MAX,
 } from "../lib/limits.ts";
-import { diffTouched } from "@jayyuen66/dsh-plugin-shared/lib/card-diff";
 import {
   CARD_UI_CSS,
   CardForm,
@@ -46,9 +45,11 @@ import {
   SelectField,
   TextField,
   ToggleField,
+  diffTouched,
+  errorText,
   splitHint,
-} from "@jayyuen66/dsh-plugin-shared/lib/card-ui";
-import type { SelectOption } from "@jayyuen66/dsh-plugin-shared/lib/card-ui";
+} from "@jayyuen66/dsh-plugin-shared/client";
+import type { SelectOption } from "@jayyuen66/dsh-plugin-shared/client";
 import {
   BUDGET_SCHEMA,
   LIMIT_SCHEMA,
@@ -63,7 +64,6 @@ import { createRebuildReader } from "./rebuild-reader.ts";
 import type { RebuildReader } from "./rebuild-reader.ts";
 import { EMBEDDING_MIRROR_URL, UI_MESSAGES } from "./ui-messages.ts";
 import type { LocaleNs, Translate, UiMessages } from "./ui-messages.ts";
-import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 
 export { cardStore, draftFields, parseRebuildPoll } from "../lib/card-logic.ts";
 

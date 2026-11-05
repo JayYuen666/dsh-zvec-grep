@@ -2,6 +2,22 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.12
+
+宿主开发基线抬到 `0.2.2-rc.1`（支持窗口 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未变），`engines.node` 地板抬到 `>=24.9.0`；卡片组件改由 shared 的 `./client` 供。检索门禁、索引与重建的判定逻辑不变，需要留意的是 `engines.node` 抬高后 node 22 装不上本包。
+
+### Changed
+
+- **shared 抬到 0.2.4**：catalog、生成物与 lockfile 随之同步；发布态依赖门禁不再要求消费者重复提供 shared 自己声明并随包安装的普通依赖（当前是纯解析器 `@deepseek-ai/dsh-fs-patch`）。这条豁免按包名整片生效，今后 shared 新增任何宿主依赖都会静默通过，不再逐条变红——它换到的是「消费者不为库包的内部依赖重复负责」这一口径。
+- **宿主开发基线**：`devDependencies` 的 dsh 家族抬到 `0.2.2-rc.1`，`@deepseek-ai/cordis` 抬到 `4.1.0`，`@deepseek-ai/cordis-plugin-group` 抬到 `1.1.0`、`@deepseek-ai/cordis-plugin-timer` 抬到 `1.2.0`，`@deepseek-ai/schemastery` 抬到 `3.19.0`；`@deepseek-ai/dsh-ptc-runtime` 从 devDependencies 移除（源码与测试都不再引用它）。`engines.dsh` 与三枚 `@deepseek-ai/dsh*` peer 保持 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 未动；`@deepseek-ai/schemastery` 的 peer 由 `^3.18.6-alpha.1` 放宽为 `^3.18.5 || ^3.18.6-alpha.1`，与两条宿主线各自的实装版本对齐。`engines.node` 由 `>=22.12.0` 抬到 `>=24.9.0`，取值取自宿主自己的地板。
+- **卡片组件改由 shared 的 `./client` 供**：`src/client-entry.ts` 的四路运行期值导入（`lib/card-ui`、`lib/card-diff`、`lib/errors`、`lib/record`）统一改走 `./client`（只换说明符，没有逻辑改动），`package.json` 新增 `dsh.bundle.client.external`，`build-client.mjs` 的外置清单同步；`cordis.patch.yml` 因此插入一条**不写 id** 的 `@jayyuen66/dsh-plugin-shared` 组件行（写 id 会在插件页多出一个可关闭的组件，关掉后设置卡失去组件供应）。
+- **CI 的 node 矩阵收敛**：`ci.yml` 的 `node: [22, 24]` 加 macOS 排除改为单格 `node: [24.9]`，两份 workflow 的 `node-version` 由 `24` 改为 `24.9`，与 `engines.node` 同值。
+- **文档**：dsh 徽章与两份 README 的窗口句保持 `^0.2.1-rc.5` 系（`engines.dsh` 本轮未动，`test/readme-parity.test.ts` 把徽章与全文 caret 版本集合钉到窗口首条，改值会当场红）；两份 README 的 `insert:` 块由「唯一一行」改为「两条条目」并写明 shared 那行为何不写 id。
+
+### Fixed
+
+- **两份 DETAIL 的不对称**：英文版漏了 `rebuildWaitMs` 的默认值（120000，取自 `host.ts` 的 `REBUILD_WAIT_MS = 2 * 60_000`）与「十项部署值只能走注册行 `config:`，优先级是行 `config:` > 代码 `.default()`」这句，中文版已有；英文补平。两侧「随包那份 `cordis.patch.yml` 只带 `id` / `name`」的说法按本轮改动改成两条条目——这一句要紧，因为按原文读者会以为多出来的 shared 行是多余物可以删，而删掉后设置卡会失去组件供应。
+
 ## 0.1.11
 
 这一版补上 search-first 门禁对命令替换与壳层包装的识别，给索引探测加显式失效通道，把状态读面按部署形态收口，并让发布链与产物门禁各自多一道判据；宿主开发基线抬到 `0.2.2-alpha.3`，支持窗口改为 `^0.2.1-rc.5 || ^0.2.2-alpha.3`。

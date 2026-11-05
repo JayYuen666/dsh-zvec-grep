@@ -15,9 +15,9 @@ The card's Rebuild button runs the equivalent of `zg index --rebuild` for a work
 
 ## Restart-only values
 
-Ten deployment values stay off the card: `searchTimeoutMs` (300000), `statusTimeoutMs` (60000), `indexTimeoutMs` (600000), `stdoutMaxBytes` (400000), `rebuildWaitMs`, `clientMode` (`auto` / `direct` / `server`), `allowRemoteEmbedding` (false), `remoteEmbeddingEndpoint`, `remoteEmbeddingApiKeyFrom`, `requireApprovalForExplicitRoot` (false).
+Ten deployment values stay off the card: `searchTimeoutMs` (300000), `statusTimeoutMs` (60000), `indexTimeoutMs` (600000), `stdoutMaxBytes` (400000), `rebuildWaitMs` (120000), `clientMode` (`auto` / `direct` / `server`), `allowRemoteEmbedding` (false), `remoteEmbeddingEndpoint`, `remoteEmbeddingApiKeyFrom`, `requireApprovalForExplicitRoot` (false). None of these ten has a card control; the only thing that makes them take effect is the `config:` block of the registration row in the next paragraph, and precedence is row `config:` > the `.default()` in code.
 
-Whether workspace content may leave the machine at all is treated as a deployment decision rather than a model-visible choice, which is why the remote-embedding trio appears in neither the card nor the tool parameters; and even when it is enabled, `zg` itself still requires `--allow-remote` or `zg auth grant`. Set all of these in the `config:` block of this plugin's row in your profile's `cordis.yml` (the `cordis.patch.yml` shipped in this package only carries the row's `id` / `name`); they take effect on restart.
+Whether workspace content may leave the machine at all is treated as a deployment decision rather than a model-visible choice, which is why the remote-embedding trio appears in neither the card nor the tool parameters; and even when it is enabled, `zg` itself still requires `--allow-remote` or `zg auth grant`. Set all of these in the `config:` block of this plugin's row in your profile's `cordis.yml` (the `cordis.patch.yml` shipped in this package carries that row's `id` / `name` plus a second, **id-less** entry for `@jayyuen66/dsh-plugin-shared` that supplies the card components — deleting it leaves the settings card without its component supplier); they take effect on restart.
 
 ## What it needs from outside
 
