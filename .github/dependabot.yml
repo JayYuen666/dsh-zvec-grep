@@ -9,7 +9,7 @@
 # 二是写成字面版本的那几枚：宿主族在 devDependencies 里逐字钉住，且每一枚都有本仓
 # pnpm-workspace.yaml 的 overrides 兜着取值；`react`（devDependencies，^19.3.0）不在 overrides
 # 覆盖范围内（catalog 里只有 `@types/react`），机器人对它提的 PR 会真的换掉安装树。
-# 两类都要人来判：走 catalog: 的在伞根改真源再投影，`react` 那一枚改了要复跑 check。
+# 两类都要人来判断：走 catalog: 的在伞根改那份唯一来源再投影，`react` 那一枚改了要复跑 check。
 #
 # 但「本仓不会出现 npm 机器人 PR」这句话不由这个文件保证：Dependabot security updates
 # 是仓库设置里独立开着的，不读本文件、也不需要 npm 配置块，仍会针对漏洞依赖提 PR。要真正
@@ -25,7 +25,7 @@ updates:
       # 本仓引用的 action 全部放进一组，避免每个 action 各占一个 PR 去抢同一个名额。
       # 模式按 `<owner>/<repo>` 写：通配符覆盖该仓库下的全部条目（codeql-action 的 init、
       # analyze、upload-sarif 就是三条不同的引用），跨仓库不会互相匹配，所以每个 owner 各列一条。
-      # 最后那条 `*` 是兜底：workflow 里新增未列出的 owner 时，它跟着进同一组，而不是脱离分组
+      # 最后那条 `*` 是有意留下的后备：workflow 里新增没列出的 owner 时，它跟着进同一组，而不是脱离分组
       # 单独占掉 open-pull-requests-limit 的名额——那种漂移没有任何机制会把它暴露出来。
       actions:
         patterns:

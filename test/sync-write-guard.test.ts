@@ -6,7 +6,7 @@
 // 的豁免扩进 lib/ 或 host.ts，lint 会安静下来，这道门照样红。README 承诺「The package itself
 // writes no files」，判据就落在这份名单上（测试文件豁免——夹具要在临时目录造文件）。
 //
-// 收集器与调用形状在 test/sync-write-support.ts（探针要驱动同一份实现）。
+// 收集器与调用形状在 test/sync-write-support.ts（探测要驱动同一份实现）。
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, it } from "vitest";
@@ -20,7 +20,7 @@ const PRODUCTION_FILES: readonly string[] = ["host.ts"];
 /**
  * 健全性判据的期望值：几枚**独立写死**的生产文件名。
  * 没有这一条，`lib/` 与 `src/` 一旦被裁空（或源码挪去别的扩展名/别的目录），
- * 收集面就只剩 host.ts，而 `offenders === []` 照样成立——空集不打 ✓。
+ * 收集范围就只剩 host.ts，而 `offenders === []` 照样成立——空集不打 ✓。
  */
 const REQUIRED_PRODUCTION: readonly string[] = [
   "host.ts",

@@ -6,11 +6,11 @@
 // 宿主上恒为假，而 mock 里永远是同一个对象 ⇒ 单测全绿、卡片轮询 404。这里换成官方件：
 //
 //   - 注册与调度：@deepseek-ai/dsh-tools 的 ToolRuntime（含 pre-execute 瀑布 + 单调 guard
-//     + 官方参数/输出 JSON Schema 子集校验）。工具经 `ctx.tools.execute()` 全管线跑，
+//     + 官方参数/输出 JSON Schema 子集校验）。工具经 `ctx.tools.execute()` 全流水线跑，
 //     不是直接调本包的 run。
 //   - 执行：@deepseek-ai/dsh-subprocess-local + @deepseek-ai/dsh-bash-local 的本地 bash
 //     执行器（真 spawn、真 deadline、真 stdout 上限与 spill、真凭据擦除）。
-//   - 后台作业：@deepseek-ai/dsh-jobs-local 的 LocalJobRegistry（真环、真泵、真容量）。
+//   - 后台作业：@deepseek-ai/dsh-jobs-local 的 LocalJobRegistry（真环形缓冲、真泵、真容量）。
 //   - 路由：@deepseek-ai/dsh-host-webserver 的 WebServer（真 node:http 监听，端口由 OS 分配）。
 //   - 计时：@deepseek-ai/cordis-plugin-timer。确认：@deepseek-ai/dsh-user-approval。
 //
@@ -60,7 +60,7 @@ export interface ShellCall {
   spec: ShellExecSpec;
 }
 
-/** 空转的释放函数（settings 替身的 configure 要交回一枚）。 */
+/** 不执行任何操作的释放函数（settings 替身的 configure 要交回一枚）。 */
 function noop(): void {
   // 无侠作。
 }
@@ -175,7 +175,7 @@ export async function startHost(
     }
     // 官方 ApprovalService 的 `static inject = ["sessionProjections"]`：alpha.2 起它要把
     // 每次问/答写进会话日志，投影注册表不在位时整条 fiber 不激活，`ctx.get("approval")`
-    // 读不到 ⇒ 管线的 ask 静默降级成拒绝。会话与投影都用官方件，不在台架里造替身。
+    // 读不到 ⇒ 流水线的 ask 静默降级成拒绝。会话与投影都用官方件，不在台架里造替身。
     await load(SessionStore);
     await load(SessionProjectionRegistry);
     if (options.approval === true) {
@@ -342,7 +342,7 @@ export async function startHost(
   };
 }
 
-/** 一台真实宿主：服务实例、记录面与调用入口。 */
+/** 一台真实宿主：服务实例、记录用的接口与调用入口。 */
 export interface Host {
   ctx: Context;
   settings: StubSettings;
@@ -385,19 +385,12 @@ export function canMakeUnreadableFile(): boolean {
 }
 
 /**
- * 本包的 root 判据只认以 `/` 开头的 POSIX 绝对路径（lib/cli.ts 的 assertAbsoluteRoot）；
- * win32 的 os.tmpdir() 交回盘符形态（`C:\...`），凡是要在盘上造真实工作区 root 的用例
- * 一律按它跳过——跳过的是「Windows 宿主不在支持面」这条已知边界，不是给用例打洞。
- */
-export const realRootUnavailable = process.platform === "win32";
-
-/**
  * 真 zg CLI 在不在 PATH 上。真宿主（integration）与端到端（e2e）两层要**真 spawn** zg（不是
  * 替身），而 CI 的干净 runner 没装它 ⇒ 那两层整体按这个谓词跳过（`describe.skipIf(!zgAvailable())`）；
  * 本机开发装了 zg 就照跑。只做「PATH 上找不找得到那个可执行名」这一档判定，不 spawn（省得为一次
  * 探测起进程），故用 existsSync 逐个 PATH 目录探；windows 上补 .cmd/.exe 两个后缀（那里 zg 多半也
  * 不是本仓 CI 的目标，但探得到就不误跳）。跳过后覆盖率不塌：本包判据由 mock 宿主那层
- * （test/host.test.ts）独立钉到 100%，这两层只负责钉「上游 zg 的事实」。
+ * （test/host.test.ts）独立对齐到 100%，这两层只负责钉「上游 zg 的事实」。
  */
 export function zgAvailable(): boolean {
   const pathVar = process.env["PATH"] ?? "";
@@ -407,7 +400,7 @@ export function zgAvailable(): boolean {
     .some((dir) => dir.length > 0 && names.some((name) => existsSync(path.join(dir, name))));
 }
 
-/** 可控延迟：借道 Promise.withResolvers（运行时 Node≥22 可用，lib 类型面没有该静态成员）。 */
+/** 可控延迟：借道 Promise.withResolvers（运行时 Node≥22 可用，lib 类型上没有该静态成员）。 */
 export async function sleep(ms: number): Promise<void> {
   const constructor = Promise as unknown as {
     withResolvers: () => { promise: Promise<void>; resolve: () => void };
@@ -440,9 +433,9 @@ export async function inOrder<TResult>(
 }
 
 /**
- * 在真实 ToolRuntime 里登记几枚**空转工具**（bash / grep 之类），让 guard 管线有可执行的
+ * 在真实 ToolRuntime 里登记几枚**不做任何检查的工具**（bash / grep 之类），让 guard 流水线有可执行的
  * 落脚点：guard 是在 `ctx.tools.execute()` 里被调起来的，没有已注册的名字就什么都测不到。
- * 入参面与输出面都按官方契约给全（parameters + output { schema, render } + execute）。
+ * 入参与输出都按官方契约给全（parameters + output { schema, render } + execute）。
  */
 export function registerDummyTools(host: Host, names: readonly string[]): void {
   const tools = host.ctx.tools as unknown as { register: (definition: unknown) => () => void };
@@ -472,7 +465,7 @@ export function registerDummyTools(host: Host, names: readonly string[]): void {
  *
  * **PATH 必须用 path.delimiter 拼**：CI 矩阵含 windows-latest（.github/workflows/ci.yml 的
  * gate job），`:` 在 win32 上不是分隔符，拼出来的整条 PATH 是一条不存在的路径，假 zg 根本
- * 找不到。win32 也没有 shebang 执行面：同一份脚本另存成 .js，再放一枚 .cmd 垫片，让命令行
+ * 找不到。win32 也没有 shebang 执行上下文：同一份脚本另存成 .js，再放一枚 .cmd 垫片，让命令行
  * 按 PATHEXT 解析得到（zgAvailable() 的 win32 名单正是 zg.cmd/.exe/zg）。
  */
 function installFakeBin(script: string): { cleanup: () => void } {
@@ -499,20 +492,20 @@ function installFakeBin(script: string): { cleanup: () => void } {
 /**
  * 一枚**假 zg**（真进程、真 spawn、可真杀），用来把后台重建的生命周期钉成确定性事实：
  * 真 zg 的时长取决于模型加载与文件数，测不出「卸载时进程被收掉」与「超时杀进程」这两条。
- * 它按 zg 的命令面回应（`--version` / `index` / 其余），时长由 `ms` 调，重建进程的 pid 落地到
+ * 它按 zg 的命令形态回应（`--version` / `index` / 其余），时长由 `ms` 调，重建进程的 pid 落地到
  * `pidFile` 供测试断言进程真的死了。
  *
- * 其余命令在**同根重建还活着**时按真 zg 的形状失败（非零退出 + `Code: …LOCK.BUSY` + 明细点名
- * `ownerOperation: index.rebuild`），空闲时才回一句未配置并 0 退出。少了这一支，检索那条
- * 「等重建落定后重试」的路径在假件上根本不会被走到：假件对任何命令都 0 退出，删掉等待臂
- * 也照样绿。
+ * 其余命令在**同根重建还活着**时按真 zg 0.3.0 的形状失败（非零退出 +
+ * `Error[ZG.ENGINE.RESOURCE_BUSY]: … operation=index.rebuild`），空闲时才回一句未配置并
+ * 0 退出。少了这一支，检索那条「等重建落定后重试」的路径在假件上根本不会被走到：假件对
+ * 任何命令都 0 退出，删掉等待分支也照样绿。
  */
 export function installFakeZg(options: { ms?: number; pidFile: string }): () => void {
   const script = `#!/usr/bin/env node
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 const argv = process.argv.slice(2);
 if (argv.includes("--version")) {
-  process.stdout.write("0.2.2\\n");
+  process.stdout.write("0.3.0\\n");
   process.exit(0);
 }
 const pidFile = ${JSON.stringify(options.pidFile)};
@@ -536,32 +529,36 @@ const liveOwnerPid = () => {
 const ms = Number(process.env.ZG_FAKE_MS ?? ${String(options.ms ?? 400)});
 const step = Math.max(20, Math.floor(ms / 4));
 const started = Date.now();
-if (argv[0] === "index") {
+if (argv[0] === "--index") {
   writeFileSync(pidFile, String(process.pid));
-  process.stderr.write("Scanning files...\\n");
-  process.stderr.write("Preparing local/potion-code-16m-v2\\n");
+  process.stderr.write("Scanning \\u2014 scanning files\\n");
+  process.stderr.write("Preparing model: local/potion-code-16m-v2\\n");
   const pump = setInterval(() => {
     if (Date.now() - started >= ms) {
       clearInterval(pump);
       rmSync(pidFile, { force: true });
       process.stdout.write("files\\t2 scanned, 2 added\\n");
-      process.stderr.write("Indexing complete\\n");
+      process.stderr.write("Finishing index\\n");
       process.exit(0);
     }
   }, step);
 } else if (liveOwnerPid() !== 0) {
-  // 同根有重建在跑 ⇒ 按真 zg 的实测失败形状回：非零退出 + Error/Code/Details 三段，
-  // 明细点名占锁方的操作名（rebuild 与别的占用者由本包的分类器分开判）。
+  // 同根有重建在跑 ⇒ 按真 zg 0.3.0 的实测失败形状回：非零退出 +
+  // Error[RESOURCE_BUSY]: 成因串点名占锁方的操作名（rebuild 与别的占用者由本包的分类器分开判）。
   const owner = liveOwnerPid();
-  process.stderr.write("Error: the workspace index is locked by another operation\\n");
-  process.stderr.write("Code: ZVEC_GREP.ENGINE.LOCK.BUSY\\n");
-  process.stderr.write("Details:\\n");
-  process.stderr.write("  ownerOperation: index.rebuild\\n");
-  process.stderr.write("  ownerPid: " + String(owner) + "\\n");
-  process.stderr.write("  lock: " + pidFile + ".lock\\n");
+  process.stderr.write(
+    "Error[ZG.ENGINE.RESOURCE_BUSY]: lock is busy: lock=" + pidFile + ".lock operation=index.rebuild\\n",
+  );
+  process.stderr.write("Error location: crates/zg-engine/src/workspace/lock.rs:50:11\\n");
   process.exit(1);
+} else if (argv.includes("--status")) {
+  process.stdout.write("  Coverage    Unavailable (index not configured)\\n\\n");
+  process.stdout.write("  Embedding   Not configured\\n");
+  process.stdout.write("  FTS         Not configured\\n\\n");
+  process.stdout.write("  Storage     .zvec-grep/index\\n");
+  process.exit(0);
 } else {
-  process.stdout.write("? Workspace index is not configured\\n");
+  process.stdout.write("freshness: fresh\\n#1 fake.ts:1-1\\nsymbol: [function] fake\\n  1: fake line\\n");
   process.exit(0);
 }
 `;
@@ -602,7 +599,7 @@ writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({
   ${JSON.stringify(DUMP_SECRET_FIELD)}: process.env[${JSON.stringify(DUMP_ENV_KEY_NAME)}] ?? null,
   TERM: process.env.TERM ?? null,
 }));
-process.stdout.write("0.2.2\\n");
+process.stdout.write("0.3.0\\n");
 `;
   return installFakeBin(script).cleanup;
 }

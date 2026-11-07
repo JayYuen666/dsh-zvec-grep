@@ -1,15 +1,16 @@
-// lib/argv-guard.ts —— 交给 `zg` 的 argv 的**唯一闸门层**：转义、规模上限、默认排除片段。
+// lib/argv-guard.ts —— 交给 `zg` 的 argv 的**唯一一道校验**：转义、规模上限、默认排除片段。
 //
 // 为什么从 lib/cli.ts 拆出来：这三族东西共同回答一个问题——「这串用户可控输入能不能
 // 进最终命令」。它们被本包三个命令构造器（search/index/status）与两条工具的生产路径
 // 逐条消费，判据本身与「命令长什么样」无关，故与 cli.ts 分家；此前 export 只因单测也按
 // 这层边界取用，`fallow --production` 因此把它们判成「只被测试养着的导出」。
 //
-// 报错文案双语：与 lib/cli.ts 同一口径——消息表（lib/messages.ts 的一份）由调用点作入参
+// 报错文案双语：与 lib/cli.ts 同一种做法——消息表（lib/messages.ts 的一份）由调用点作入参
 // 注入，纯函数不读设置；本模块的校验文本原样回显给模型（工具失败信息）。
 
 import { fill } from "./messages.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
+import type { PathPlatform } from "./platform.ts";
 
 // ── 命令规模上限（防 E2BIG / 防单条超长 query 打爆 argv）────────────────────
 // 三档上限与 zg 自己对外的契约取齐（[MCP_MAX_QUERY_GROUPS / MCP_MAX_QUERY_CHARS /
@@ -17,9 +18,11 @@ import type { ZvecGrepMessages } from "./messages.ts";
 // 放得比上游宽只会让模型拿到一个「本插件允许、但 zg 侧本来就该拒」的参数形状，收窄到
 // 闭集里则能在构造阶段就报出人话。`MAX_QUERY_ROUTES` 与 `LIMIT_MAX` 原本已取齐。
 //
-// MAX_COMMAND_BYTES 是本包自己的一档：整条命令经 `bash -c <command>` 作为**单个** argv 项
-// 传给内核，Linux MAX_ARG_STRLEN≈128KB、macOS ARG_MAX 总量 1MB，取 64K **UTF-8 字节**
-// 留一半余量（判据按字节比：多字节内容一个码元可占 3~4 字节，按码元数比会放过 E2BIG）。
+// MAX_COMMAND_BYTES 是本包自己的一档：POSIX 上整条命令经 `bash -c <command>` 作为
+// **单个** argv 项传给内核，Linux MAX_ARG_STRLEN≈128KB、macOS ARG_MAX 总量 1MB，取
+// 64K **UTF-8 字节**留一半余量（判据按字节比：多字节内容一个码元可占 3~4 字节，按码元
+// 数比会放过 E2BIG）。win32 走 `pwsh -Command`，整条命令同样是一个 argv 项，受
+// CreateProcess 的 32767 码元上限约束——那里改用 lib/cli.ts 的 MAX_COMMAND_BYTES_WIN32。
 export const MAX_COMMAND_BYTES = 64_000;
 /** 检索路由（query/queries/fts/vector）合计组数上限。 */
 export const MAX_QUERY_ROUTES = 32;
@@ -29,10 +32,27 @@ export const MAX_QUERY_CHARS = 4000;
 const MAX_FILTER_ITEMS = 128;
 /** 过滤类数组单项长度上限（glob 不该长成文章）。 */
 export const MAX_FILTER_CHARS = 1024;
+/**
+ * 时间过滤串（`--modified-after` / `--modified-before`）上限：与上游 MCP `TimeInput` 的
+ * string 分支 `maxLength` 一致（0.3.0 `tools/list` 实测 128）。CLI 与 MCP 两条通道共用
+ * 同一道闸，免得同一份入参因传输不同而一收一拒。
+ */
+export const MAX_TIME_CHARS = 128;
 
-/** POSIX sh 单引号转义：' → '\''。把任意字符串安全放进单引号内，防注入。 */
-export function shq(value: string): string {
-  return `'${value.replaceAll("'", String.raw`'\''`)}'`;
+/**
+ * 单引号转义：POSIX sh 写成 `'…'`（内嵌 `'` → `'\''`），PowerShell 写成 `'…'`
+ * （内嵌 `'` → `''`）。两种壳的单引号内容都不做变量展开，故 `$`、反引号、反斜杠都按
+ * 字面量保留；差别只在内嵌单引号的写法。
+ *
+ * 缺省 "posix" 是给纯函数单测与 lib 内部调用的确定值；宿主按 `runtimePlatform()` 传入。
+ * @param value 待转义的原文
+ * @param platform 壳方言（win32 = pwsh）
+ * @returns 可直接拼进命令的单引号串
+ */
+export function shq(value: string, platform: PathPlatform = "posix"): string {
+  return platform === "win32"
+    ? `'${value.replaceAll("'", "''")}'`
+    : `'${value.replaceAll("'", String.raw`'\''`)}'`;
 }
 
 /** 长度上界校验（超限即抛，避免整条命令撑爆 argv）。 */
@@ -49,7 +69,7 @@ function assertTextLen(
 }
 
 /**
- * 可选文本取值：未给 → 空串；非字符串 → 报错（绝不静默降级成默认值）；
+ * 可选文本取值：未给 → 空串；非字符串 → 报错（绝不会静默降级成默认值）；
  * 去首尾空白并校验 NUL 与长度。
  */
 export function optionalText(
@@ -88,7 +108,7 @@ export function stringList(
   if (!Array.isArray(value)) {
     throw new TypeError(fill(messages.mustBeStringArray, { name }));
   }
-  // 逐项校验先于条数上限：数组既超长又混入非字符串项时，首条报错要指向根因（类型错），
+  // 逐项校验先于条数上限：数组既超长又混入非字符串项时，首条报错要指向真正的原因（类型错），
   // 否则用户按「最多 N 项」删完还会在同一个类型错上再撞一次。
   const out: string[] = [];
   for (const item of value) {
@@ -113,7 +133,7 @@ export function stringList(
  * 路径过滤类参数的取值：单值与数组两种形态都收，规范化成数组后交给 `stringList` 走同
  * 一套校验（trim / 去空串 / NUL / 条数 / 长度）。
  *
- * 兼容单值是因为上游就这么收：zg 自己的对外契约里 globs / insensitiveGlobs / fileTypes /
+ * 兼容单值是因为上游就这么收：zg 自己的对外声明里 globs / insensitiveGlobs / fileTypes /
  * excludedFileTypes / ignoreFiles 都是「一个字符串或一个字符串数组」的并集，只收数组
  * 会让模型按上游习惯写单个 glob 时撞上「必须是字符串数组」——形状没错、形状太严。
  * 其余类型错误（非字符串、非数组的其它值）仍然照旧报错，不做任何静默降级。

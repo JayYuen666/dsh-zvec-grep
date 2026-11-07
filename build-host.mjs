@@ -3,7 +3,7 @@
 /// <reference types="node" />
 // 构建 host.js：rolldown 把 host.ts 及其 `./lib/*` 依赖打成单文件 ESM，落在**包根**
 // （与源码同目录，故 `import.meta.dirname` 的语义与源码态完全一致）。
-// 编排（依赖段外部化、输出守卫、region 正典化、moduleIds 结构性判据）统一住在
+// 编排（依赖段外部化、输出守卫、region 路径规范化、moduleIds 结构性判据）统一实现在
 // @jayyuen66/dsh-plugin-shared/lib/build-host，一处可改；本文件只声明本仓的入口、产物
 // 与生成头。为什么必须有打包这一步（Node 对 node_modules 里的 .ts 直接抛
 // ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING）、为什么外部化按包名段判——见 shared
@@ -14,7 +14,7 @@ import { rolldown } from "rolldown";
 import { buildHostEntries } from "@jayyuen66/dsh-plugin-shared/lib/build-host";
 import { invokedDirectly, writeArtifact } from "@jayyuen66/dsh-plugin-shared/lib/build-artifacts";
 
-// 测试按「脚本自己导出它用的工具」这一口径从本模块导入 singleEntryChunk。
+// 测试按「脚本自己导出它用的工具」这一规则从本模块导入 singleEntryChunk。
 export { singleEntryChunk } from "@jayyuen66/dsh-plugin-shared/lib/build-artifacts";
 
 const root = import.meta.dirname;

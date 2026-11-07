@@ -1,4 +1,4 @@
-// lib/limits.ts —— 设置卡六个字段里三个数值字段的区间与默认值（零依赖叶）。
+// lib/limits.ts —— 设置卡七个字段里三个数值字段的区间与默认值（零依赖叶）。
 //
 // 为什么单列：这组数同时被宿主 schema（host.ts 的 .default/.min/.max）、limit 钳制
 // （lib/cli.ts）、卡片显示与输入区间（lib/card-logic.ts / src/client-entry.ts）消费，

@@ -24,7 +24,7 @@ on:
 # 一次可能失败的并发上传；OIDC 换 token 与公有 API 的发布额度也被无谓重复消耗。
 # 所以组键按 ref 聚合，让同一 ref 的分析排成一队，并**不**取消——体检结果不该因为又一次运行
 # 而被判成「没量过」。(早先把 event_name 放进组键，正好让四个入口各自成组并行，把要防的覆盖
-# 变成了默认行为；那条口径与这里的目的相反。)
+# 变成了默认行为；那条规则与这里的目的相反。)
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -64,6 +64,6 @@ jobs:
           path: results.sarif
           retention-days: 5
       - name: Upload to code-scanning
-        uses: github/codeql-action/upload-sarif@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: results.sarif

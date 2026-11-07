@@ -1,4 +1,4 @@
-// test/client-freshness.ts —— 产物新鲜度指纹门禁（8 包共用，TDD）。
+// test/client-freshness.ts —— 产物一致性指纹门禁（8 包共用，TDD）。
 //
 // 背景：src/client-entry.ts 改后忘跑 node build-client.mjs，浏览器一直加载旧
 // client.js——本会话已两次踩坑（rescue 403 修复没进产物；ctx-observe 字段补齐
@@ -42,7 +42,7 @@ function digestOf(text: string): string {
 export async function declareClientFreshness(testFileUrl: string): Promise<void> {
   const testDir = path.dirname(fileURLToPath(testFileUrl));
   const pkgDir = path.resolve(testDir, "..");
-  // 同步读 manifest：登记因此是同步操作，不存在「忘记 await」这一失败面。
+  // 同步读 manifest：登记因此是同步操作，不存在「忘记 await」这种失败方式。
   // name 用 JSON.parse 读顶层字段——正则抠第一处 "name": 会命中嵌套对象里的同名键。
   const manifest = JSON.parse(readFileSync(path.resolve(pkgDir, "package.json"), "utf8")) as {
     name?: unknown;
@@ -59,7 +59,7 @@ export async function declareClientFreshness(testFileUrl: string): Promise<void>
     async () => {
       // 动态 import 的 .mjs 模块为 any：用类型断言收窄 buildClient 签名（测试
       // 豁免 no-unsafe-type-assertion），避免对 any 的 unsafe 调用/赋值。
-      // 载入失败带上下文：报错点在「请先构建」，而不是裸 ENOENT。
+      // 载入失败带上下文：报错点在「请先构建」，而不是一句没有路径信息的 ENOENT。
       let mod: { buildClient?: unknown };
       try {
         mod = (await import(pathToFileURL(path.resolve(pkgDir, "build-client.mjs")).href)) as {

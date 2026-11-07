@@ -1,4 +1,4 @@
-// test/embedding-cache.ts —— 「这枚本地 embedding 的权重在不在缓存里」的唯一探针。
+// test/embedding-cache.ts —— 「这枚本地 embedding 的权重在不在缓存里」的唯一探测。
 //
 // 为什么单列：四份测试文件原先各抄一遍同一段 existsSync，且每份都把 qwen 的 gguf 也算作
 // 「就绪」，而那四份用例递给出的都是 potion-code-16m-v2 —— 于是缺 potion 权重的机器不会跳过，
@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 /**
- * 各枚测试用 embedding 的缓存落点，相对 `<缓存根>/models`。model2vec 后端那一层的形状是
+ * 各枚测试用 embedding 的缓存位置，相对 `<缓存根>/models`。model2vec 后端那一层的形状是
  * `<后端目录>/<HF repo，/ 换成 -->/<revision>/<权重文件>`：前两段与权重文件名分别来自上游
  * engine/models/backends/model2vec.ts 的 cacheDirectory 与 engine/models/catalog.ts 的 artifacts。
  */
@@ -29,7 +29,7 @@ const CACHE_PATHS: ReadonlyMap<string, { repo: readonly string[]; artifact: stri
  * - 只认传进来的取值：别的模型的权重在场替代不了它。
  * - 取值没登记就抛，而不是返回 false：静默 false 会让整组用例长期 skip，那比红难查得多。
  * - 缓存根按上游那条规则取：`ZVEC_GREP_HOME` 优先于 `~/.zvec-grep`（上游
- *   engine/utils/path.ts 的 defaultHome）。本包从不传 `--model-cache`，所以没有第三种落点。
+ *   engine/utils/path.ts 的 defaultHome）。本包从不传 `--model-cache`，所以没有第三种写入位置。
  * - `revision` 那一层不写死 sha：它跟着上游 catalog 的取值变，写死就等于把「有没有权重」
  *   换成「是不是上游当期 pinned 的那一版」，上游改版时整组用例静默消失。
  */

@@ -34,7 +34,7 @@ function sharedStubMember(): null {
 const PKG_DIR = path.resolve(import.meta.dirname, "..");
 
 /**
- * 判断 profile 里那枚依赖的落点是不是本目录。
+ * 判断 profile 里那枚依赖装到了哪个目录。
  *
  * 判据是「剥掉 link:/file: 前缀后解析成绝对路径，再与 PKG_DIR 等值比较」，不是子串：
  * 按包含关系判定时，相邻目录（dsh-zvec-grep-copy、dsh-zvec-grep2）会命中同一份断言，
@@ -67,7 +67,7 @@ function linksToThisCheckout(target: unknown): boolean {
 function profileBundleName(): string {
   // 宿主派发插件页时用的 entryKey 就是**被装的那个 bundle** 的包名（与本包 package.json
   // 一致，与装法无关：registry / link / 本机 profile 都是它），所以核心判据不需要 profile。
-  // profile 只存在在这台开发机上；装了它才顺手钉两道机器侧漂移针（清单里恰有一条、
+  // profile 只存在在这台开发机上；装了它才顺手钉两道机器侧产物漂移检查（清单里恰有一条、
   // link 目标就是本目录，避免比到残留副本）。
   const override = process.env["DSH_PROFILE_PACKAGE_JSON"] ?? "";
   const profilePath =
@@ -110,7 +110,7 @@ function patchEntryIds(): string[] {
   ).filter((id) => id !== "shared");
 }
 
-/** 本条目那张表单的官方快照面（别名要保持**已实例化**，否则每处使用都得再给类型参）。 */
+/** 本条目那张表单的官方快照类型（别名要保持**已实例化**，否则每处使用都得再给类型参）。 */
 type FormSnapshot = ConfigFormSnapshot<Record<string, unknown>>;
 
 interface LoadedModuleDef {
@@ -128,7 +128,7 @@ interface FormTrace {
   mutateCalls: unknown[][];
 }
 
-/** 替身的公开面：官方 `ConfigForm` 五成员（getSnapshot / subscribe / mutate / set /
+/** 替身交出的接口：官方 `ConfigForm` 五成员（getSnapshot / subscribe / mutate / set /
  *  unset）+ 一根 dispose 绊线。`extends ConfigForm<…>` 是**编译期**契约：官方面加一位
  *  （或改一位签名）这里立刻编译失败，而不是等真宿主来告诉你。 */
 interface FakeForm extends ConfigForm<Record<string, unknown>> {
@@ -149,9 +149,9 @@ function snap(over: Partial<FormSnapshot> = {}): FormSnapshot {
 }
 
 /**
- * 注入面下发给卡片的写入函数。卡片自己声明的是 Promise<void>（src/client-entry.ts 的
+ * 注入下发给卡片的写入函数。卡片自己声明的是 Promise<void>（src/client-entry.ts 的
  * CardSlotProps），测试侧改标 Promise<unknown> 只为了能把「resolve 出来是 undefined
- * = 受理位没外泄给卡片」写成断言；两个 wrapper 的真实返回类型由 tsc 在 src 那侧钉住。
+ * = 受理结果没外泄给卡片」写成断言；两个 wrapper 的真实返回类型由 tsc 在 src 那侧钉住。
  */
 interface CardPayload {
   set: (field: string, value: unknown) => Promise<unknown>;
@@ -170,7 +170,7 @@ interface HostTrace {
   /** configForms.get() 被要过哪些条目 id。 */
   entryIds: string[];
   slotNames: string[];
-  /** slots.inject 登记的工厂：槽「折叠 → 再声明」时宿主会重跑它。 */
+  /** slots.inject 登记的工厂：槽位声明被收回、再次声明时宿主会重跑它。 */
   slotFactories: (() => () => void)[];
   /** slots.register 交回的注销函数。 */
   cleanups: (() => void)[];
@@ -181,7 +181,7 @@ interface HostTrace {
 
 /**
  * 本条目共享表单的替身。形状直接是官方 `ConfigForm<Record<string, unknown>>` 五成员
- * （getSnapshot / subscribe / mutate / set / unset）：set/unset 回**受理位**
+ * （getSnapshot / subscribe / mutate / set / unset）：set/unset 回**受理结果**
  * （true = 宿主受理，false = 拒绝或写入被跳过），只有传输失败才 reject。
  * ⚠ `dispose` 不在消费者契约里，留在这里只作**绊线**：卡片一旦试图销毁 provider
  * 持有的共享表单（旧 settingsScope 时代的写法），disposeCalls 就非空 → 用例红。
@@ -193,7 +193,7 @@ function fakeForm(trace: FormTrace, opts: { fail?: boolean } = {}): FakeForm {
   /** 快照身份稳定（官方契约：stable reference until the next change）——cardStore 的
    *  memo 正是靠引用相等判「未换代」，每次 new 一个对象会让用例测不到缓存。 */
   const snapshot = snap();
-  /** 先记轨迹，再回受理位（或按 fail 模拟传输失败）。 */
+  /** 先记轨迹，再回受理结果（或按 fail 模拟传输失败）。 */
   const write = (record: () => void): Promise<boolean> => {
     record();
     return opts.fail === true ? Promise.reject(new Error("transport down")) : Promise.resolve(true);
@@ -332,6 +332,11 @@ await declareSchemaCoverage(import.meta.url, {
         "非 volatile 部署值（cordis.yml config: 改）：zg 传输模式随部署是否启用守护进程而定，默认自动即最优，故不设卡位",
     },
     {
+      field: "daemonUrl",
+      reason:
+        "非 volatile 部署值（cordis.yml config: 改）：MCP 传输的守护进程端点。默认上游缺省监听地址；daemon 用 --listen 换过端口的部署改这里，不是用户可调项",
+    },
+    {
       field: "rebuildWaitMs",
       reason:
         "非 volatile 部署值（cordis.yml config: 改）：检索等待同根重建落定的上限，随部署的索引规模调整",
@@ -384,7 +389,7 @@ describe("buildClient()", () => {
     assert.ok(out.includes(UI_MESSAGES.zh.embeddingHint), "中文那份在产物里");
     assert.ok(out.includes(UI_MESSAGES.en.embeddingHint), "英文那份在产物里");
     // 只认官方的 locale.register 调用点：`.register(` 这个兜底会让 slots.register /
-    // effects.register 之类无关调用也满足「locale 注册面在产物里」。
+    // effects.register 之类无关调用也满足「locale 注册入口在产物里」。
     assert.ok(out.includes("locale.register("), "官方 locale 注册面在产物里");
   });
 
@@ -392,7 +397,7 @@ describe("buildClient()", () => {
     const out = await buildClient();
     // 快照契约是 {status, writable, value: {...}}：把 snap 整个当 value 用时配置读不到，
     // 卡片只会恒显示默认值，而且一声不响。
-    // 单一判据：只认 snap.value 这一层。三选一兜底几乎恒绿——`.value ?? {}` 与
+    // 单一判据：只认 snap.value 这一层。三选一兜底几乎永远通过——`.value ?? {}` 与
     // `[snap.value` 这种片段在无关代码里也很容易命中，卡片改回「整枚快照当 value」时
     // 只要产物别处恰好有一个 `.value ?? {}` 就仍然通过。
     assert.ok(
@@ -422,7 +427,7 @@ async function loadClientExports(): Promise<{
     console,
   };
   vm.createContext(sandbox);
-  // 给求值设上限：产物里出现死循环（构建器或外壳拼接回归）时应当得到一条失败用例，
+  // 给求值设上限：产物里出现死循环（构建器或 外壳 拼接回归）时应当得到一条失败用例，
   // 而不是把整个 vitest worker 挂死。
   vm.runInContext(out, sandbox, { timeout: 5000 });
   const loaded = sandbox.loadedDef;
@@ -474,7 +479,7 @@ async function loadClientExports(): Promise<{
 describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
   /** 求值产物、取出导出的 apply/inject（宿主替身由各用例自己给）。 */
 
-  it("factory 可求值并导出 inject/apply（注入面按 0.1.7 交 configForms）", async () => {
+  it("factory 可求值并导出 inject/apply（注入按 0.1.7 交 configForms）", async () => {
     // configForms 取代 0.1.6 的 settingsScope：后者在 installed 0.1.7 全树零命中，继续
     // 注入它 = 必填服务缺失 = 整条 client 入口挂不上（卡片静默消失）。契约源 installed
     // dsh-client-ui-settings/lib/types/client/config-form.d.ts（Context 增强）与
@@ -520,7 +525,7 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
     const payload = trace.payload as CardPayload;
     assert.equal(typeof payload.set, "function", "payload 应带 set（产物契约变了）");
     assert.equal(typeof payload.unset, "function", "payload 应带 unset（产物契约变了）");
-    // 写通道受理位 Promise<boolean> **原样透传**给卡片（消费在 save()：false →
+    // 写通道受理结果 Promise<boolean> **原样透传**给卡片（消费在 save()：false →
     // saveRejected 文案且整批保留 touched；reject → saveFailed）——旧版在此 await 后
     // 刻意不消费（"消费=改行为"），一次合规修复即是那次行为变更。
     assert.equal(await payload.set("defaultLimit", 7), true, "payload.set 透传受理位");
@@ -540,7 +545,7 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
       [],
       "disposer 不得销毁 provider 持有的共享表单（0.1.7 ConfigForm 契约无 dispose）",
     );
-    // 「折叠 → 再声明」：工厂重跑，拿回的仍是同一张长活表单，写入照常落盘。
+    // 槽位声明被收回、再次声明：工厂重跑，拿回的仍是同一张长活表单，写入照常写到磁盘。
     const [redeploy] = trace.slotFactories;
     assert.ok(redeploy, "slots.inject 登记了可重跑的工厂");
     const cleanupAgain = redeploy();
@@ -556,12 +561,12 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
       "重挂后的卡片必须仍能写入（表单没被 disposer 打死）",
     );
     assert.deepEqual(formTrace.disposeCalls, [], "重跑路径同样不 dispose 共享表单");
-    // 官方第五位 mutate（批量原子写）在本卡的面包路上一次都不该出现：写入始终逐字段
+    // 官方第五位 mutate（批量原子写）在本卡的打包路径上一次都不该出现：写入始终逐字段
     // 走 set/unset。这根绊线钉住「卡片没绕过自己的 set/unset 轨迹去批量写」。
     assert.deepEqual(formTrace.mutateCalls, [], "本卡不用批量写，mutate 只是官方面的一员");
   });
 
-  it("传输失败（ConfigForm.set/unset 唯一会 reject 的一种）：字段级 console.error 后上抛，由卡片 save() 收口成 saveFailed", async () => {
+  it("传输失败（ConfigForm.set/unset 唯一会 reject 的一种）：字段级 console.error 后上抛，由卡片 save() 统一处理成 saveFailed", async () => {
     const formTrace: FormTrace = {
       setCalls: [],
       unsetCalls: [],
@@ -668,7 +673,7 @@ describe("单文件产物的输出守卫", () => {
     assert.throws(() => singleEntryChunk(output, "entry.ts"), /2 项输出/u);
   });
 
-  it("拒绝 asset：单文件产物没有落盘 asset 的位置", () => {
+  it("拒绝 asset：单文件产物没有写到磁盘 asset 的位置", () => {
     const output = [
       outputItem("chunk", ARTIFACT_FILE, { isEntry: true, code: CHUNK_CODE }),
       outputItem("asset", "x.css"),

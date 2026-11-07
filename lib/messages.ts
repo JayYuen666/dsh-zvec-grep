@@ -9,13 +9,13 @@
 // 带变量的文案用 `{name}` 占位符 + fill() 填（与官方 locale 的插值语法同源，两侧一套写法），
 // 字典本身是扁平字符串表。console.* 的日志、注释、索引路径/命令 argv/枚举值不在此列。
 // 这张表就是 host 半的全部文案：没有渲染点的文案不建表（卡片的 <select> 只显示「引用（维度）」，
-// 那一行人读口径住在 lib/embedding-catalog.ts 的注释里）。
+// 那一行人读规则写在 lib/embedding-catalog.ts 的注释里）。
 
 import type { MessagesCatalog } from "@jayyuen66/dsh-plugin-shared/lib/locale";
 
-/** 本包 host 侧产出的全部人读文案（工具描述、工具回显、guard 理由、重建读面的拒绝）。 */
+/** 本包 host 侧产出的全部人读文案（工具描述、工具回显、guard 理由、重建读取接口的拒绝）。 */
 export interface ZvecGrepMessages {
-  // ── 工具描述（模型面）──────────────────────────────────────────────────────
+  // ── 工具描述（模型可见）──────────────────────────────────────────────────────
   /** zg_search 的 description。 */
   readonly searchToolDescription: string;
   /** zg_index 的 description。 */
@@ -23,7 +23,7 @@ export interface ZvecGrepMessages {
   /** zg_status 的 description。 */
   readonly statusToolDescription: string;
 
-  // ── 工具参数说明（模型面）──────────────────────────────────────────────────
+  // ── 工具参数说明（模型可见）──────────────────────────────────────────────────
   /** zg_search 的 root。 */
   readonly rootSearchDescription: string;
   /** zg_index 的 root。 */
@@ -55,6 +55,14 @@ export interface ZvecGrepMessages {
   readonly modifiedAfterDescription: string;
   readonly modifiedBeforeDescription: string;
   readonly deviceDescription: string;
+  /** zg_search 的 files（文件发现模式，0.3.0 `zg --rg --files`）。 */
+  readonly filesDescription: string;
+  /** zg_search 的 category（引擎分类过滤，0.3.0 新增）。 */
+  readonly categoryDescription: string;
+  /** zg_search 的 categoryNot。 */
+  readonly categoryNotDescription: string;
+  /** zg_index 的 nestedGit（0.3.0 新增扫描规则）。 */
+  readonly nestedGitDescription: string;
   readonly resetPathsDescription: string;
   readonly confirmDescription: string;
   readonly embeddingDescription: string;
@@ -98,8 +106,27 @@ export interface ZvecGrepMessages {
   readonly rebuildWaitTimeout: string;
   /** 等待同根重建落定期间被取消：`{root}`。*/
   readonly rebuildWaitAborted: string;
-  /** 索引锁被非重建操作占用（常见是增量刷新）：`{op}`（ownerOperation 原文）。 */
+  /** 索引锁被非重建操作占用（常见是增量刷新）：`{op}`（占锁方自报操作名）。 */
   readonly lockBusyOtherOperation: string;
+  /**
+   * 远程 embedding 授权被拒（0.3.0 `ZG.ENGINE.PERMISSION_DENIED`）时的补注：上游报错
+   * 原文自带可照抄的 `zg --auth grant` 命令，这里补本部署侧的两条出路（部署开关或 grant）。
+   */
+  readonly remoteAuthDenied: string;
+  /**
+   * `transport=mcp` 档拉起守护进程失败：`{detail}`。这一档不静默回退 CLI——用户显式
+   * 选了 MCP 就是显式承担了 daemon 的存在；失败要交代两条出路（手动 `zg --server on`、
+   * 或换回 auto/cli 档），以及插件重启后旧 token 失忆这种已知形态。
+   */
+  readonly daemonStartFailed: string;
+  /** MCP 端点配置非法（形状与允许值）。 */
+  readonly daemonUrlInvalid: string;
+  /** MCP 传输上收到 `device` 参数（daemon 侧无此面）：`{field}`。 */
+  readonly deviceUnsupportedOnDaemon: string;
+  /** MCP 调用本身失败（网络/会话/协议层，非 zg 错误文本）：`{detail}`。 */
+  readonly mcpCallFailed: string;
+  /** auto 档 daemon 失败后同调用回退 CLI 的可见说明。 */
+  readonly daemonFallbackNote: string;
   /** 该根正在重建时的状态投影：`{root}`、`{jobId}`。*/
   readonly statusRebuilding: string;
   /** `--check-ready` 判出未就绪时的收尾注脚（报告已在上方）：`{root}`、`{detail}`。 */
@@ -124,7 +151,7 @@ export interface ZvecGrepMessages {
   readonly deniedFailure: string;
   /** zg 未安装（exit 127）：`{detail}`。 */
   readonly notInstalledFailure: string;
-  /** zg 版本低于门槛：`{actual}`、`{minimum}`。 */
+  /** zg 版本低于下限：`{actual}`、`{minimum}`。 */
   readonly zgVersionTooOld: string;
   /** 显式 root 的用户确认理由（喂官方 approval）：`{root}`、`{cwd}`。 */
   readonly rootApprovalReason: string;
@@ -142,20 +169,16 @@ export interface ZvecGrepMessages {
    * 正好失效——所以这条只说「怎么拿到可归因的文本」，不猜原因。
    */
   readonly noErrorCodeHint: string;
-  /** stdout 截尾：`{maxBytes}`、`{spill}` 落盘提示。 */
+  /** stdout 截尾：`{maxBytes}`、`{spill}` 写到磁盘提示。 */
   readonly outputTruncated: string;
-  /** 完整输出落盘位置：`{path}`。 */
+  /** 完整输出写到磁盘位置：`{path}`。 */
   readonly spillNote: string;
   /** 成功但被拒过文件操作的警告：`{denied}`。 */
   readonly sandboxWarning: string;
   /** stderr 回显（降级提示常在这里）：`{marked}`、`{tail}`。 */
   readonly stderrNote: string;
-  /** 命中摘要：`{groups}`、`{grouped}`、`{dedup}`、`{limit}`、`{capped}`、`{truncated}`。 */
+  /** 命中摘要（0.3.0：组计数维度已消失，只剩去重位置）：`{unique}`、`{limit}`、`{truncated}`。 */
   readonly hitSummary: string;
-  /** 命中摘要的「去重后不同位置」片段：`{unique}`；一条位置都数不出时整段省略。 */
-  readonly hitDedup: string;
-  /** 命中摘要的「某组命中数正好等于上限」片段——只陈述观察，不断言发生了截断。 */
-  readonly hitCapped: string;
   /** 命中摘要的「输出已截尾」片段（计数只含保留部分）。 */
   readonly hitTruncated: string;
   /** root 目录不存在：`{root}`。 */
@@ -181,7 +204,7 @@ export interface ZvecGrepMessages {
   /** 写进官方注册表 `detail` 的卸载理由（无变量）。 */
   readonly jobReasonUnload: string;
 
-  // ── 重建读面（Typert Remote 的三个方法）回显给人的拒绝 ──────────────────────
+  // ── 重建读取接口（Typert Remote 的三个方法）回显给人的拒绝 ──────────────────────
   /** root 参数不合法：`{reason}`。 */
   readonly endpointRootInvalid: string;
   /** root 不在观测白名单内：`{root}`。 */
@@ -223,16 +246,16 @@ export interface ZvecGrepMessages {
    * 模型以为自己启用了后台刷新、其实索引一动不动。`{root}` 是这次检索的工作区。
    */
   readonly refreshBackgroundNeedsServer: string;
-  /** zg_status 末尾补的守护进程就绪态（就绪那一臂）：无占位符。 */
+  /** zg_status 末尾补的守护进程就绪态（就绪那一条分支）：无占位符。 */
   /**
    * `refresh=background` 被**部署钉死的 `clientMode: direct`** 挡住时的那句（`{root}`）。
-   * 与守护进程缺席分开：那一档叫用户去 `zg server on` 是对的，这一档那么说就是指错方向
+   * 与守护进程缺席分开：那一档叫用户去 `zg --server on` 是对的，这一档那么说就是指错方向
    * ——模式是部署在 cordis.yml 的行 config 里定的，得回那里改。
    */
   readonly refreshBackgroundPinnedDirect: string;
-  /** zg_status 末尾补的守护进程就绪态（就绪那一臂）：无占位符。 */
+  /** zg_status 末尾补的守护进程就绪态（就绪那一条分支）：无占位符。 */
   readonly serverReadyNote: string;
-  /** zg_status 末尾补的守护进程就绪态（未就绪那一臂）：无占位符。 */
+  /** zg_status 末尾补的守护进程就绪态（未就绪那一条分支）：无占位符。 */
   readonly serverUnavailableNote: string;
   /** 符号类型不在 zg 闭集内：`{received}`、`{allowed}`。 */
   readonly symbolTypeInvalid: string;
@@ -240,7 +263,7 @@ export interface ZvecGrepMessages {
   readonly rootEscapesFs: string;
   /** root 非字符串：`{received}`。 */
   readonly rootMustBeString: string;
-  /** root 缺失（内部调用面）。 */
+  /** root 缺失（内部调用）。 */
   readonly rootRequired: string;
   /** root 非绝对路径：`{path}`。 */
   readonly rootMustBeAbsolute: string;
@@ -269,6 +292,8 @@ export interface ZvecGrepMessages {
   readonly exhaustiveNeedsPattern: string;
   /** 穷举模式收到索引侧参数：`{names}`。 */
   readonly exhaustiveConflicts: string;
+  /** 文件发现模式收到用不上的参数：`{names}`。 */
+  readonly filesConflicts: string;
   /** 显式 embedding 不在本地清单、且部署未开放远程：`{reference}`、`{choices}`。 */
   readonly embeddingNotAllowed: string;
   /** drop 与 resetPaths 互斥。 */
@@ -336,9 +361,9 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     fuseDescription: "融合所有组为单一排名",
     limitDescription: "每组最大条数 1-50，默认 10；越出区间直接报错",
     previewDescription:
-      "每条命中带的源码片段大小：none 只给锚点行、short 给锚点加一段有界上下文、full 给整段源码。默认 short",
+      "每条命中带的源码片段大小：none 只给锚点行、short 给锚点加一段有界上下文（默认）、full 给整段源码、detail 另附符号/签名/Range 等结构化字段并按文件分组",
     refreshDescription:
-      "检索前如何刷新索引：wait 等刷新到最新（默认）、off 不刷新、background 交给守护进程后台刷新。background 只在守护进程就绪时可用：没有守护进程时这一档在命令构造前就被拒绝（直连模式下 zg 只会静默关掉刷新并留一行 stderr warning，那等于把「没刷新」说成「后台在刷」），要它请先在终端执行 `zg server on`",
+      "检索前如何刷新索引：wait 等刷新到最新（默认）、off 不刷新、background 交给守护进程后台刷新。background 只在守护进程就绪时可用：没有守护进程时这一档在命令构造前就被拒绝（直连模式下 zg 只会静默关掉刷新并留一行 stderr warning，那等于把「没刷新」说成「后台在刷」），要它请先在终端执行 `zg --server on`",
     globsDescription: "路径 glob（如 src/**），单个字符串或数组",
     globsIndexDescription: "路径 glob",
     insensitiveGlobsDescription: "大小写不敏感 glob",
@@ -349,12 +374,18 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     preferSymbolDescription: "优先精确符号",
     modifiedAfterDescription: "只搜该时间后修改的文件",
     modifiedBeforeDescription: "只搜该时间前修改的文件",
-    deviceDescription: "auto/cpu/metal/vulkan/cuda；默认 auto（Metal 加速，失败自动回退 CPU）",
+    deviceDescription:
+      "auto/cpu/metal/vulkan/cuda；默认 auto（Metal 加速，失败自动回退 CPU）。仅 CLI 传输消费：MCP 传输（守护进程）的检索面没有这一位，显式传入会被拒绝",
+    filesDescription:
+      "文件发现模式（对应 zg --rg --files）：不搜索内容，按当前过滤规则（globs/fileTypes/modifiedAfter/…）列出文件清单——默认感知 .gitignore/.ignore/.rgignore，输出已排序且无条数上限（--limit 不适用）。与 query/queries/fts/vector/fuse/limit/preview/refresh 及全部索引侧参数互斥，也不发放 grep/rg 配额",
+    categoryDescription: "引擎分类过滤（如 code、document），单个字符串或数组",
+    categoryNotDescription: "排除的引擎分类，单个字符串或数组",
+    nestedGitDescription: "扫描嵌套 Git 仓库与子模块（默认不含）",
     resetPathsDescription:
       "清掉这个根继承来的文件选择设置（globs/fileTypes/hidden/… 全部回到未设置），只影响本次写入的索引配置；可与 globs/fileTypes 同传（先清干净再按这次的规则选），但与 drop 互斥",
     confirmDescription: "用户已明确要求本次建/重建/删索引，必须为 true",
     embeddingDescription:
-      "本地 embedding 模型引用（默认取设置 defaultEmbedding）。只接受本地清单内的模型；远程 embedding 会把工作区内容送到外部端点，须由用户在部署配置里显式开放，本插件不接受模型侧开启",
+      "embedding 模型引用（默认取设置 defaultEmbedding）。本地清单内的模型直接可选；远程 qwen 模型须由用户在部署配置里打开 allowRemoteEmbedding 才可选（远程会把工作区内容送到外部端点，首次索引还要用户执行一次 zg --auth grant 授权），本插件不接受模型侧自行开启",
     rebuildDescription: "重建已有索引（切换 embedding 时必须为 true）",
     dropDescription: "删除索引（与其它索引选项互斥）",
     ignoreFilesDescription:
@@ -371,7 +402,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "# zvec-grep（zg）工作区检索规则",
       "",
       "本环境的工作区检索路由：",
-      "- 工作区已建 zg 索引（存在 .zvec-grep/ 目录）时：所有检索必须先调用 zg_search（语义/混合，命中更全更准）；grep/rg 只作为 zg_search 之后的精确字面/正则补充。每次成功的 zg_search 解锁少量 grep/rg 配额（次数/时效见设置），配额用尽或过期后门禁会再次拦截，此时应换一个更准确的 query/fts 重新 zg_search。门禁同时覆盖 bash 里的 grep/rg 命令与原生 grep 工具。",
+      "- 工作区已建 zg 索引（存在 .zvec-grep/manifest.json）时：所有检索必须先调用 zg_search（语义/混合，命中更全更准）；grep/rg 只作为 zg_search 之后的精确字面/正则补充。每次成功的 zg_search 解锁少量 grep/rg 配额（次数/时效见设置），配额用尽或过期后门禁会再次拦截，此时应换一个更准确的 query/fts 重新 zg_search。门禁同时覆盖 bash 里的 grep/rg 命令与原生 grep 工具。",
       "- 无索引工作区：zg_search 会自动改走**穷举词法检索**（逐行字面匹配，结果里会有一条前置声明）。" +
         "精确查找（单个定义、字面量、文件名、配置键、报错信息、正则、穷举列表）用 zg_search 就够，" +
         "不必先 zg_index（那要先下载 embedding 权重）。也可显式 rg=true 强制它，或 rg=false 拒绝改道。" +
@@ -407,7 +438,18 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "本次不会发放 grep/rg 配额——重建期间索引不可读，先等它结束。",
     rebuildWaitAborted: "等待 {root} 的重建完成时被中止。",
     lockBusyOtherOperation:
-      "zg 索引锁正被其他操作占用（ownerOperation: {op}），本命令没有等待它结束：这类操作（如索引刷新）可能耗时很久，稍后重试或等它落定后再查",
+      "zg 索引锁正被其他操作占用（operation: {op}），本命令没有等待它结束：这类操作（如索引刷新）可能耗时很久，稍后重试或等它落定后再查",
+    remoteAuthDenied:
+      "[zvec-grep] 这次索引被 zg 以远程授权拦下（上游报错原文里带有可照抄的 `zg --auth grant` 命令）。两条出路：让用户在持有终端时执行那条 grant（对工作区持久授权），或在插件部署配置里打开 allowRemoteEmbedding 并配好端点与凭据环境变量后重试——本插件不会替用户把工作区内容送出本机。",
+    daemonUrlInvalid:
+      "daemonUrl 不是可用的 MCP 端点：{received}。需要 `http(s)://<host>[:<port>]/mcp`（默认 `http://127.0.0.1:7999/mcp`）；transport=mcp 自启 daemon 时还会把它的 host:port 作为 `--listen`。改回合法端点或把 transport 换回「自动」/「仅 CLI」后重载插件。",
+    daemonStartFailed:
+      "transport=mcp 需要守护进程，但自动拉起失败：{detail}。出路：在持有终端时手动执行 `zg --server on`（daemonUrl 不是默认端点时补 `--listen <host:port>`）后重试；或把设置卡的传输方式换回「自动」/「仅 CLI」。插件把自启 token 持久化在 `<ZVEC_GREP_HOME 或 ~/.zvec-grep>/dsh-zvec-grep.token`（0600），正常崩溃/重启会复用它；该文件丢失时才需要手工收尾：`zg --server status` 不需要令牌，可读到 PID，终止那个进程（POSIX `kill <pid>`；Windows `Stop-Process -Id <pid>`）后让本插件重新拉起；`zg --server off` 同样需要那枚已丢失的令牌。",
+    deviceUnsupportedOnDaemon:
+      "device 参数仅 CLI 传输消费：守护进程（MCP 传输）的检索面没有这一位。去掉该参数重试，或改用「仅 CLI」传输档。",
+    mcpCallFailed: "zg 守护进程调用失败：{detail}",
+    daemonFallbackNote:
+      "[zvec-grep] 守护进程调用失败，本次已回退到 CLI 通道（下次会重新探测守护进程）：{detail}",
     statusRebuilding:
       "{root} 正在重建中（作业 {jobId}）。重建期间索引不可读，检索会自动等待它完成后重试。" +
       "如需查看实时输出，请在设置卡的工作区重建面板里观察。此刻即使问「索引是否就绪」也是否定的答案——重建落定后再问。",
@@ -449,7 +491,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     detailPrefix: " 详情：{detail}",
     detailColon: "：{detail}",
     noErrorCodeHint:
-      "（这条失败没有 zg 的结构化 `Code:` 行，本包无法按码归因。上游不带 `--debug` 时会把部分失败塌成一句无码文本；要拿到可归因的完整输出，请让持有终端的用户把同一条命令加上 `--debug` 复跑一次）",
+      "（这条失败没有 zg 的结构化 `Error[码]:` 行，本包无法按码归因。上游对部分失败会塌成一句无码文本；要拿到可归因的完整输出，请让持有终端的用户把同一条命令加上 `--debug` 复跑一次）",
     outputTruncated:
       "[zvec-grep] 注意：输出超过 {maxBytes} 字节上限，已截断，仅保留尾部{spill}。" +
       "如需完整结果请缩小检索范围（更精确的 query / 更小的 limit / 更窄的 root）。",
@@ -460,10 +502,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     stderrNote:
       "[zvec-grep] zg stderr（可能含降级提示，如退化为纯词法检索 / 跳过 --refresh）：{marked}{tail}",
     hitSummary:
-      "[zvec-grep] 命中摘要：{groups} 个查询组，分组计数合计 {grouped} 条{dedup}；请求 --limit {limit}{capped}{truncated}",
-    hitDedup: "，去重后 {unique} 个不同位置",
-    hitCapped:
-      "（有组的命中数正好等于 --limit；zg 不提供截断信号，此处只陈述计数，不推断是否还有更多）",
+      "[zvec-grep] 命中摘要：去重后 {unique} 个不同位置（请求 --limit {limit}{truncated}）",
     hitTruncated: "；输出已截尾，计数只含保留部分",
     rootMissing: "root 目录不存在（zg 需要真实存在的工作区路径）：{root}",
     jobOutputTruncated: "\n[zvec-grep] 输出过长，已截断，只保留尾部",
@@ -503,7 +542,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "模式下成立。缺了守护进程时这次调用要的是 background，而上游只会往 stderr 打一行 " +
       "warning 就把**刷新整个关掉**，所以这里不再替它把「没刷新」说成「后台在刷」。" +
       "两条出路：按默认 refresh=wait（检索前同步刷到最新，直连模式可用），或在持有终端时" +
-      "先执行 `zg server on` 再来要后台刷新——后者还会顺带带来索引增量刷新与常驻的模型池。",
+      "先执行 `zg --server on` 再来要后台刷新——后者还会顺带带来索引增量刷新与常驻的模型池。",
     refreshBackgroundPinnedDirect:
       "{root} 这次检索把 `refresh=background` 拒绝了：本 daemon 的传输模式被部署钉死在 " +
       "direct（行 config 的 `clientMode: direct`），而后台刷新只在 server 模式下存在。这一档" +
@@ -514,7 +553,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     serverUnavailableNote:
       "[zvec-grep] 守护进程：未就绪。检索因此按直连模式逐次冷加载 embedding 模型（大工作区" +
       "会更慢，且 refresh=background 不可用）；需要增量索引与常驻模型池时，请在持有终端执行" +
-      " `zg server on`",
+      " `zg --server on`",
     symbolTypeInvalid: "符号类型非法：{received}（合法取值：{allowed}，只接受小写）",
     rootEscapesFs: "root 含越界的 .. 段：{path}",
     rootMustBeString: "root 必须是字符串（收到 {received}）",
@@ -534,18 +573,20 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     exhaustiveNeedsPattern: "穷举检索（rg=true）需要一个 query 作为匹配模式",
     exhaustiveConflicts:
       "穷举检索（rg=true）与下列索引侧参数互斥：{names}。穷举是纯词法匹配，不支持这些参数；把它们去掉，或先建索引（zg_index）再用索引检索",
+    filesConflicts:
+      "文件发现模式（files=true）与这些参数互斥：{names}。它只列文件、不搜内容——query 会被当成路径、limit 没有意义（上游明拒）、device 不参与文件发现；请去掉这些参数后重发",
     embeddingNotAllowed:
-      "embedding 引用 {reference} 不在本地候选清单内，而本部署未开放远程 embedding。远程 embedding 会把工作区内容送到外部端点，必须由用户在部署配置里显式开放（allowRemoteEmbedding），本插件不接受模型侧开启。可选本地模型：{choices}。若用户确已自行配好远程凭据（zg config provider set / zg auth grant <root> --capability embedding --scope workspace），请在插件部署配置里打开对应开关后重试。",
+      "embedding 引用 {reference} 不在候选清单内。可选本地模型：{choices}；远程模型（qwen/*）需在部署配置里打开 allowRemoteEmbedding 才可选，且首次索引要用户授权（zg --auth grant <root> --capability embedding --scope workspace）。未知前缀的引用在任何开关下都不放行——远程端点会把工作区内容送出本机，这个决定必须由用户显式做出。",
     dropWithResetPaths:
       "drop 与 resetPaths 互斥：--drop 整条命令只有删除索引一件事，resetPaths 无处安放（上游 zg 也拒这一对）。要清继承的文件选择设置，请不要传 drop。",
     dropWithIndexArgs:
       "drop 与这些索引侧参数互斥：{names}。--drop 整条命令只有删除索引一件事，它们不会被使用（静默收下只会让人以为过滤/重建生效了）；请去掉这些参数后重发删除。",
     ignoreFileMissing:
-      "ignoreFiles 里的 {path} 不是一份「存在且当前进程可读的文件」（不存在、是目录、或有文件但读不了都算）。上游 zg 遇到读不成的忽略文件不会按「没有这条规则」继续，而是整次索引失败（ENOENT / EISDIR / EACCES），并把这条坏路径写进工作区索引状态——此后这条树上的 zg index / zg status 都会报同一个错，--reset-paths 也清不掉，只有 zg_index drop 能救。请给一个真实存在、当前用户可读的忽略文件路径。",
+      "ignoreFiles 里的 {path} 不是一份「存在且当前进程可读的文件」（不存在、是目录、或有文件但读不了都算）。0.3.0 的 zg 对读不成的忽略文件会静默容忍——索引照常建立，但那条排除规则悄悄不生效（你以为它在挡文件，实际什么都没排除），本包因此在构造前就把坏路径拦下。请给一个真实存在、当前用户可读的忽略文件路径。",
     exhaustiveFallbackNote:
       "[zvec-grep] 该工作区（含向上各级）尚无 zg 索引，已自动改用穷举词法检索（rg 模式）。结果是逐行字面匹配，不是语义相关度排序；需要语义检索请先 zg_index 建索引。",
     rgDescription:
-      "穷举词法检索（对应 zg query --rg）：不需要索引，逐行字面匹配。留空则在工作区无索引时自动改用它、有索引时照常走索引检索。显式 false 可要求只用索引检索（无索引即报错）。它不支持 preview / refresh / fuse / symbolTypes / preferSymbol / fts / vector / queries，且不发放 grep/rg 配额",
+      "穷举词法检索（对应 zg --rg）：不需要索引，逐行字面匹配。留空则在工作区无索引时自动改用它、有索引时照常走索引检索。显式 false 可要求只用索引检索（无索引即报错）。它不支持 preview / refresh / fuse / symbolTypes / preferSymbol / fts / vector / queries / category，且不发放 grep/rg 配额",
     intWithReceived: "{name} 必须是 >= {min} 的整数（收到 {received}）",
     intRequired: "{name} 必须是 >= {min} 的整数",
     guardRootRejected: "{name} 的 root 不被接受：{reason}",
@@ -608,9 +649,9 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     fuseDescription: "Fuse all groups into a single ranking",
     limitDescription: "Max hits per group, 1-50, default 10; a value outside that range is refused",
     previewDescription:
-      "How much source each hit carries: none anchor line only, short anchor plus a bounded context window, full the whole chunk. Default short",
+      "How much source each hit carries: none anchor line only, short anchor plus a bounded context window (default), full the whole chunk, detail adds symbol/signature/Range metadata grouped per file",
     refreshDescription:
-      'How the index is refreshed before searching: wait refreshes to the latest (default), off does not refresh, background hands it to the daemon. background needs a ready daemon: without one it is refused before the command is built (in direct mode zg silently turns refreshing off and leaves one stderr warning, which would report "refreshing in the background" when nothing refreshes) — run `zg server on` in a terminal to get it',
+      'How the index is refreshed before searching: wait refreshes to the latest (default), off does not refresh, background hands it to the daemon. background needs a ready daemon: without one it is refused before the command is built (in direct mode zg silently turns refreshing off and leaves one stderr warning, which would report "refreshing in the background" when nothing refreshes) — run `zg --server on` in a terminal to get it',
     globsDescription: "Path globs (e.g. src/**), a single string or an array",
     globsIndexDescription: "Path globs",
     insensitiveGlobsDescription: "Case-insensitive globs",
@@ -622,17 +663,24 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     modifiedAfterDescription: "Only search files modified after this time",
     modifiedBeforeDescription: "Only search files modified before this time",
     deviceDescription:
-      "auto/cpu/metal/vulkan/cuda; default auto (Metal acceleration, falls back to CPU on failure)",
+      "auto/cpu/metal/vulkan/cuda; default auto (Metal acceleration, falls back to CPU on failure). Consumed by the CLI transport only: the daemon (MCP transport) search surface has no such knob, and passing it is refused",
+    filesDescription:
+      "File discovery mode (zg --rg --files): no content search — lists the files matching the current filters (globs/fileTypes/modifiedAfter/…). Respects .gitignore/.ignore/.rgignore by default; the list is sorted and uncapped (--limit does not apply). Conflicts with query/queries/fts/vector/fuse/limit/preview/refresh and every index-side parameter, and grants no grep/rg quota",
+    categoryDescription:
+      "Engine category filter (e.g. code, document), a single string or an array",
+    categoryNotDescription: "Engine categories to exclude, a single string or an array",
+    nestedGitDescription: "Scan nested Git repositories and submodules (excluded by default)",
     resetPathsDescription:
       "Clear the file-selection settings this root inherited (globs/fileTypes/hidden/… all go back " +
       "to unset), affecting only the index config written this time. May be combined with " +
       "globs/fileTypes (clear first, then apply this call's rules), but conflicts with drop",
     confirmDescription: "The user explicitly asked for this index build/rebuild/drop; must be true",
     embeddingDescription:
-      "Local embedding model reference (defaults to defaultEmbedding setting). Only models in the " +
-      "local catalog are accepted; remote embedding sends workspace content to an external endpoint " +
-      "and must be enabled explicitly by the user in the deployment config — this plugin never lets " +
-      "the model side enable it",
+      "Embedding model reference (defaults to defaultEmbedding setting). Local catalog models are " +
+      "always selectable; the remote qwen models require allowRemoteEmbedding turned on in the " +
+      "deployment config (remote embedding sends workspace content to an external endpoint, and the " +
+      "first index build needs a one-time user authorization via zg --auth grant) — this plugin never " +
+      "lets the model side enable it",
     rebuildDescription: "Rebuild the existing index (must be true when switching embedding)",
     dropDescription: "Delete the index (mutually exclusive with the other index options)",
     ignoreFilesDescription:
@@ -656,7 +704,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "# zvec-grep (zg) workspace search rules",
       "",
       "Search routing for this environment:",
-      "- When the workspace has a zg index (a .zvec-grep/ directory exists): every search must call " +
+      "- When the workspace has a zg index (a .zvec-grep/manifest.json exists): every search must call " +
         "zg_search first (semantic/hybrid, broader and more precise hits); grep/rg only as the exact " +
         "literal/regex follow-up after zg_search. Each successful zg_search unlocks a small grep/rg " +
         "quota (count/window in the settings); once it is spent or expired the gate blocks again and " +
@@ -714,7 +762,25 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "Retry later. No grep/rg quota is granted: the index is unreadable while the rebuild runs.",
     rebuildWaitAborted: "aborted while waiting for the rebuild of {root} to finish",
     lockBusyOtherOperation:
-      "the zg index lock is held by another operation (ownerOperation: {op}); this command did not wait for it: such operations (e.g. an index refresh) can run very long — retry later, or query again once it settles",
+      "the zg index lock is held by another operation (operation: {op}); this command did not wait for it: such operations (e.g. an index refresh) can run very long — retry later, or query again once it settles",
+    remoteAuthDenied:
+      "[zvec-grep] zg refused this indexing on remote-authorization grounds (the upstream error text carries a ready-to-copy `zg --auth grant` command). Two ways out: have the user run that grant in a terminal (persistent per-workspace authorization), or turn on allowRemoteEmbedding in the plugin's deployment config with the endpoint and credential env configured, then retry — this plugin never sends workspace content off the machine on its own.",
+    daemonUrlInvalid:
+      "daemonUrl is not a usable MCP endpoint: {received}. Expected `http(s)://<host>[:<port>]/mcp` (default `http://127.0.0.1:7999/mcp`); transport=mcp also passes its host:port as `--listen` when it starts the daemon. Fix the endpoint or switch transport back to auto/CLI, then reload the plugin.",
+    daemonStartFailed:
+      "transport=mcp needs the daemon but auto-starting it failed: {detail}. Either run " +
+      "`zg --server on` in a terminal (add `--listen <host:port>` when daemonUrl is not the " +
+      "default endpoint) and retry, or switch the card's transport back to auto/CLI. The plugin " +
+      "persists its self-start token at `<ZVEC_GREP_HOME or ~/.zvec-grep>/dsh-zvec-grep.token` " +
+      "(0600) and reuses it after a crash/restart; only when that file is gone do you need to " +
+      "recover manually: `zg --server status` needs no token and prints the PID — terminate that " +
+      "process (POSIX `kill <pid>`; Windows `Stop-Process -Id <pid>`), then let the plugin start " +
+      "a new one; `zg --server off` also requires that lost token.",
+    deviceUnsupportedOnDaemon:
+      "the device parameter is consumed by the CLI transport only: the daemon (MCP transport) search surface has no such knob. Drop the parameter and retry, or switch the transport to CLI-only.",
+    mcpCallFailed: "the zg daemon call failed: {detail}",
+    daemonFallbackNote:
+      "[zvec-grep] the daemon call failed; this call fell back to the CLI transport (the next call probes the daemon again): {detail}",
     statusRebuilding:
       "{root} is being rebuilt (job {jobId}). The index is unreadable while the rebuild runs; " +
       "searches wait for it to finish and retry. Watch live output in the settings card rebuild panel. " +
@@ -773,9 +839,9 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     detailPrefix: " details: {detail}",
     detailColon: ": {detail}",
     noErrorCodeHint:
-      "(this failure carries no structured `Code:` line from zg, so it cannot be attributed by " +
-      "code. Without `--debug` upstream collapses some failures into a single uncode line — have " +
-      "a user with a terminal re-run the same command with `--debug` for attributable output)",
+      "(this failure carries no structured `Error[<code>]:` line from zg, so it cannot be attributed " +
+      "by code. Upstream collapses some failures into a single uncode line — have a user with a " +
+      "terminal re-run the same command with `--debug` for attributable output)",
     outputTruncated:
       "[zvec-grep] note: output exceeded the {maxBytes} byte limit and was truncated, only the " +
       "tail is kept{spill}. Narrow the search for full results (sharper query / smaller limit / " +
@@ -788,12 +854,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "[zvec-grep] zg stderr (may contain degradation notes, e.g. falling back to pure lexical " +
       "search / skipping --refresh): {marked}{tail}",
     hitSummary:
-      "[zvec-grep] hit summary: {groups} query group(s), {grouped} hit(s) in grouped counts" +
-      "{dedup}; requested --limit {limit}{capped}{truncated}",
-    hitDedup: ", {unique} distinct location(s) after dedup",
-    hitCapped:
-      " (some group's hit count equals --limit; zg gives no truncation signal, so this states the " +
-      "count only and infers nothing about further hits)",
+      "[zvec-grep] hit summary: {unique} distinct location(s) after dedup (requested --limit {limit}{truncated})",
     hitTruncated: "; output truncated, the count covers only the kept part",
     rootMissing: "root directory does not exist (zg needs a real workspace path): {root}",
     jobOutputTruncated: "\n[zvec-grep] output too long, truncated — only the tail is kept",
@@ -838,7 +899,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "holds in server mode. Without a daemon the CLI prints one stderr warning and silently " +
       'turns refreshing **off**, which this plugin will not report as "refreshing in the ' +
       'background". Either keep the default refresh=wait (synchronous refresh before the search, ' +
-      "works in direct mode) or run `zg server on` in a terminal first — the daemon also brings " +
+      "works in direct mode) or run `zg --server on` in a terminal first — the daemon also brings " +
       "incremental indexing and a resident embedding model pool.",
     refreshBackgroundPinnedDirect:
       "{root}: `refresh=background` was refused because this daemon's transport mode is pinned " +
@@ -851,7 +912,7 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     serverUnavailableNote:
       "[zvec-grep] daemon: not ready. Searches therefore run in direct mode and cold-load the " +
       "embedding model every call (slower on large workspaces, and refresh=background is " +
-      "unavailable); run `zg server on` in a terminal for incremental indexing and a resident " +
+      "unavailable); run `zg --server on` in a terminal for incremental indexing and a resident " +
       "model pool",
     symbolTypeInvalid: "invalid symbol type: {received} (allowed: {allowed}; lowercase only)",
     rootEscapesFs: "root contains a .. segment that escapes the filesystem root: {path}",
@@ -877,13 +938,16 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "exhaustive search (rg=true) conflicts with these indexed-search parameters: {names}. " +
       "Exhaustive search is pure lexical matching and does not support them; drop them, or build " +
       "an index first (zg_index) and search the index",
+    filesConflicts:
+      "file discovery (files=true) conflicts with these parameters: {names}. It only lists files " +
+      "and never searches content — query would be read as a path, limit is meaningless (upstream " +
+      "refuses it outright), and device plays no part in file discovery; drop them and resend",
     embeddingNotAllowed:
-      "embedding reference {reference} is not in the local catalog, and this deployment has not " +
-      "enabled remote embedding. Remote embedding sends workspace content to an external endpoint " +
-      "and must be turned on explicitly by the user in the deployment config (allowRemoteEmbedding); " +
-      "this plugin never lets the model side enable it. Local choices: {choices}. If the user has " +
-      "already set up remote credentials themselves (zg config provider set / zg auth grant <root> " +
-      "--capability embedding --scope workspace), enable the matching deployment setting and retry.",
+      "embedding reference {reference} is not in the catalog. Local choices: {choices}; the remote " +
+      "qwen models require allowRemoteEmbedding turned on in the deployment config (and a one-time " +
+      "user authorization, zg --auth grant <root> --capability embedding --scope workspace). " +
+      "References with unknown prefixes are refused under every switch — a remote endpoint sends " +
+      "workspace content off the machine, and that decision belongs to the user.",
     dropWithResetPaths:
       "drop conflicts with resetPaths: --drop does nothing but delete the index, so resetPaths has " +
       "nowhere to go (upstream zg rejects the pair too). To clear inherited file-selection settings, " +
@@ -894,21 +958,20 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "took effect); remove them and resend the drop.",
     ignoreFileMissing:
       "{path} is not an existing file the current process can read (missing, a " +
-      "directory, or present-but-unreadable all count). Upstream zg does not treat a failed " +
-      'ignore-file read as "no such rule": the whole indexing run fails (ENOENT / EISDIR / EACCES) ' +
-      "and the bad path is written into the workspace index state, after which every zg index / " +
-      "zg status on that tree reports the same error — even --reset-paths cannot clear it, only " +
-      "zg_index drop can. Give a path that really exists and that the current user can read.",
+      "directory, or present-but-unreadable all count). zg 0.3.0 silently tolerates an unreadable " +
+      "ignore file — indexing succeeds, but that exclusion rule quietly does nothing (you believe " +
+      "it is filtering files while nothing is excluded), so this plugin refuses the bad path " +
+      "before the command is built. Give a path that really exists and that the current user can read.",
     exhaustiveFallbackNote:
       "[zvec-grep] This workspace (and every directory above it) has no zg index, so the search fell " +
       "back to exhaustive lexical matching (rg mode). Results are literal line matches, not ranked by " +
       "semantic relevance; run zg_index first if you need semantic search.",
     rgDescription:
-      "Exhaustive lexical search (zg query --rg): needs no index, matches literal text line by line. " +
+      "Exhaustive lexical search (zg --rg): needs no index, matches literal text line by line. " +
       "Leave it unset to fall back to it automatically when the workspace has no index, and to use " +
       "the index when one exists. An explicit false demands indexed search only (an error when there " +
       "is no index). It does not support preview / refresh / fuse / symbolTypes / preferSymbol / fts " +
-      "/ vector / queries, and it grants no grep/rg quota",
+      "/ vector / queries / category, and it grants no grep/rg quota",
     intWithReceived: "{name} must be an integer >= {min} (received {received})",
     intRequired: "{name} must be an integer >= {min}",
     guardRootRejected: "the root given to {name} is not accepted: {reason}",

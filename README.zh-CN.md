@@ -46,7 +46,7 @@
   - [zg\_status](#zg_status)
   - [rg 开关](#rg-开关)
   - [root 判据](#root-判据)
-- [ search-first 门禁](#-search-first-门禁)
+- [ search-first 检查](#-search-first-检查)
 - [ 设置项](#-设置项)
   - [远程 embedding](#远程-embedding)
   - [显式 root 前的确认](#显式-root-前的确认)
@@ -54,7 +54,7 @@
 - [ 外部依赖](#-外部依赖)
 - [ 守护进程](#-守护进程)
 - [ 对外接口](#-对外接口)
-- [ 后台作业面](#-后台作业面)
+- [ 后台作业](#-后台作业)
 - [ 数据与隐私](#-数据与隐私)
 - [ 已知边界](#-已知边界)
 - [ 常见问题](#-常见问题)
@@ -64,8 +64,8 @@
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
 
 - **三枚模型工具，底下是一条 CLI。** zg_search / zg_index / zg_status 经宿主 shell 调 zg CLI。传输模式缺省 `--mode auto`：守护进程就绪走 server，缺席时静默落回 direct——没有任何一方替你拉起 daemon。
-- **一道 search-first 门禁。** 已建索引的工作区里，grep/rg（shell 命令或原生工具）必须先有一次成功的 zg_search；每次检索重新武装一份有时效的配额。
-- **一段 systemPrompt 硬规则**（`zvec-grep-routing`，order 1550）加一道 `tools.guard` 兜底：zg_index 强制显式 confirm，所有 root 在 guard 与 execute 两条路上过同一套判据。
+- **一道 search-first 检查。** 已建索引的工作区里，grep/rg（shell 命令或原生工具）必须先有一次成功的 zg_search；每次检索重新武装一份有时效的配额。
+- **一段 systemPrompt 硬规则**（`zvec-grep-routing`，order 1550）加一道 `tools.guard` 后备：zg_index 强制显式 confirm，所有 root 在 guard 与 execute 两条路上过同一套判据。
 - **一张 web 设置卡**（"zvec-grep（zg）"）：默认 embedding、limit、门禁参数、守护进程就绪行，以及「工作区重建」按钮——作业登记进官方宿主作业注册表。
 - **没有索引也能起步。** zg_search 可改走 zg 的穷举词法通道（`rg` 开关）；从未建索引的 root 明确报错，而不是被静默索引。
 
@@ -79,7 +79,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 - **Node.js `>= 24.9`**（纯 ESM；正是这个下限让 `require()` 一枚 ESM 入口成为可能，`engines.node` 因此声明）。
 - **宿主 `dsh` 在 `0.2.1-rc.5` 或 `0.2.2-alpha.3` 这条线上。** 宿主读 `engines.dsh`（`^0.2.1-rc.5 || ^0.2.2-alpha.3`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.1-rc.5` 的都通过宿主装载门；`0.2.2` 预发布线上，npm 的严格 peer 解析从 `0.2.2-alpha.3` 起算。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
-- **按契约，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.1-rc.5 || ^0.2.2-alpha.3`），`devDependencies` 里的精确钉版才是防「第二份宿主类型面」的编译期纪律——那不是宿主会去读的声明。
+- **按约定，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.1-rc.5 || ^0.2.2-alpha.3`），`devDependencies` 里的精确钉版才是防「第二份宿主类型」的编译期纪律——那不是宿主会去读的声明。
 - **值导入都是必需 peer。** `@deepseek-ai/schemastery` 是宿主 fork（只有它的 `resolve` 认 `.volatile()` 字段）；`@deepseek-ai/dsh-typert-protocol` 提供 `TypertRemoteService` 这个要 `extends` 的类；`@deepseek-ai/dsh-scope` 提供步骤准入判定用的 `scopeOf`；shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`。四者都落 peer 加同版精确钉的 devDependencies——缺一枚就是装载期 `ERR_MODULE_NOT_FOUND`，不是优雅降级。`dependencies` 里是 `@jayyuen66/dsh-plugin-shared` 与 `zod`（后者版本走伞根 catalog，供设置卡的 strict codec 校验）。
 - **随包发什么**：`host.js`、`client.js`、`cordis.patch.yml`、`icon.svg`、两份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`locale/zh.json` + `locale/en.json`、`docs/`（两份 DETAIL）。产物由 `prepack` 现产，不入库。
 
@@ -92,37 +92,37 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 1. **层已经进栈。** `dsh --profile web --dump-config` 末尾出现 `# == @jayyuen66/dsh-zvec-grep` 加 `- id: zvec-grep`。这条命令是唯一被接受的判据，而且**不是只读命令**——层行从 stdout 读，**并且**单独检查 stderr；`# == <layer>` 与 `# == <layer>, patched by <path>` 两种形态都要认。
 2. **工具答得上来。** 让模型对当前工作区跑一次 zg_status：工具会执行并把 zg 自己的输出透传回来。回「未知工具」说明 bundle 层没进栈。
 3. **门禁会拦——前提是已建索引。** `enforceSearchFirst` 开着且 `<root>/.zvec-grep/` 下有清单时，一次成功的 zg_search 之前 grep/rg 被「尚未执行过 zg_search」那句拒绝。没有索引的工作区里门禁无事可拦。
-4. **卡片渲染。** 设置页列出 "zvec-grep（zg）"：六个可编辑值、就绪行（探测答不出时保持空白）与重建按钮；改一个值点**保存**以 200 落地。
+4. **卡片渲染。** 设置页列出 "zvec-grep（zg）"：七个可编辑值（含「检索传输方式」）、就绪行（探测答不出时保持空白）与重建按钮；改一个值点**保存**以 200 落地。
 5. **profile 里没有宿主副本。** 临时 profile 的 `node_modules/` 里只有 `@jayyuen66/`，没有 `@deepseek-ai/` 目录。
 
 ## <img src="https://api.iconify.design/lucide/circle-slash.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它不提供什么
 
-- **没有自有 HTTP 路由。** 卡片的数据面是官方 Typert Remote 命名空间 `zvecGrepRebuild`，经宿主 `/api` 网关；认证、Host / DNS 重绑定 / Origin 判据与请求体上限都归网关。
+- **没有自有 HTTP 路由。** 卡片的数据那一栏是官方 Typert Remote 命名空间 `zvecGrepRebuild`，经宿主 `/api` 网关；认证、Host / DNS 重绑定 / Origin判据与请求体上限都归网关。
 - **没有 CLI 子命令。** `dsh zvec-grep …` 不存在。
-- **不碰守护进程的生命周期。** `zg server on` 是用户的动作；本包只读就绪态。
-- **不依赖 ripgrep。** rg 只出现在门禁判据里。
-- **不向宿主数据目录写任何东西。** 落盘的都是 zg 的事：检索根下的 `.zvec-grep/` 索引与清单、zg 的全局 home `~/.zvec-grep`（config / 锁 / 模型）、以及按 `hfEndpoint` 下载的 embedding 权重缓存。
-- 必需的服务面：settings / shell / tools / systemPrompt / timer（全在 `inject` 里）。宿主 `jobs` 服务可选——没有它时重建路径拒绝且不 spawn，三枚工具照常工作。
+- **守护进程生命周期按传输档区分。** `transport=auto` / `cli` 不主动拉起 daemon（`auto` 只在探测到就绪时走 MCP）；`transport=mcp` 会自启一个带随机 token 的 daemon（`zg --server on`，回环 7999），同一枚 token 既作 MCP Bearer、也经 env 喂给所有 CLI 子进程；插件卸载时用它停掉自己拉起的那一个。用户自启的 daemon（默认无鉴权）本包只读就绪态，绝不停。
+- **不依赖 ripgrep。** rg 只出现在检查判据里。
+- **只写一个文件，且只服务自启的 daemon。** `transport=mcp` 的 token 持久化在 `<ZVEC_GREP_HOME 或 ~/.zvec-grep>/dsh-zvec-grep.token`（0600），供重启后重新认证；停 daemon 成功后删除。写到磁盘的其余内容都是 zg 的事：检索根下的 `.zvec-grep/` 索引与清单、zg 的全局 home `~/.zvec-grep`（config / 锁 / 模型）、以及按 `hfEndpoint` 下载的 embedding 权重缓存。
+- 必需的宿主服务：settings / shell / tools / systemPrompt / timer（全在 `inject` 里）。宿主 `jobs` 服务可选——没有它时重建路径拒绝且不 spawn，三枚工具照常工作。
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
-- `dsh.bundle.patch` 指向 `cordis.patch.yml`，其 `insert:` 块带**两条条目**：`- name: "@jayyuen66/dsh-plugin-shared"`（卡片组件的供应行，**刻意不写 `id`**，所以插件页不会把它列成可停用组件）与 `- id: zvec-grep`、`name: "@jayyuen66/dsh-zvec-grep"`——让宿主扫描 client 半的是**裸包名**。bundle 安装走 pnpm（>= 12.3.0）。
-- 缺任一注入服务面，cordis 就不激活本条目（启动诊断点名 `pending (waiting for service: …)`）；ctx 形状不对时 apply 抛 `required services … missing`。
+- `dsh.bundle.patch` 指向 `cordis.patch.yml`，其 `insert:` 块带**两条条目**：`- name: "@jayyuen66/dsh-plugin-shared"`（卡片组件的供应行，**刻意不写 `id`**，所以插件页不会把它列成可停用组件）与 `- id: zvec-grep`、`name: "@jayyuen66/dsh-zvec-grep"`——让宿主扫描 client 半的是**不带子路径的包名**。bundle 安装走 pnpm（>= 12.3.0）。
+- 缺任一注入宿主服务，cordis 就不激活本条目（启动诊断点名 `pending (waiting for service: …)`）；ctx 形状不对时 apply 抛 `required services … missing`。
 - 卡片注册在 `plugins.bundle.config` 槽的 **bundle 包名**键下；设置命名空间与 `configForms` 的读仍走裸条目 id `zvec-grep`（按条目 id 隐式注册）。
-- 重建读面注册在 apply fiber 上——不声明 `webServer`、没有子 fiber。TUI 宿主上服务照常注册，只是卡片没有地方渲染。
+- 重建读取接口注册在 apply fiber 上——不声明 `webServer`、没有子 fiber。TUI 宿主上服务照常注册，只是卡片没有地方渲染。
 - 状态轮询是客户端自己的定时器（2000 ms），不是服务端推送；每次读都以结果对象回答，不抛错。
 - 部署默认值写在注册行的 `config:` 上；优先级：卡运行时值 > 行 config > schema 的 `.default()`。
 
 ## <img src="https://api.iconify.design/lucide/search.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 提供给模型的工具
 
-输出为纯文本；超时 5 分钟（search）/ 10 分钟（index）/ 60 秒（status）；stdout 上限 400000 字节，超限截尾并提示。沙箱 runner 失败、策略拒绝与 zg 自身失败分开归因；结果可能不完整时显式打标。`root` 必须是字符串，构造出的命令按 UTF-8 字节（不是码元）封顶：非字符串的 root 与超长命令直接拒绝，不会回落到会话工作区，也不会撞上内核参数上限。`limit` 越出 1-50 同样直接拒绝并点名区间，不静默钳制——钳过的少结果会被模型当成这次检索的事实；省略则用默认值。
+输出为纯文本；超时 5 分钟（search）/ 10 分钟（index）/ 60 秒（status）；stdout 上限 400000 字节，超限截尾并提示。沙箱 runner 失败、策略拒绝与 zg 自身失败分开归因；结果可能不完整时显式打标。`root` 必须是字符串，构造出的命令按 UTF-8 字节（不是码元）封顶：非字符串的 root 与超长命令直接拒绝，不会回落到会话工作区，也不会撞上内核参数上限。`limit` 越出 1-50 同样直接拒绝并点名区间，不会静默钳制——钳过的少结果会被模型当成这次检索的事实；省略则用默认值。
 
 ### zg_search
 
 - query / queries / fts / vector 至少其一（合计 <= 32 组、单条 <= 4000 字符）；四个过滤项（`globs` / `insensitiveGlobs` / `fileTypes` / `excludedFileTypes`）收单字符串或数组（128 项、单项 <= 1024 字符）。
-- `symbolTypes` 绑定 zg 的闭集，**只认小写**（`module` / `class` / `interface` / `function` / `value` / `alias`）；非法取值在构造命令前就拦，不做大小写折叠。
-- `preview`：`none` / `short`（默认）/ `full`。`refresh`：`wait`（默认）/ `off` / `background`——`background` 要有**就绪的守护进程**，没有就在构造命令前拒并给出路（`zg server on`，或把 `clientMode` 从 `direct` 改回来）。
-- 输出尾部一行**命中摘要**分两栏：各查询组 `hits:` 之和，与去重后不同位置数（按相对路径 + 行号范围）——同一处被多组命中时不能拿求和冒充命中总数。某组正好等于 `--limit` 只作观察陈述；zg 不提供截断信号。
+- `symbolTypes` 绑定 zg 的闭集，**只认小写**（`alias` / `class` / `enum` / `function` / `interface` / `module` / `value`，最多 7 项）；非法取值在构造命令前就拦，不做大小写折叠。
+- `preview`：`none` / `short`（默认）/ `full` / `detail`（0.3.0 新增：附符号、签名与 Range，并按文件分组）。`refresh`：`wait`（默认）/ `off` / `background`——`background` 要有**就绪的守护进程**，没有就在构造命令前拒并给出路（`zg --server on`，或把 `clientMode` 从 `direct` 改回来）。
+- 输出尾部一行**命中摘要**：去重后的不同位置数（身份键取条目头行 `#N` 之后的原样文本，`score=` 装饰不计入）——同一处被多组命中时不重复计。某组正好等于 `--limit` 只作观察陈述；zg 不提供截断信号。
 - `trace` 透传 `--trace`（每条命中的召回路径、名次、分值）；摘要去重键剥掉逐组不同的分值。
 
 ### zg_index
@@ -148,7 +148,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 ### root 判据
 
 - 三者的 root 都可省略（缺省=当前会话工作区）。校验：以 `/` 开头的绝对路径、词典归一；空串/非字符串/NUL/相对路径/越界的 `..`、归一后为 `/` 都拒；目录不存在单报「root 目录不存在」，不冒成 spawn ENOENT。
-- 会话工作区之外的 root 只有走共享判据（`judgeRoot`）的「祖先/后代」分支才放行，且每个过判据的 root 都登记进卡片重建吃的观测白名单。guard 与 execute 同一套判据——不会同一件事拒两遍、说法还不同。
+- 会话工作区之外的 root 只有走共享判据（`judgeRoot`）的「祖先/后代」分支才放行，且每个过判据的 root 都登记进卡片重建所用的观测白名单。guard 与 execute 同一套判据——不会同一件事拒两遍、说法还不同。
 
 ## <img src="https://api.iconify.design/lucide/ban.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> search-first 门禁
 
@@ -158,11 +158,11 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 - **步骤准入让路**：宿主提供 `toolSet` 且本步骤的视图不含 `zg_search` 时（受限子代理或条件工具步骤），grep/rg 不被拦——强迫模型去调一个本步骤调不动的工具是死路。不提供步骤准入的宿主沿用原判据。
 - **「含索引」= `<root>/.zvec-grep/manifest.json` 在盘上，*并且*解析得开**：`manifestVersion` 严格等于 1、`rootPaths` 覆盖该目录（归一相等，macOS 两侧剥 `/private` 前缀）。只判目录名不够——它同时是 zg 的全局 home（`~/.zvec-grep`）；只判存在会把半截或外来的清单误判成有索引，把检索与门禁双向堵死。
 - 白名单/解锁表在内存里有界（64 根 / 256 分片），命中即触摸、先过期后 LRU 淘汰；白名单条目带一天有效期。
-- enforceSearchFirst=false 只关门禁；confirm 与 root 兜底照旧。
+- enforceSearchFirst=false 只关检查；confirm 与 root 兜底照旧。
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 设置项
 
-命名空间 `zvec-grep` 即设置条目 id；schema 共 16 个字段、逐字段带内置默认，其中卡上那 6 枚标 `.volatile()`。
+命名空间 `zvec-grep` 即设置条目 id；schema 共 18 个字段、逐字段带内置默认，其中卡上那 7 枚标 `.volatile()`。
 
 | 字段 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
@@ -173,7 +173,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 | `grepBudgetPerSearch` | natural，1-20 | `3` | 每次成功检索重新武装的 grep/rg 次数 |
 | `unlockWindowMin` | natural，1-240 | `10` | 配额有效分钟数 |
 
-另有**非 volatile 部署值**，共 10 枚不进卡片，cordis.yml 行 `config:` 是唯一改值入口：searchTimeoutMs=300000、statusTimeoutMs=60000、indexTimeoutMs=600000（也是重建 kill 定时器时长）、stdoutMaxBytes=400000、clientMode=auto、rebuildWaitMs=120000，加远程 embedding 三件套与 requireApprovalForExplicitRoot（见下两小节）。优先级：卡值 > 行 config > `.default()`；行里显式缺省的字段不覆盖默认。
+另有**非 volatile 部署值**，共 11 枚不进卡片，cordis.yml 行 `config:` 是唯一改值入口：searchTimeoutMs=300000、statusTimeoutMs=60000、indexTimeoutMs=600000（也是重建 kill 定时器时长）、stdoutMaxBytes=400000、clientMode=auto、daemonUrl=http://127.0.0.1:7999/mcp、rebuildWaitMs=120000，加远程 embedding 三件套与 requireApprovalForExplicitRoot（见下两小节）。优先级：卡值 > 行 config > `.default()`；行里显式缺省的字段不覆盖默认。
 
 ### 远程 embedding
 
@@ -189,22 +189,24 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ## <img src="https://api.iconify.design/lucide/monitor.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 支持面
 
-- **POSIX 宿主（Linux / macOS）。** root 判据只认 `/` 开头的绝对路径，命令行是 POSIX 形态（`shq()` 转义进 `bash -c`），清单比对按 `/` 分隔。
-- **Windows 不在支持面内，fail-fast。** 会话工作区长成 `C:\Users\…` 时三个工具都在 root 判据处当场拒并说明原因——不会拿错位路径去拼 zg 命令。真要支持得改判据本身（盘符/UNC、第二套命令形态、按 `/` 的切词），本包不做也不假装能做。
-- **CI 照此分工**：ubuntu 格是全部门禁（含四项 100% 覆盖率）；其它平台只跑不依赖盘上真工作区的检查、不判覆盖率。理由写在 `.github/workflows/ci.yml`。
+- **POSIX 与 Windows 宿主。** root 判据在 POSIX 上收 `/…`，在 Windows 上收盘符（`C:\…`、`C:/…`）与 UNC（`\\server\share\…`）；命令行在 POSIX 上用 bash 单引号转义、在 Windows 上用 pwsh 转义；grep/rg 门禁的切词跟同一方言（POSIX 反斜杠转义，Windows 反引号转义并认 `rg.exe`/`grep.exe`）。
+- **Windows 有测试兜着，不是猜的。** 平台注入的 win32 夹具在任意宿主上跑；CI 的 `windows-latest` 格跑真实临时工作区用例；ubuntu 格仍是唯一判四项 100% 覆盖率阈值的格子（分工理由见 `.github/workflows/ci.yml`）。
+- **CI 照此分工**：ubuntu 格是全部门禁（含四项 100% 覆盖率）；其它平台只跑不依赖盘上真工作区的检查、不判覆盖率。
 
 ## <img src="https://api.iconify.design/lucide/cpu.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 外部依赖
 
 - 二进制依赖是 **zg**（`npm install -g @zvec/zvec-grep`）。不在 PATH 时 shell 回 exit 127，工具回「zg 未安装或不在 PATH」，与「沙箱 runner 没起来」分开归因。
 - 上游即 `@zvec/zvec-grep`（提供 `zg` 这枚 bin），仓库 https://github.com/zvec-ai/zvec-grep，许可 **Apache-2.0**。本包只经宿主 shell 调那枚 CLI，不含也不分发上游源码。
-- 版本下限 `0.2.2`（`lib/zg-version.ts` 的 `MINIMUM_ZG_VERSION`）：低于它就在下发命令前停住并点名实际版本——更老的 zg 可能把同一串 argv 解成别的东西。
+- 版本下限 `0.3.0`（`lib/zg-version.ts` 的 `MINIMUM_ZG_VERSION`）：0.3.0 是 Rust 重写后 CLI 形态破坏性变更的第一版（`--index` / `--status` / 裸词 / `--server`）。低于它就在下发命令前停住并点名实际版本——更老的 zg 会把同一串 argv 解成别的东西。
 - 本地 embedding 由 zg 侧后端加载（qwen3/embeddinggemma 走 llama-cpp，potion-* 走 model2vec，其余走 transformers-js）；权重按 hfEndpoint 注入 HF_ENDPOINT 后下载。
 
 ## <img src="https://api.iconify.design/lucide/server.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 守护进程
 
-- direct 与 server 是**两种能力面**，不是快慢之分：direct 每次查询都冷加载 embedding 模型；增量刷新（watcher）、`refresh=background` 与常驻模型池只在 server 模式下存在。上游对 `auto` 只做就绪探测、不拉起 daemon。
-- 本包也不拉——`zg server on` 会留下 detached 进程与 token 文件，那是用户的决定。本包做的是把差异**显式化**：按 60 秒 TTL 缓存 `zg server status --check-ready` 的退出码（探测失败按未就绪收口，绝不外抛基础设施故障），据此收口 `refresh=background`，并在 `zg_status` 输出尾与卡片各回显一行。探测只由 `roots()` 读面发出。
-- 卡片的 `serverReady` 在卡片层只可能是 `true` / `false`——探测失败按未就绪收口，就绪行恒渲染。`undefined` 只会出现在旧快照的 `roots()` 原始载荷里（那一次探测压根没跑），实时卡片把它折成 `false`。想要红利就在终端里跑 `zg server on`。
+- direct 与 server 是**两种能力**，不是快慢之分：direct 每次查询都冷加载 embedding 模型；增量刷新（watcher）、`refresh=background` 与常驻模型池只在 server 模式下存在。上游对 `auto` 只做就绪探测、不拉起 daemon。
+- 本包的拉起策略跟 `transport` 走：`auto` / `cli` 不拉；`mcp` 档会自启一个带随机 token 的 daemon（`zg --server on`，监听 `daemonUrl` 的 host:port，默认回环 7999），同一枚 token 经 env 喂给所有 CLI 子进程、经 Bearer 喂给 MCP 调用；卸载时用同一枚 token 执行 `zg --server off` 停掉**自己拉起**的那一个。用户自启的 daemon（默认无鉴权）本包只读就绪态，不会停它。token 持久化在 `<ZVEC_GREP_HOME 或 ~/.zvec-grep>/dsh-zvec-grep.token`（0600）：崩溃/重启或另一宿主能读回同一枚，并发冷启动经 O_EXCL 认领收敛到一枚，不会互相覆盖。
+- **多个 agent 可以同时检索。** 同一宿主内的冷启动合并成一发 `zg --server on`；共用 `ZVEC_GREP_HOME` 的多个宿主共用同一个 daemon（上游 `instance.lock`，重复启动退 0 并回同一个 PID）。每个并发工具调用各用一条 MCP 会话——同一条 zg 会话一次只处理一个 `tools/call`——空闲会话复用，agent 之间不排队。只有索引重建会占工作区写锁；检索最多等它 `rebuildWaitMs`（这是唯一的有界等待，不是启动等待）。不同 `ZVEC_GREP_HOME` 是不同 daemon，需各自配 `daemonUrl` 端口。
+- 就绪态按 60 秒 TTL 缓存 `zg --server status --check-ready` 的退出码（探测失败按未就绪统一处理，绝不外抛基础设施故障），据此统一处理 `refresh=background`，并在 `zg_status` 输出尾与卡片各回显一行。探测由 `roots()` 读取接口、`zg_status` 与 `backgroundSupportFor` 发出。
+- 卡片的 `serverReady` 在卡片层只可能是 `true` / `false`——探测失败按未就绪统一处理，就绪行恒渲染。`undefined` 只会出现在旧快照的 `roots()` 原始载荷里（那一次探测压根没跑），实时卡片把它折成 `false`。想手动起一个共享 daemon 就在终端里跑 `zg --server on`。
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 对外接口
 
@@ -216,24 +218,24 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 | `rebuild({ root })` | 一个绝对 root | `{ ok: true, jobId, reused? }` 或 `{ ok: false, error, status }` |
 | `status({ jobId })` | 本包发的作业号 | `{ status, exitCode, root, output }`（有沙箱时带 `sandbox`）或 `{ ok: false, error, status: 404 \| 503 }` |
 
-- `rebuild` 拒绝非 `/` 路径、白名单之外的 root、已消失的目录；无 `jobs` 服务时一条都不 spawn（503 臂）。同根占位在第一个 `await` 前取——第二次点击跟随在跑的那条（`reused: true`），不会在同一份索引上再起一条 zg；启动失败归还占位，没有树会被永久标成「重建中」。
+- `rebuild` 拒绝非 `/` 路径、白名单之外的 root、已消失的目录；无 `jobs` 服务时一条都不 spawn（503 那一条分支）。同根占位在第一个 `await` 前取——第二次点击跟随在跑的那条（`reused: true`），不会在同一份索引上再起一条 zg；启动失败归还占位，没有树会被永久标成「重建中」。
 - `status` 只认本包侧表里的 id（最近 10 条已落定记录，在跑的永不淘汰），别人的作业经它读不到。卡片每 2 秒轮询。拒绝里的 `status` 是**保留的语义码，不是 HTTP 状态**；三个方法都不把异常抛穿网关——一次被拒的调用对卡片只是一条笼统失败，会停掉还在跑的重建的轮询。
 - 并发由**宿主注册表**决定（实测默认未拥有桶 10）；满员时 `rebuild` 交回官方点名文案的拒绝，绝不杀在跑的重建。
 
-## <img src="https://api.iconify.design/lucide/boxes.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 后台作业面
+## <img src="https://api.iconify.design/lucide/boxes.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 后台作业
 
 一次「工作区重建」是宿主 `ctx.jobs` 里的一枚**未拥有**作业（`kind: "zvec-grep-rebuild"`，id 形如 `zvec-grep-rebuild-<hex>`）。三个后果：
 
-- **模型侧能看见。** 官方 `job_list` / `job_output` / `job_kill` 列得出这次重建（退出码与信号走 `detail`，与宿主 bash 工具同形）；输出走官方 pull source，面板关着环也照常前进。
-- **未拥有 ⇒ 对全部会话可见**——采用官方注册表的已知且被接受的暴露面，要收回只有回滚换装一条路。`status` 读面仍只认本包侧表。
+- **模型侧能看见。** 官方 `job_list` / `job_output` / `job_kill` 列得出这次重建（退出码与信号走 `detail`，与宿主 bash 工具同形）；输出走官方 pull source；面板关着时，环形缓冲也照常前进。
+- **未拥有 ⇒ 对全部会话可见**——采用官方注册表的已知且被接受的暴露面，要收回只有回滚换装一条路。`status` 读取接口仍只认本包侧表。
 - **多了两个状态词**：`stopping`（取消已发出、未落定——按仍在跑显示）与 `failed`（注册表侧判定，带专门文案）。
-- 输出环按 **UTF-8 字节**留存（实测宿主默认 262144），卡片的尾窗按 **UTF-16 码元**计——中文输出的窗比换装前小约 1/3。「已截断」指环裁掉了头部；「缓冲区溢出」指字节真丢了。超时说明与沙箱事实在投影时合成、不进环；注册表被重载时轮询把 unknown job 折成拒绝结果，不抛穿。
+- 输出环形缓冲按 **UTF-8 字节**留存（实测宿主默认 262144），卡片的尾窗按 **UTF-16 码元**计——中文输出的窗比换装前小约 1/3。「已截断」环形缓冲裁掉了头部；「缓冲区溢出」指字节真丢了。超时说明与沙箱事实在投影时合成、不进环形缓冲；注册表被重载时轮询把 unknown job 折成拒绝结果，不抛穿。
 
 ## <img src="https://api.iconify.design/lucide/lock.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 数据与隐私
 
-| 口径 | 内容 |
+| 规则 | 内容 |
 | --- | --- |
-| 写盘 | 本包不写任何文件。落盘形状归 zg：检索根下的 `.zvec-grep/` 索引目录、全局 home `~/.zvec-grep`（config/锁/模型）与 embedding 权重缓存；宿主数据目录里什么都不落 |
+| 写盘 | 本包不写任何文件。写到磁盘形状归 zg：检索根下的 `.zvec-grep/` 索引目录、全局 home `~/.zvec-grep`（config/锁/模型）与 embedding 权重缓存；宿主数据目录里什么都不落 |
 | 本包读什么 | 索引探测：一次存在性检查加读一次清单 |
 | 网络 | 只有 zg 按 hfEndpoint 下载 embedding 权重。远程 embedding 默认关闭、属部署决定 |
 | 密钥排除 | 默认排除、大小写不敏感、且排在你的路径规则之后：`*.pem` / `*.key` / `*.p12` / `*.pfx` / `*.keystore` / `*.jks` / `*.ppk` / `id_rsa*` / `id_ed25519*`（excludeSecrets=false 可关）。**无扩展名**的密钥文件不覆盖——走 ignoreFiles 声明 |
@@ -243,10 +245,10 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ## <img src="https://api.iconify.design/lucide/triangle-alert.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 已知边界
 
-- **Windows 宿主不支持**——失败是明确的拒绝，不是错误的答案。
+- **Windows 宿主已支持**：盘符/UNC root 与 `pwsh` 命令转义；确切边界见「支持面」一节。
 - **无扩展名的密钥文件**不在排除规则覆盖内；`id_rsa*` / `id_ed25519*` 只覆盖 OpenSSH 默认命名。
 - **未拥有的重建作业对全部会话可见**——官方作业注册表的被接受暴露面。
-- **中文输出窗缩小约三分之一**——官方环按 UTF-8 字节、卡片按 UTF-16 码元的代价。
+- **中文输出窗缩小约三分之一**——官方的环形缓冲按 UTF-8 字节、卡片按 UTF-16 码元的代价。
 - **没有 `Code:` 行的 zg 失败无法按码归因**；这种回显带「可加 `--debug` 复跑」的指引（不默认带 `--debug`，它会撑爆给模型读的有界回显）。
 - **穷举检索不发放配额、也不产出语义结论**；每次自动改道都带前置声明。
 - **确认开关有三处死路**（never 审批预设、委派子代理、无 approval 服务）——写在设置项一节，不藏着。
@@ -255,9 +257,9 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 | 问题 | 回答 |
 | --- | --- |
-| grep/rg 被拒且提示「尚未执行过 zg_search」 | 这是 search-first 门禁，先 zg_search；配额用尽或过期同理，换个更准的 query 重搜续上，不必关插件。 |
+| grep/rg 被拒且提示「尚未执行过 zg_search」 | 这是 search-first 检查，先 zg_search；配额用尽或过期同理，换个更准的 query 重搜续上，不必关插件。 |
 | 检索超时 | 默认 `--refresh wait` 同步刷新索引；用 globs/fileTypes 缩小范围、调小 limit，或起守护进程——直连模式每次冷加载 embedding 模型，那才是预算给到 5 分钟的原因。 |
-| 报错「zg 索引锁正被其他操作占用（ownerOperation: …）」 | 占锁方不是重建（常见是增量刷新），这一条命令不为它等待——那类操作可能跑很久，排队等于无界挂起。稍后重试，或等它落定后再查；只有重建占锁走自动等待重试。zg 的原始失败文本随行，可核对是哪一把锁。 |
+| 报错「zg 索引锁正被其他操作占用（operation: …）」 | 占锁方不是重建（常见是增量刷新），这一条命令不为它等待——那类操作可能跑很久，排队等于无界挂起。稍后重试，或等它落定后再查；只有重建占锁走自动等待重试。zg 的原始失败文本随行，可核对是哪一把锁。 |
 | 重建被拒「root 不在观测白名单内」 | 该目录从未在本 daemon 开过会话；先在那里起会话，或让模型带 confirm=true 调 zg_index。 |
 | 卡片显示重建失败而 zg 看着像跑完了 | 成功判据是 completed 且 exit 0——exit 127（zg 没装）也落在 completed，看输出尾部。 |
 | 从未建索引的 root | zg_search 明确报错；建索引只在明确请求时由 zg_index 做。 |
@@ -271,9 +273,9 @@ pnpm run check   # 类型检查（三个 tsconfig 程序）→ lint → 两个 b
 ```
 
 - 测试分三层：`test/*.test.ts`（单测 + mock 宿主上下文）、`test/integration/*`（真宿主服务，经 `ctx.tools.execute()` / 真 `fetch` 驱动）、`test/e2e/zg-cli.test.ts`（无插件无替身——构造出的命令行直喂**真 zg CLI**）。宿主契约的缺陷出在中间层：mock 上下文只会同意本包已经相信的事。
-- 覆盖率四项 **100%**，分母是选入的面（`host.ts` + `lib/**`，以及卡片侧两个可单测源文件 `src/ui-messages.ts` / `src/rebuild-reader.ts`）；只有纯浏览器入口 `src/client-entry.ts` 在分母外，经 bundle 覆盖。
+- 覆盖率四项 **100%**，分母是选进来的文件（`host.ts` + `lib/**`，以及卡片侧两个可单测源文件 `src/ui-messages.ts` / `src/rebuild-reader.ts`）；只有纯浏览器入口 `src/client-entry.ts` 在分母外，经 bundle 覆盖。
 - `host.js` / `client.js` 不入库；`prepare` / `prepack` 现产，两条测试拿磁盘产物与内存构建逐字节比。发布物不手改。
-- manifest 门（`test/publish-manifest.test.ts`）守发布面：入口目标被 `files` 覆盖、宿主包不进 `dependencies`、`dsh-*` 精确钉、产物无本机路径。`test/dist-size.test.ts` 设体积预算，`test/readme-parity.test.ts` 钉两份 README 的结构对等。
+- manifest 门（`test/publish-manifest.test.ts`）守发布清单：入口目标被 `files` 覆盖、宿主包不进 `dependencies`、`dsh-*` 精确钉、产物无本机路径。`test/dist-size.test.ts` 设体积预算，`test/readme-parity.test.ts` 钉两份 README 的结构对等。
 
 ## <img src="https://api.iconify.design/lucide/scale.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 许可
 

@@ -1,15 +1,15 @@
-// test/publish-manifest.test.ts —— 发布形态门禁：入口面必须**与发布器无关**地可解析。
+// test/publish-manifest.test.ts —— 发布形态门禁：入口必须**与发布器无关**地可解析。
 //
-// 为什么值得一条测试：构建与单测都在源码侧跑绿，而真实故障发生在装出去之后。两类坑都在
-// 那一侧。其一是入口指向没随包发出去的文件；其二是入口覆盖写在 `publishConfig` 里——
+// 为什么值得一条测试：构建与单测都在源码侧跑绿，而真实故障发生在装出去之后。装出去之后有
+// 两类坑。其一是入口指向没随包发出去的文件；其二是入口覆盖写在 `publishConfig` 里——
 // pnpm 发布时把它合并到顶层，npm 不合并（npm 会打印
 // "Unknown publishConfig config main/exports" 并忽略），同一个仓库换个发布器就发出一个
 // import 必失败的包。这里不模仿任何发布器的实现，而是把不变式钉成断言：**顶层入口自己就
 // 完整可解析，且 publishConfig 不再承载入口字段**，于是两套发布器语义的差恒为空。
 //
 // 第二组门禁扫注释：日期与轮次编号写下时有用，读的人只会困惑，且没有任何读者能从中重建
-// 当时的上下文。只扫注释行与文档；测试夹具里的日期（modifiedAfter 之类的边界值）是数据，
-// 角色文档里的日期是内容，两者都不在禁面内。
+// 当时的上下文。只扫注释行与文档；夹具里的日期（modifiedAfter 之类的边界值）是数据，
+// 角色文档里的日期是内容，两者都不在禁止名单内。
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { readFile, readdir } from "node:fs/promises";
@@ -55,12 +55,12 @@ const FORBIDDEN_IN_ARTIFACTS: readonly RegExp[] = [
  * 随包发布的产物文件后缀（声明文件与产物同等对待）。
  *
  * 只认 .js 会漏掉 .mjs/.cjs，尤其漏掉最重要的 .d.ts：本组门禁的意图明写「落进声明或产物
- * 都不允许」，而声明面正是消费方 tsc 直接读的那批文件，一旦入口补上 types 就落在扫描之外。
+ * 都不允许」，而那批声明文件正是消费方 tsc 直接读的，一旦入口补上 types 就落在扫描之外。
  */
 const ARTIFACT_EXTENSIONS: readonly string[] = [".js", ".mjs", ".cjs", ".d.ts", ".mts", ".cts"];
 
 /**
- * 该文件是否属于「随包发布的产物面」。
+ * 该文件是否属于「随包发布的产物」。
  *
  * @param file - 相对包根的路径
  * @returns 命中产物后缀时为 true
@@ -69,17 +69,17 @@ function isArtifactFile(file: string): boolean {
   return ARTIFACT_EXTENSIONS.some((extension) => file.endsWith(extension));
 }
 
-/** `publishConfig` 里唯一允许出现的字段：可见性与源，都不是入口面。 */
+/** `publishConfig` 里唯一允许出现的字段：可见性与源，都不是入口字段。 */
 const ALLOWED_PUBLISH_CONFIG = new Set(["access", "registry"]);
 
-/** 遍历时跳过的目录：依赖、产物、以及本门禁刻意不管的面。 */
+/** 遍历时跳过的目录：依赖、产物、以及本门禁刻意不管的目录。 */
 const SKIP_DIRS = new Set([
   "node_modules",
   "coverage",
   "_env",
   "dist",
   ".git",
-  // 测试夹具里的日期与轮次编号是数据，不是注释噪音。
+  // 夹具里的日期与轮次编号是数据，不是注释噪音。
   "test",
   "tests",
   "__tests__",
@@ -87,7 +87,7 @@ const SKIP_DIRS = new Set([
   "agents",
 ]);
 
-/** package.json 里与入口面有关的形状；其余字段本门禁不关心。 */
+/** package.json 里与入口有关的形状；其余字段本门禁不关心。 */
 interface Manifest {
   readonly name?: string;
   readonly main?: string;
@@ -287,7 +287,7 @@ async function collectSources(dir: string, prefix: string): Promise<string[]> {
  * 取一段文本里属于注释或文档的行。文档（`.md`）整体算；代码只取注释行，免得把字符串
  * 字面量里的数据（日期夹具、示例路径）误判成注释噪音。
  *
- * @param file - 相对包根的文件名，用于决定判定口径
+ * @param file - 相对包根的文件名，用于决定判定规则
  * @param text - 文件全文
  * @returns 参与门禁的行
  */
@@ -295,7 +295,7 @@ function commentLines(file: string, text: string): string[] {
   if (file.endsWith(".md")) {
     return text.split("\n");
   }
-  // YAML 没有行尾注释以外的形态，但它的注释符是 #，与代码两侧不同口径。
+  // YAML 没有行尾注释以外的形态，但它的注释符是 #，与代码两侧不同一种做法。
   if (/\.ya?ml$/u.test(file)) {
     return text.split("\n").filter((line) => /^\s*#/u.test(line));
   }
@@ -354,8 +354,8 @@ describe("发布形态", () => {
 
   it("通配条目的形状由模式本身决定（shapeOf/expand 的第二道回归防线）", async () => {
     // 期望独立写死，不从实现派生：扩展名与递归这两位错一位就当场红。
-    // 坏形态的两条具体后果：`dist/*` 的扩展名被错认成 "*" → 展开成空集（发布面虚低）；
-    // 「dir 是 . 才递归，否则只算一层」→ `lib/**` 漏掉整棵子树（发布面同样虚低）。
+    // 坏形态的两条具体后果：`dist/*` 的扩展名被错认成 "*" → 展开成空集（发布名单虚低）；
+    // 「dir 是 . 才递归，否则只算一层」→ `lib/**` 漏掉整棵子树（发布名单同样虚低）。
     expect(shapeOf("*")).toStrictEqual({ kind: "glob", dir: ".", extension: "", recursive: false });
     expect(shapeOf("dist/*")).toStrictEqual({
       kind: "glob",
@@ -406,7 +406,7 @@ describe("发布形态", () => {
     }
   });
 
-  it("包根的每一份 .md 都在发布面里（npm 只自动附带 README* 与 LICENSE）", async () => {
+  it("包根的每一份 .md 都在发布名单里（npm 只自动附带 README* 与 LICENSE）", async () => {
     // 一次性封住这一类陷阱，而不是每加一份文档就补一条断言：`CHANGELOG.md`、
     // `THIRD_PARTY_NOTICES.md` 都不在 npm 的无条件附带清单里（见 {@link ALWAYS_SHIPPED} 的实测），
     // 忘了写进 `files` 就静默不随包分发——npm 页面看不出任何异常，只有真去找那份文件的人
@@ -420,8 +420,8 @@ describe("发布形态", () => {
     }
   });
 
-  it("产物面扫描覆盖 .js/.mjs/.cjs 与声明文件（只认 .js 会漏掉 tsc 读的那批）", () => {
-    // 期望独立写死：入口一旦补上 types，声明文件就是消费方 tsc 直接读的面。
+  it("产物扫描覆盖 .js/.mjs/.cjs 与声明文件（只认 .js 会漏掉 tsc 读的那批）", () => {
+    // 期望独立写死：入口一旦补上 types，声明文件就是消费方 tsc 直接读的那批文件。
     const artifacts = ["host.js", "dist/x.mjs", "dist/x.cjs", "dist/host.d.ts", "dist/x.d.mts"];
     const notArtifacts = ["host.ts", "dist/host.d.ts.map", MANIFEST_FILE, "README.md"];
     // 收集式断言：失败时报告的是「哪几个文件判错」，而不是一句没有对象的 toBe(false)。
@@ -429,10 +429,10 @@ describe("发布形态", () => {
     expect(notArtifacts.filter((file) => isArtifactFile(file))).toStrictEqual([]);
   });
 
-  it("产物面没有本机指涉（绝对路径、pnpm store 布局）", async () => {
+  it("产物没有本机指涉（绝对路径、pnpm store 布局）", async () => {
     // 注释门读不到产物：rolldown 构建时剥掉源码注释，而 `//#region` 标记里的路径、字符串字面量
-    // 里的本机路径会原样进 tarball。client 半必须把 shared 的产物**内联**（浏览器解析不了裸
-    // 说明符），所以它的标记里一度烙着 `node_modules/.pnpm/<名>@<版>_<哈希>/`——那既是安装布局
+    // 里的本机路径会原样进 tarball。client 半必须把 shared 的产物**内联**（浏览器解析不了
+    // bare说明符），所以它的标记里一度烙着 `node_modules/.pnpm/<名>@<版>_<哈希>/`——那既是安装布局
     // 外泄，也让同一份源码在不同机器上产出不同字节。
     const { shipped } = await readSurface();
     const artifacts = [...shipped].filter((file) => isArtifactFile(file)).toSorted();
@@ -490,8 +490,8 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     // profile 副本挂载出来的 ToolRuntime，得到 undefined，于是 `.prepare(...)` 在**每一次**原生
     // 工具调用上抛 "Cannot read properties of undefined (reading 'prepare')"，整个 profile 的
     // 工具一起失效。构建、类型检查与本包测试在此之前全部照绿，判据只能落在 manifest 面上。
-    // 本包的运行期面只有一枚宿主包：产物 host.js 值导入 @deepseek-ai/schemastery（宿主 fork，
-    // `.volatile()` 解析只有它有），client.js 与产物里的 dsh-* 全是类型面、编译期已擦除。它落
+    // 本包的运行期依赖只有一枚宿主包：产物 host.js 值导入 @deepseek-ai/schemastery（宿主 fork，
+    // `.volatile()` 解析只有它有），client.js 与产物里的 dsh-* 全是类型上、编译期已擦除。它落
     // peer 就够了——裸说明符由宿主那一份解析，peer 与 dev 都不进 profile。
     const { manifest } = await readSurface();
     const leaked = Object.keys(manifest.dependencies ?? {}).filter((name) =>
@@ -504,8 +504,8 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     // registry 上的 dist-tag 是实测出来的陷阱：`latest` 可能指向远早于宿主 ABI 的版本。
     // 精确钉是让「不带版本地装成远古版本」这件事不发生的最小条件；一旦放宽成 `^`/`~`，
     // 宿主某天发新 minor 就会自动跟上去，而插件与宿主 ABI 耦合，那等于让本包在没有测试的
-    // 情况下换掉编译用的宿主类型面。
-    // 只判 dev 这一侧：它才是本包真正装下来的那一份。peer 记的是「运行期由宿主提供」，
+    // 情况下换掉编译用的宿主类型声明。
+    // 只判 dev这一侧 段：它才是本包真正装下来的那一份。peer 记的是「运行期由宿主提供」，
     // 装什么版本由宿主决定，判据在下面那条。
     const { manifest } = await readSurface();
     // 过滤出违规项再一次性断言，而不是在循环里按条件 expect：失败时 diff 直接列出
@@ -538,8 +538,8 @@ describe("宿主依赖的版本形状（升级防线）", () => {
   });
 
   it("devDependencies 里的 dsh-* 全部同版本（不许装出第二份宿主类型）", async () => {
-    // 宿主类型面被这些包以 type-only 方式消费；同一次安装里出现两枚 dsh-session 的拷贝，
-    // nominal 类型（品牌串、投影状态）会开始互相不认，而那不报编译错、只报运行期
+    // 宿主类型被这些包以 type-only 方式消费；同一次安装里出现两枚 dsh-session 的拷贝，
+    // nominal 类型（带 brand 标记的 id、投影状态）会开始互相不认，而那不报编译错、只报运行期
     // 「认不出这个 callId」。同版本是让这件事不发生的最小条件。
     const { manifest } = await readSurface();
     const dshDev = Object.entries(manifest.devDependencies ?? {}).filter(([name]) =>
@@ -551,7 +551,7 @@ describe("宿主依赖的版本形状（升级防线）", () => {
     expect(drifted, `这些 dsh-* 与 ${baseline} 不同版本`).toStrictEqual([]);
   });
 
-  it("peerDependencies 里的 dsh 家族写支持窗口范围，与裸 dsh 逐条同一条", async () => {
+  it("peerDependencies 里的 dsh 家族与支持窗口 `engines.dsh` 写同一条范围", async () => {
     // peer 由宿主拿自己安装的那版去满足：钉成精确版本等于要求两者版本号完全相等，而滚动支持
     // 窗口本来就含三个版本。宿主侧只在 manifest 没有 engines.dsh 时才读 peer（app-boot 的
     // plugin-compatibility 里 engines.dsh 存在即独判），所以这一位是发布元数据的含义问题。
@@ -611,7 +611,7 @@ describe("注释与文档没有内部指涉", () => {
 /**
  * 说明符的包名段：`@scope/pkg/sub` → `@scope/pkg`，`pkg/sub` → `pkg`。
  *
- * @param specifier - `from "..."` 里那枚裸说明符
+ * @param说明符- `from "..."` 里那枚裸说明符
  * @returns 包名
  */
 function packageNameOf(specifier: string): string {
@@ -625,7 +625,7 @@ function packageNameOf(specifier: string): string {
 /**
  * 一段产物文本里**值导入**的宿主包名。
  *
- * 判面取出货产物而不是 shared 的源码：源码里的 type-only 导入在发布态已被擦除，产物里还剩下的
+ * 判断时取出货产物而不是 shared 的源码：源码里的 type-only 导入在发布态已被擦除，产物里还剩下的
  * 说明符才是装出去之后真会被 resolve 的那批。两种写法都要认——压缩后的产物里 `from` 与引号之间
  * 可以没有空格。
  * @param text - shared 某个 dist 产物的全文
@@ -666,7 +666,7 @@ async function sharedArtifacts(): Promise<string[]> {
     );
   } catch (error) {
     // MODULE_NOT_FOUND / ERR_PACKAGE_PATH_NOT_EXPORTED 都是「环境未就绪」，不是被测代码的缺陷：
-    // 裸堆栈会让人把它和「本包依赖面漏了一条」混在一起读。
+    // 原始调用栈会让人把它和「本包少声明了一条依赖」混在一起读。
     throw new Error(
       `解析 @jayyuen66/dsh-plugin-shared/package.json 失败：先在本仓安装依赖（pnpm install --ignore-scripts）。原因：${String(error)}`,
       { cause: error },
@@ -688,7 +688,7 @@ async function sharedArtifacts(): Promise<string[]> {
     .map((name) => path.join(dist, name));
 }
 
-describe("发布态运行期依赖面（装出去之后才炸的那一类）", () => {
+describe("发布态运行期依赖（装出去之后才炸的那一类）", () => {
   it("值导入的识别覆盖四种写法（漏一种就是给这道门留盲区）", () => {
     const cases: readonly (readonly [string, readonly string[]])[] = [
       [
@@ -709,7 +709,7 @@ describe("发布态运行期依赖面（装出去之后才炸的那一类）", (
         imports: [...expected],
       });
     }
-    // 负例：普通第三方与相对路径都不属于宿主包面。
+    // 负例：普通第三方与相对路径都不属于宿主包。
     expect([...valueImportedHostPackages('import { z } from "zod";')]).toStrictEqual([]);
     expect([...valueImportedHostPackages('import x from "./local.js";')]).toStrictEqual([]);
   });
@@ -720,7 +720,7 @@ describe("发布态运行期依赖面（装出去之后才炸的那一类）", (
     // 直接引那枚宿主包）。缺席时本包的类型检查、构建与 528 条用例全部照绿，故障只在装出去之后
     // 以 ERR_MODULE_NOT_FOUND 出现——躺在 profile 里的是 shared 的产物而不是它的源码，peer
     // 没有任何编译期信号。
-    // 判面取「shared 产物实际值导入」这一集合，而不是 shared 声明的 peer 全集：后者含纯类型面
+    // 判断时取「shared 产物实际值导入」这一集合，而不是 shared 声明的 peer 全集：后者含纯类型上
     // 的成员，本包不引就不该钉，否则这道门会把人推向为用不到的包付一次导入。
     const artifacts = await sharedArtifacts();
     expect(artifacts.length, "至少要扫到 shared 的一枚产物，否则这道门是空转的").toBeGreaterThan(0);
@@ -776,7 +776,7 @@ function repositoryUrlOf(manifest: Manifest): string {
  * `git+https://github.com/<账号>/<仓>.git`、`https://github.com/<账号>/<仓>/issues` 与
  * `https://github.com/<账号>/<仓>#readme` 三种写法都归一到同一段，末尾的 `.git` 收掉。
  * 两枚段分开取：只写 `[^/?#]+` 会在第一个 `/` 处截断，于是三处都退化成 `<账号>`，
- * 「同源」这条断言就变成恒真。
+ * 「同源」这条断言就变成永远成立。
  * @param url - 待归一的 URL
  * @returns `<账号>/<仓库名>`；认不出仓库时为空串
  */
@@ -787,7 +787,7 @@ function repoSlug(url: string): string {
   return owner === "" || repo === "" ? "" : `${owner}/${repo}`;
 }
 
-describe("发布元数据面（npm 页面与搜索读的是这些）", () => {
+describe("发布元数据那一栏（npm 页面与搜索读的是这些）", () => {
   it("描述、关键词、许可与作者齐备", async () => {
     const { manifest } = await readSurface();
     expect(

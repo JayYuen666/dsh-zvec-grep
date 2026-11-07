@@ -4,7 +4,7 @@
 // 新增一节而另一侧漏了，都**不会**让现有用例变红——文档漂移不是行为差异。而这两份是同一个
 // 插件对两类读者的同一份说明，骨架应当一一对应。
 //
-// 判面取结构而不是逐句对译：两份文档的句子本来就不是字面互译（中英术语与详略不同），按文本
+// 比对取结构而不是逐句对译：两份文档的句子本来就不是字面互译（中英术语与详略不同），按文本
 // 比会天天误报；标题层级序列与头部骨架（logo 打头 + HTML h1 + 语言徽章互链）才是可机判的最小信号。
 import { readFile } from "node:fs/promises";
 import path from "node:path";
@@ -18,7 +18,7 @@ const DOC_EN = "README.md";
 const DOC_ZH = "README.zh-CN.md";
 
 /** 视觉头的固定骨架：居中 logo 块打头；包名落在 HTML h1 上——头部没有 ATX 标题可判。
- *  包名从 package.json 现量（去掉 `@scope/`）：写死一份就等于「重命名包时这一处不会红」。 */
+ *  包名从 package.json 当场实测（去掉 `@scope/`）：写死一份就等于「重命名包时这一处不会红」。 */
 const HEAD_FIRST_LINE = '<p align="center">';
 const manifest = JSON.parse(await readFile(path.join(pkgDir, "package.json"), "utf8")) as {
   name?: unknown;
@@ -67,12 +67,12 @@ function headingLevels(text: string): string[] {
   return levels;
 }
 
-/** 读一份发布文档：读不到时报的是文档门的话，而不是裸 ENOENT（两份 README 与 CHANGELOG 共用）。 */
+/** 读一份发布文档：读不到时报的是文档检查那句话，而不是一句没有路径信息的 ENOENT（两份 README 与 CHANGELOG 共用）。 */
 async function readDoc(file: string): Promise<string> {
   try {
     return await readFile(path.join(pkgDir, file), "utf8");
   } catch (error: unknown) {
-    throw new Error(`发布文档门读不到 ${file}（包根 ${pkgDir}）`, { cause: error });
+    throw new Error(`发布文档检查读不到 ${file}（包根 ${pkgDir}）`, { cause: error });
   }
 }
 
@@ -93,7 +93,7 @@ function headOf(text: string): string {
  * README 的宿主支持窗口与 package.json 的 engines.dsh 同源。
  *
  * 为什么单列：伞根的 bump-manifests 只改 package.json，两份 README 的 badge 与两条策略句
- * 不在它的改写面内——0.1.11 就这样出现过 manifest 已抬到 rc.5/alpha.3、文档还写着
+ * 不在它的改写入内——0.1.11 就这样出现过 manifest 已抬到 rc.5/alpha.3、文档还写着
  * rc.3/alpha.2 的窗口。这条门把「只改一半」拦在本地，而不是等宿主装载门在用户机器上拒装。
  */
 describe("两份 README 的宿主支持窗口与 manifest 同源", () => {
@@ -192,7 +192,7 @@ function schemaShape(): { total: number; defaulted: number; volatile: number } {
 }
 
 /**
- * README 里那句配置面数字 = 导出 Config 的实际形状。
+ * README 里那句配置表数字 = 导出 Config 的实际形状。
  *
  * 为什么单开一条：上面那门只比**结构**，两侧一起写错时它照绿。0.1.3 正是这个样子——中英两份
  * 都写着 14 个字段（英文 fourteen），而 schema 早已是 16 枚（远程 embedding 三件套与
@@ -201,7 +201,7 @@ function schemaShape(): { total: number; defaulted: number; volatile: number } {
  * 措辞被改掉时正则取不到数，本条即红：这条门要的是「文档里那句数字仍可机判」这件事本身，
  * 而不是某种具体句式。改文档请连正则一起改，别改一侧。
  */
-describe("两份文档声明的配置面数字与实际 schema 对齐", () => {
+describe("两份文档声明的配置表数字与实际 schema 对齐", () => {
   it("字段总数、卡上 volatile 数、非 volatile 部署值数三处都对得上", async () => {
     const [english, chinese] = await readDocs();
     const shape = schemaShape();

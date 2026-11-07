@@ -1,10 +1,10 @@
-// test/dist-size.test.ts —— 产物体积闸门。
+// test/dist-size.test.ts —— 产物体积上限检查。
 //
 // 为什么要有：`npm run check` 的顺序是 build 在 test 之前，所以这道门读到的是**当轮刚产出**
-// 的产物，不是上一次遗留的。它挡的是「有人往切面里塞进大对象字面量或整段查表」这类回退——
+// 的产物，不是上一次遗留的。它挡的是「有人往构建切面里塞进大对象字面量或整段查表」这类回退——
 // 体积不是行为，不会让任何现有用例变红，所以必须单独有一把尺子。
 //
-// 预算怎么定的：取当前实测值上浮约 25%。留这一截是给正常演进的——加一条规则、改一句文案
+// 预算怎么定的：取当前实测值上加约 25%。留这一截是给正常演进的——加一条规则、改一句文案
 // 不该立刻逼人来改预算；翻倍一定会顶穿。确属需要突破时，改这些常量并写明理由。
 //
 // 明确不做的事：**不开 minify**。压缩后产物里的跨包说明符字符串会消失，而
@@ -17,14 +17,18 @@ import { describe, it } from "vitest";
 
 const pkgDir = path.join(import.meta.dirname, "..");
 
-/** host 半产物体积预算（取实测值上浮后的整数档）。宿主按包名载入它，这些字节是真实的装载成本。 */
-const HOST_BUDGET_BYTES = 240_000;
-/** client 半产物体积预算（取实测值上浮后的整数档）。浏览器侧加载，按平台单独计账。 */
+/** host 半产物体积预算（取实测值加余量后的整数档）。宿主按包名载入它，这些字节是真实的装载成本。 */
+// 0.3.0 适配新增 lib/daemon-client.ts（MCP/HTTP 客户端）与 lib/daemon-args.ts（参数映射）
+// 两个切面，host.js 随之抬到 ~252KB；预算按演进抬到 270KB，不是放任增长（超它仍红）。
+// Windows 支持又加入双档路径归一（lib/platform.ts、win32 的盘符/UNC 与 pwsh 切词）、
+// 会话池与 token 认领，实测 ~282KB；预算按同一口径抬到 310KB。
+const HOST_BUDGET_BYTES = 310_000;
+/** client 半产物体积预算（取实测值加余量后的整数档）。浏览器侧加载，按平台单独计账。 */
 // 设置卡迁到 @jayyuen66/dsh-plugin-shared/lib/card-ui 后，卡片样式与组件逻辑随包进
 // client.js（实测增加约 9 KB），预算按迁移后的实量重定。
 const CLIENT_BUDGET_BYTES = 80_000;
 
-/** 下限：闸门只管「别超」时，构建异常只写出空文件或残片会让 `bytes <= budget` 恒真。
+/** 下限：只卡「别超」时，构建异常只写出空文件或残片会让 `bytes <= budget` 永远成立。
  *  取值远低于当期实测（host.js 227,142 B / client.js 65,390 B），正常演进不会撞到；
  *  撞到它就说明产物不是「变快了」而是「变没了」。 */
 const HOST_FLOOR_BYTES = 120_000;
@@ -41,11 +45,11 @@ describe("产物体积", () => {
   // 预算时容易忘了把它塞进某个数组的某个分支里。
   it.each(BUDGETS)("%s 体积落在 %s–%s 字节之间", (file, floor, budget) => {
     const target = path.join(pkgDir, file);
-    // 先认「在不在」：缺产物时报的是这条门禁的话，而不是裸 ENOENT 堆栈 ——
+    // 先认「在不在」：缺产物时报的是这条门禁的话，而不是一句没有路径信息的 ENOENT 堆栈 ——
     // 后者分不清「没构建」与「构建坏了」，而这两种的下一步动作完全不同。
     assert.ok(
       existsSync(target),
-      `${file} 不在包根：这道门比的是已构建产物，先跑本仓的 build（见 README 的开发口径）。`,
+      `${file} 不在包根：这道门比的是已构建产物，先跑本仓的 build（见 README 的开发规则）。`,
     );
     const bytes = readFileSync(target).byteLength;
     assert.ok(

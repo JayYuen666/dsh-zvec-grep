@@ -1,20 +1,20 @@
-// 生产源码「不写盘」判据的支撑面：源码文件的收集器与调用形状。
+// 生产源码「不写盘」判据的支撑代码：源码文件的收集器与调用形状。
 //
-// 为什么单独成模块（而不是留在 *.test.ts 里）：这道门的判据本身要被探针直接驱动
+// 为什么单独成模块（而不是留在 *.test.ts 里）：这道门的判据本身要被探测直接驱动
 // （造一枚软链目录、塞一个别名 import，看它认不认得出），留在测试文件里就只能靠
-// vitest 的全局执行环境，探针没法复用同一份实现。
+// vitest 的全局执行环境，探测没法复用同一份实现。
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { stripComments, stringSpans } from "./schema-coverage.ts";
 
-/** 计入源码面的扩展名：只认 `.ts` 的话，`.mts` / `.cts` 入口会静默逃逸。 */
+/** 计入源码的范围的扩展名：只认 `.ts` 的话，`.mts` / `.cts` 入口会静默逃逸。 */
 export const SOURCE_EXTENSIONS: readonly string[] = [".ts", ".mts", ".cts"];
 
 /**
  * 递归收集目录下的源码文件。
  *
  * 软链要跟着看：`readdir(withFileTypes)` 交回的 dirent 对符号链接既不是 `isDirectory()`
- * 也未必带 `.ts` 后缀，静默跳过就等于「把 lib/ 换成一枚软链」能让整道门空转。
+ * 也未必带 `.ts` 后缀，静默跳过就等于「把 lib/ 换成一枚软链」能让整道检查失去校验作用。
  * 断链在这里让 `stat` 抛出去——判据宁可红，也不要量出一份假的干净。
  */
 export async function sourceFiles(dir: string): Promise<string[]> {
