@@ -25,11 +25,6 @@ const PKG_NAME = (
   }
 ).name;
 
-/** shared 客户端行在冒烟测试里的替身：任何成员都映射到同一个空实现。 */
-function sharedStubMember(): null {
-  return null;
-}
-
 /** 本包目录（绝对路径），用于核对 profile 的 link: 目标。 */
 const PKG_DIR = path.resolve(import.meta.dirname, "..");
 
@@ -103,11 +98,10 @@ function patchEntryIds(): string[] {
   // 条目层级是结构性的：顶层 `- insert:` 之下，每条条目是 4 空格缩进的 `- id: <裸条目 id>`。
   // 不用 `^\s*`：它在 m 标志下会把任意缩进层级（乃至嵌套子项的 id）都当成条目，
   // patch 结构一加嵌套，bareIds 就会多出条目而误红。
-  // shared 是卡片组件行，不是本包的 settings 命名空间；这里只收本包自己的裸条目。
   return Array.from(
     patch.matchAll(/^ {4}- id:\s+(?<id>\S+)\s*$/gmu),
     (row) => row.groups?.["id"] ?? "",
-  ).filter((id) => id !== "shared");
+  );
 }
 
 /** 本条目那张表单的官方快照类型（别名要保持**已实例化**，否则每处使用都得再给类型参）。 */
@@ -457,9 +451,10 @@ async function loadClientExports(): Promise<{
     if (name === "zod") {
       return { z };
     }
-    if (name === "@jayyuen66/dsh-plugin-shared/client") {
-      return new Proxy({}, { get: () => sharedStubMember });
-    }
+    // shared 的 `./client` 不再是可满足的请求：卡片组件已内联进产物（build-client.mjs 的
+    // 外置清单只留 react / zod）。工厂真发起这个 require 时按「未知请求」抛出，把外置回流
+    // 挡在这里——宿主页面上的同款失败是启动期的 "missed the module table"
+    // （dsh-ocr-review 仓 issue #2）。
     throw new Error(`unexpected require in client factory: ${name}`);
   });
   const exports = mod as { apply?: unknown; inject?: unknown };

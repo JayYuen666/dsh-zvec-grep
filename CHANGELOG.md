@@ -2,6 +2,14 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.14
+
+修复 0.1.13 引入的 web 启动隐患：卡片组件收回 `client.js` 内联，移除对 `@jayyuen66/dsh-plugin-shared/client` 的模块表外置与 `cordis.patch.yml` 里的 shared 供应行。zg 命令面与 MCP 传输层不变。
+
+### Fixed
+
+- **卡片组件内联进 `client.js`，产物自足**：0.1.13 把 `@jayyuen66/dsh-plugin-shared/client` 外置给宿主模块表，靠 `cordis.patch.yml` 插入的一条**不写 id** 的 shared 组件行把 shared 装载成供应方。这份供应链在 shared 只作为传递依赖装进 profile 时（`dsh plugin add` 的正常结果）没有保证——宿主侧可以既不报错也不把 shared 的 client 产物排进启动图，页面启动时 `require("@jayyuen66/dsh-plugin-shared/client")` 落进 `missed the module table`，整窗「应用无法启动或已意外停止」（dsh-ocr-review 仓 issue #2，宿主 0.2.2-rc.1 dsh desktop 实报）。`build-client.mjs` 的外置清单收回 react / zod 两族（宿主 `PLATFORM_MODULES` 供给，内联反而会产生第二份身份），卡片组件全部内联；`package.json` 的 `dsh.bundle.client.external` 与 patch 里的 shared 供应行随之移除，`cordis.patch.yml` 回到只声明本包一行。`test/build-client.test.ts` 的工厂替身对未知请求的抛出把外置回流挡在装配层。
+
 ## 0.1.13
 
 适配 zg 0.3.0（上游 Rust 重写，CLI 形态破坏性变更），新增守护进程 MCP 传输层与传输三档设置卡开关，并把 0.3.0 的功能面对齐进三件工具。**不兼容旧 zg**：`MINIMUM_ZG_VERSION` 抬到 `0.3.0`，0.2.x 的 Node 版 zg 会在版本门槛处被拦下并给出升级指引。

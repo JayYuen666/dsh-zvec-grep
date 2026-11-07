@@ -106,7 +106,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
-- `dsh.bundle.patch` 指向 `cordis.patch.yml`，其 `insert:` 块带**两条条目**：`- name: "@jayyuen66/dsh-plugin-shared"`（卡片组件的供应行，**刻意不写 `id`**，所以插件页不会把它列成可停用组件）与 `- id: zvec-grep`、`name: "@jayyuen66/dsh-zvec-grep"`——让宿主扫描 client 半的是**不带子路径的包名**。bundle 安装走 pnpm（>= 12.3.0）。
+- `dsh.bundle.patch` 指向 `cordis.patch.yml`，其 `insert:` 块只有一条 `- id: zvec-grep`、`name: "@jayyuen66/dsh-zvec-grep"`——让宿主扫描 client 半的是**不带子路径的包名**。卡片组件直接打进 `client.js`（只有 `react` / `zod` 外置给宿主模块表），卡片不依赖第二份包被装载。bundle 安装走 pnpm（>= 12.3.0）。
 - 缺任一注入宿主服务，cordis 就不激活本条目（启动诊断点名 `pending (waiting for service: …)`）；ctx 形状不对时 apply 抛 `required services … missing`。
 - 卡片注册在 `plugins.bundle.config` 槽的 **bundle 包名**键下；设置命名空间与 `configForms` 的读仍走裸条目 id `zvec-grep`（按条目 id 隐式注册）。
 - 重建读取接口注册在 apply fiber 上——不声明 `webServer`、没有子 fiber。TUI 宿主上服务照常注册，只是卡片没有地方渲染。

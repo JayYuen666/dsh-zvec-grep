@@ -105,7 +105,7 @@ If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entr
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
-- `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries **two entries**: `- name: "@jayyuen66/dsh-plugin-shared"` (the supplier of the card components, deliberately **without an `id`** so the plugin page does not list it as a switchable component) and `- id: zvec-grep` with `name: "@jayyuen66/dsh-zvec-grep"` - the **bare package name** is what makes the host scan the client half. Bundle installation goes through pnpm (>= 12.3.0).
+- `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries a single `- id: zvec-grep` entry with `name: "@jayyuen66/dsh-zvec-grep"` - the **bare package name** is what makes the host scan the client half. The card components are bundled into `client.js` (only `react` / `zod` stay external to the host's module table), so the card does not depend on a second package being loaded. Bundle installation goes through pnpm (>= 12.3.0).
 - A missing injected surface keeps cordis from activating the entry (startup diagnostic: `pending (waiting for service: …)`); a malformed ctx throws `required services … missing` from apply.
 - The card is registered in the `plugins.bundle.config` slot keyed by the **bundle package name**; the settings namespace and `configForms` reads stay the bare entry id `zvec-grep` (implicit registration by entry id).
 - The rebuild read surface is installed on the apply fiber - no `webServer` dependency, no child fiber. On a TUI host the service still registers; the card simply has nowhere to render.
