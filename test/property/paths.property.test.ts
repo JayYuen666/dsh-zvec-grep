@@ -77,7 +77,7 @@ const noTrailingSlashArb = fc
   .string({ maxLength: 64 })
   .filter((value) => !value.endsWith("/") && value.length > 0);
 
-/** 栈式归一模型：折叠空段与 `.`、`..` 弹栈、越根即抛。按 normalizeAbsolutePath 的头注契约独立实现。 */
+/** 栈式归一模型：丢掉空段与 `.`、`..` 弹栈、越根即抛。按 normalizeAbsolutePath 的头注契约独立实现。 */
 function modelNormalize(segments: readonly string[]): string {
   const stack: string[] = [];
   for (const seg of segments) {
@@ -160,7 +160,7 @@ describe("normalizeAbsolutePath 对栈式归一模型", () => {
 });
 
 describe("assertAbsoluteRoot 的性质", () => {
-  it("非字符串一律 TypeError，绝不静默接受", () => {
+  it("非字符串一律 TypeError，绝不会静默接受", () => {
     fc.assert(
       fc.property(nonStringValueArb, (value) => {
         assert.throws(() => assertAbsoluteRoot(value, zh), TypeError);
@@ -317,8 +317,8 @@ describe("isGrepRgCommand 的引号隔离性质", () => {
   });
 });
 
-describe("hasExternalTarget 的目标面性质", () => {
-  it("根外的显式操作数判外部；同一串作为重定向落点或取值旗标的值都不判", () => {
+describe("hasExternalTarget 的目标性质", () => {
+  it("根外的显式操作数判外部；同一串作为重定向位置或取值旗标的值都不判", () => {
     fc.assert(
       fc.property(absolutePathArb, externalPathArb, (root, external) => {
         const quoted = shq(external);

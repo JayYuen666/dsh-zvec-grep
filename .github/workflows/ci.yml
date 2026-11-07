@@ -13,7 +13,7 @@ on:
   # 但「上周没跑」不等于「上周全绿」，读结论时别把它当连续证据。
   schedule:
     - cron: "37 3 * * 1"
-# 同一分支上后到的提交取消前一个。发布用的是另一套口径（publish.yml 的
+# 同一分支上后到的提交取消前一个。发布用的是另一套规则（publish.yml 的
 # cancel-in-progress: false）——发布不能中途取消。
 # 组的键里带 event_name：周度漂移检测与 main 上的 push 都落在 refs/heads/main 上，
 # 只按 ref 分组会让后到的把先到的取消掉，而周度那一跑是「上游变了没有」的唯一信号，
@@ -27,9 +27,9 @@ permissions:
   contents: read
 # pnpm 取具体补丁版本而不是主版本 12：`version: 12` 让每次运行拿上游最新的 12.x，补丁差在安装树的
 # 解法上是可观察的行为差异（本族各仓 cordis.patch.yml 就记着 pnpm 某个小版本的 add 缺陷）。取值与
-# 伞根 packageManager 同源，也是各仓 lockfile 当期由之生成的那一枚。口径：九仓 CI 都在 workflow 级
+# 伞根 packageManager 同源，也是各仓 lockfile 当期由之生成的那一枚。规则：九仓 CI 都在 workflow 级
 # env 里写这枚字面值；唯一例外是 dsh-lesson-loop，它的 package.json 自带 packageManager，由
-# pnpm/action-setup 自己读，再写 env 就成了两份真源。
+# pnpm/action-setup 自己读，再写 env 就成了两份唯一来源。
 env:
   PNPM_VERSION: 12.11.2
 jobs:
@@ -62,24 +62,48 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
+      # Windows runner 的默认 shell 是 pwsh：pwsh 把 pnpm 解析成 .ps1 垫片时，pnpm 步会
+      # 零输出、秒退 0 而结论 success。本仓的 pnpm 步显式走 bash；这一步在每一格先把
+      # 解析到的 pnpm 路径与版本打出来，作为「工具就位」的正向证据。
+      - name: pnpm 可用性
+        shell: bash
+        run: |
+          command -v pnpm
+          pnpm --version
       # --frozen-lockfile：lockfile 与 package.json 不一致时直接失败，而不是在 CI 里静默改一份
       # lockfile 后继续跑——那样绿的是「CI 现场解出来的那棵树」，不是仓库里这一份。
-      - run: pnpm install --frozen-lockfile
-      # 两格命令不同，因为**覆盖率只能在 ubuntu 格判**：本包的 root 判据只认以 `/` 开头的
-      # 绝对路径（lib/cli.ts 的 assertAbsoluteRoot），而 win32 上 os.tmpdir() 交回的是盘符形态
-      # （实测 C:\Users\RUNNER~1\AppData\Local\Temp\…），凡是要在盘上造真实工作区的用例都会在
-      # rootOf 先拒掉、根本走不到被测行为 ⇒ 这些 suite 按平台跳过（test/host.test.ts 的
-      # realRootUnavailable）。跳过了 184 条用例，host.ts 在 win32 不可能到四项 100%，
-      # 所以 windows 格跑 check:platform（同一套 typecheck/lint/两个 bundle/全量用例/格式，
-      # 只是不判覆盖率），而不是把覆盖率阈值调低——阈值 100% 是 ubuntu 格的真约束，不是装饰。
-      # dsh 的 Windows 宿主因此明确不在支持面内（README「支持面」一节）；要支持 Windows 得动
-      # root 判据与命令形态本身，那是设计变更而不是给 CI 打个洞。
+      - shell: bash
+        run: pnpm install --frozen-lockfile
+      # 两格命令不同：四项 100% 覆盖率门只由 ubuntu 一格判定（覆盖率报告也只收它），其余格
+      # 跑同一套 typecheck/lint/两个 bundle/全量用例/格式，不判覆盖率。windows 格的全量用例
+      # 照跑：root 判据的 win32 档收盘符与 UNC（lib/cli.ts 的 assertAbsoluteRoot），真盘用例
+      # 不按平台跳过；win32 能否也到四项 100% 未单独验证过，两格拆分沿用，不在本文件里顺手改。
       - name: gate（ubuntu：全部门禁，覆盖率归这一格）
         if: matrix.os == 'ubuntu-latest'
-        run: pnpm run check
-      - name: gate（其余平台：产物/换行/path.sep 与不依赖真根的用例，不判覆盖率）
+        shell: bash
+        env:
+          NO_COLOR: "1"
+        run: |
+          set -o pipefail
+          pnpm run check 2>&1 | tee "$RUNNER_TEMP/gate.log"
+      - name: gate（其余平台：不判覆盖率）
         if: matrix.os != 'ubuntu-latest'
-        run: pnpm run check:platform
+        shell: bash
+        env:
+          NO_COLOR: "1"
+        run: |
+          set -o pipefail
+          pnpm run check:platform 2>&1 | tee "$RUNNER_TEMP/gate.log"
+      # 假绿的形态是「格子 success 但什么都没跑」（pwsh + pnpm 的历史实测）。判据落在门禁
+      # 本该产出的行上：没有 vitest 的测试汇总行就是没真跑，这里把红补上。不带 if：
+      # 门禁真红时本步不执行，不盖住真正的失败原因。
+      - name: 断言门禁真跑出测试
+        shell: bash
+        run: |
+          if ! grep -q "Test Files" "$RUNNER_TEMP/gate.log"; then
+            echo "::error::门禁日志里没有 vitest 测试汇总行——判定步骤可能没有真跑"
+            exit 1
+          fi
       # 覆盖率只在一次运行的日志里滚一遍就没了，翻起来费劲。落成产物之后，
       # 「这次为什么掉了」可以直接把报告下下来看，而不必重跑一次。
       # 只收 ubuntu 的 node 24 那一格：其余格各传一份只会得到同样的报告。
@@ -112,7 +136,7 @@ jobs:
 
       # 运行页顶部的摘要：把结果留在这一页，不必点进每一步的日志里找。
       # 它必须排在 job 的最后一步：job.status 在执行到那一步时才求值，后面若还有判定步骤，
-      # 后续步骤失败而摘要早已写成 success——那一行会成为唯一的结论面，且是错的。
+      # 后续步骤失败而摘要早已写成 success——那一行会成为唯一的结论，且是错的。
       - name: 运行摘要
         if: always()
         # 脚本体是 bash 写法（`{ …; } >> "$GITHUB_STEP_SUMMARY"`）；矩阵含 windows 格，
@@ -198,7 +222,7 @@ jobs:
           const NAME = "@jayyuen66/dsh-zvec-grep";
           const mod = await import(NAME);
           // 入口形状两态都收：本仓用默认导出，而同级包里也有纯命名导出的。写死一种形态
-          // 会让另一种假红——判据是「apply 与 Config 能从入口拿到」，不是「挂在 default 上」。
+          // 会让另一种误报——判据是「apply 与 Config 能从入口拿到」，不是「挂在 default 上」。
           const plugin = mod.default ?? mod;
           if (typeof plugin?.apply !== "function") throw new Error("入口没有 cordis 插件形状：缺 apply");
           if (plugin.Config === undefined) throw new Error("入口缺 Config：设置卡不会挂载");
@@ -212,7 +236,7 @@ jobs:
           if (!patchRel) throw new Error("package.json 缺 dsh.bundle.patch：宿主不会把它 reconcile 进层栈");
           const patch = path.join(pkgDir, patchRel);
           if (!existsSync(patch)) throw new Error(`bundle patch 没随包发出：${patchRel}`);
-          // bundle 注册行按裸包名扫 dsh.client 声明，所以 patch 文件必须**随包在**且写着这一行；
+          // bundle 注册行按不带子路径的包名扫 dsh.client 声明，所以 patch 文件必须**随包在**且写着这一行；
           // 取不到或行丢了，`dsh plugin add` 会静默少一个条目。
           const text = readFileSync(patch, "utf8");
           // 守卫要判的是「有没有一条条目按裸包名引用本包」，不是「有没有 id 行」也不是
@@ -239,7 +263,7 @@ jobs:
           # 单引号是刻意的：脚本体里有 JS 模板串，交给 shell 展开就坏了。
           set -euo pipefail
           tarball="$(find /tmp/pkg/pnpm -name '*.tgz' -print -quit)"
-          # 同 npm 侧探针：取不到就是打包环节的红，不能让 pnpm 去装一个空串。
+          # 同 npm 侧那次探测：取不到就是打包环节的红，不能让 pnpm 去装一个空串。
           if [ -z "$tarball" ]; then
             echo "::error::/tmp/pkg/pnpm 下没有 tgz——pnpm pack 没产出可安装的包"
             exit 1
@@ -247,7 +271,7 @@ jobs:
           mkdir -p /tmp/probe-pn && cd /tmp/probe-pn
           npm init -y >/dev/null
           # 这个目录之后由 pnpm 管，装依赖也得用 pnpm：在 pnpm 布局的项目里跑 `npm install`
-          # 会读不懂 pnpm 留下的 node_modules 树并崩掉，与本包无关，但足以让这一格假红。
+          # 会读不懂 pnpm 留下的 node_modules 树并崩掉，与本包无关，但足以让这一格误报。
           pnpm add "$tarball"
           node --input-type=module -e '
           import { existsSync, readFileSync } from "node:fs";
@@ -283,12 +307,12 @@ jobs:
   # 来源证明是给「这次运行打出来的这份产物」出的第三方可验凭据，不是多一步验证：
   # 签在 PR 上，那张证明看起来属于本仓，指向的却是 PR 里 prepack 脚本产出的字节。
   # 它也不能靠在同一 job 里给某一步加 if 来做——id-token 与 attestations 是 job 级权限，
-  # 挂上去就等于 PR 也拿到了写入能力，权限面不会因为某一步被跳过而收窄。所以拆成独立 job。
+  # 挂上去就等于 PR 也拿到了写入能力，权限范围不会因为某一步被跳过而收窄。所以拆成独立 job。
   attest:
     needs: install-probe
     # 只给默认分支上的构建签来源证明：push/PR 以外只剩 workflow_dispatch，而 dispatch 能在
     # 任意分支或 tag 上触发——签出来的证明会带着本仓身份指向一份非默认分支的字节。
-    # PR 排除的理由见下；dispatch 这条在 ref 上再收一次，不等于收紧权限面（权限仍是 job 级）。
+    # PR 排除的理由见下；dispatch 这条在 ref 上再收一次，不等于收紧权限范围（权限仍是 job 级）。
     if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-latest
     timeout-minutes: 10

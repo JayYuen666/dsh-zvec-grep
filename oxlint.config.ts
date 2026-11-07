@@ -21,7 +21,7 @@ export default definePluginConfig({
     },
     // lib/index-preflight.ts 用 accessSync 判「存在但当前进程读不了」那一档（mode 000 / 他人
     // 属主 ⇒ statSync().isFile() 照样为真，而真 zg open 会 EACCES 并把坏路径写进工作区索引
-    // 状态、永久弄坏这棵树）。它是只读的**权限探针**，不是写盘，与 statSync 同属一次 O(1)
+    // 状态、永久弄坏这棵树）。它是只读的**权限探测**，不是写盘，与 statSync 同属一次 O(1)
     // 探测，没有 readFileSync 那种「把大文件整段读进内存」的代价；共享基线的只读豁免表
     // 恰好没收录它，所以要在这里点名。
     { files: ["lib/index-preflight.ts"], apis: ["accessSync"] },

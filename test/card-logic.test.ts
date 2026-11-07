@@ -16,9 +16,9 @@ import type { ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-settings/cli
 const COMMITTED_ENDPOINT = "https://committed.example";
 
 /**
- * 本条目那张表单的官方快照面：别名在测试这边按官方类型**自己抄一份**（同
- * test/build-client.test.ts 的口径），不引 lib/card-logic.ts 里那个私有简写——
- * 引简写等于让简写自己给自己作证，抄官方那一侧则官方改形状时这里当场红。
+ * 本条目那张表单的官方快照类型：别名在测试这边按官方类型**自己抄一份**（同
+ * test/build-client.test.ts 的规则），不引 lib/card-logic.ts 里那个私有简写——
+ * 引简写等于让简写自己给自己作证，从官方类型抄一份则官方改形状时这里当场红。
  */
 type FormSnapshot = ConfigFormSnapshot<Record<string, unknown>>;
 
@@ -49,7 +49,7 @@ const ZH_REBUILD_EXIT_UNKNOWN = "重建没有可判定的结果（应答的 stat
 // ── SettingScope（= 官方 ConfigForm<Record<string, unknown>>）替身 ──────────
 // 契约形状本身即断言：五成员全必选（getSnapshot / subscribe / mutate / set / unset，
 // 见 @deepseek-ai/dsh-client-ui-settings/client 的 ConfigForm），set/unset 回
-// `Promise<boolean>`（受理位），**没有** dispose——`configForms.get(entryId)` 交回的是
+// `Promise<boolean>`（受理结果），**没有** dispose——`configForms.get(entryId)` 交回的是
 // provider 持有的共享表单（同包 config-form.d.ts），卡片自 dispose 会连坐同
 // provider 的其它消费者。
 
@@ -69,7 +69,7 @@ function snap(over: Partial<FormSnapshot> = {}): FormSnapshot {
 
 /** 退订替身本体：一枚有身份的函数，`fakeScope` 每次订阅都交回它 —— 「卡片拿到的退订
  *  就是 scope 那一枚」这条身份断言靠的就是它不是就地新建的空函数。不捕获外层变量，
- *  所以住在模块层。 */
+ *  所以定义在模块层。 */
 function fakeUnsubscribe(): void {
   void 0;
 }
@@ -99,7 +99,7 @@ function fakeScope(initial: FormSnapshot): SettingScope & {
       unsubscribes.push(fakeUnsubscribe);
       return fakeUnsubscribe;
     },
-    // 路径级原子写入：本卡不走它，但官方类型面要求它在位（缺了就编译不过）。
+    // 路径级原子写入：本卡不走它，但官方类型上要求它在位（缺了就编译不过）。
     mutate: async (ops: readonly unknown[]): Promise<boolean> => {
       mutates.push([...ops]);
       return true;
@@ -225,7 +225,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
     assert.equal(draftOf({}, {}, "hasOwnProperty"), undefined);
   });
 
-  it("六个字段全部草稿优先（含 hfEndpoint 与 embedding）", () => {
+  it("七个字段全部草稿优先（含 hfEndpoint、embedding 与 transport）", () => {
     const committed = {
       defaultEmbedding: "local/committed",
       hfEndpoint: COMMITTED_ENDPOINT,
@@ -233,6 +233,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
       defaultLimit: 5,
       grepBudgetPerSearch: 2,
       unlockWindowMin: 30,
+      transport: "cli",
     };
     const touched = {
       defaultEmbedding: "local/draft",
@@ -241,6 +242,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
       defaultLimit: 9,
       grepBudgetPerSearch: 4,
       unlockWindowMin: 45,
+      transport: "mcp",
     };
     assert.deepEqual(draftFields(touched, committed), {
       embedding: "local/draft",
@@ -249,6 +251,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
       enforceSearchFirst: true,
       grepBudget: "4",
       unlockWindow: "45",
+      transport: "mcp",
     });
     // 未改动时全部显示已提交值
     assert.deepEqual(draftFields({}, committed), {
@@ -258,6 +261,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
       enforceSearchFirst: false,
       grepBudget: "2",
       unlockWindow: "30",
+      transport: "cli",
     });
   });
 
@@ -269,8 +273,9 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
       enforceSearchFirst: true,
       grepBudget: "3",
       unlockWindow: "10",
+      transport: "auto",
     });
-    // 空串 embedding / 非字符串 endpoint / 非有限数都回默认
+    // 空串 embedding / 非字符串 endpoint / 非有限数都回默认；transport 域外值回 auto
     assert.deepEqual(
       draftFields(
         {
@@ -278,6 +283,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
           hfEndpoint: 42,
           grepBudgetPerSearch: Number.NaN,
           unlockWindowMin: "30",
+          transport: "teleport",
         },
         {},
       ),
@@ -288,6 +294,7 @@ describe("draftOf / draftFields（草稿优先，受控输入的唯一真值来�
         enforceSearchFirst: true,
         grepBudget: "3",
         unlockWindow: "10",
+        transport: "auto",
       },
     );
     // Infinity 不是可显示数值
@@ -462,10 +469,10 @@ describe("parseRebuildPoll（completed 且 exit 0 才算成功）", () => {
   });
 });
 
-describe("替身的写入轨迹分别记账（供上面几条依赖）", () => {
+describe("替身的写入轨迹分别记录下来（供上面几条依赖）", () => {
   // 这条不是产品覆盖：卡片"清空走 unset、有值走 set"的决策在 src/client-entry.ts 的 save() 里，
   // 那是浏览器入口（document/React），node 侧求值不到它。这里只证明 fakeScope 这两条轨迹
-  // 各自记账、互不串台 —— 后面「mutate 不落到 set 轨迹」那类断言靠的就是它先成立。
+  // 各自记录下来、互不串台 —— 后面「mutate 不落到 set 轨迹」那类断言靠的就是它先成立。
   // 写通道**透传**的产品判据在 test/build-client.test.ts（对产物求值 payload.set/unset
   // 是否落进本条目那张表单）；save() 里那一支的分支选择没有 node 侧判据，按已知缺口登记。
   it("set 与 unset 各记各的轨迹", async () => {

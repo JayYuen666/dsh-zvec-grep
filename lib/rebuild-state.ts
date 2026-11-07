@@ -10,17 +10,18 @@
 //   - 同一根同时只有一条活跃重建：claim 在已有活跃条目时拒绝。
 //   - 占位不是可轮询记录：作业 id 只在官方注册表真正接纳之后才由 attach 补上，之前恒为
 //     undefined（调用方据此不得去轮询或回显 id）。
-//   - 释放必达：每条 claim 都配一次 release（含超时、被取消、失败、卸载四种出口），且
+//   - 释放必达：每条 claim 都配一次 release（含超时、被取消、失败、卸载四条返回路径），且
 //     release 幂等，重复调用不会误伤已经归一的条目。
 //
-// 等待者挂在条目自带的 promise 上，由 release 统一唤醒：等待与放行是同一条收口，
+// 等待者挂在条目自带的 promise 上，由 release 统一唤醒：等待与放行是同一条统一处理，
 // 不存在「等待者还在、条目已消失」的悬挂。
 
-// 官方作业品牌串（type-only：产物里零运行时引用，本文件仍是纯逻辑模块）。
+// 官方作业 id 的类型品牌（type-only：产物里零运行时引用，本文件仍是纯逻辑模块）。
 import type { JobId } from "@deepseek-ai/dsh-jobs";
 // 覆盖判据复用门禁/授权那一个（同一份 pathInsideRoot），不另写一套路径前缀比较。
 import { normalizeRoot, pathInsideRoot } from "./search-predicates.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
+import type { PathPlatform } from "./platform.ts";
 
 /** 活跃重建的两个阶段：起进程前后由 attach 划界。 */
 export type RebuildPhase = "starting" | "running";
@@ -39,9 +40,9 @@ export interface ActiveRebuild {
    * 官方作业注册表签发的 id。占位期间恒为 undefined —— 这是「尚未可轮询」的判据，
    * 调用方绝不能把 undefined 当成一个有效 id 去读状态。
    *
-   * 用官方的品牌串 `JobId`（@deepseek-ai/dsh-jobs，type-only）而不是 `string`：
+   * 用官方带 `brand` 标记的 `JobId`（@deepseek-ai/dsh-jobs，type-only）而不是 `string`：
    * attach 的入参与 jobs.start 的返回值同型，于是「谁往这里塞了一个普通字符串」
-   * 在类型上不可能发生。本文件因此不再有一处品牌加宽断言。
+   * 在类型上不可能发生。本文件因此不再有一处把 string 加宽成 `JobId` 的断言。
    */
   jobId: JobId | undefined;
   /** 条目落定时兑现；等待者只挂这一条。 */
@@ -56,7 +57,7 @@ export interface ActiveRebuild {
 /** 一条等待者的结果：区分「等到落定」与「自己先到头了」。 */
 export type WaitOutcome = "settled" | "timeout" | "aborted";
 
-/** 「某条占位已落定」这条承诺的收口：只交回结论，把 promise 本身留在注册表内部。 */
+/** 「某条占位已落定」这条承诺的统一处理：只交回结论，把 promise 本身留在注册表内部。 */
 async function settledOutcome(target: ActiveRebuild): Promise<WaitOutcome> {
   await target.settled;
   return "settled";
@@ -66,7 +67,7 @@ export interface RebuildRegistry {
   /** 原子占位。已有活跃重建 ⇒ null（调用方据此复用而不是再起一条）。 */
   claim: (root: string, origin: RebuildOrigin, startedAt?: number) => ActiveRebuild | null;
   /**
-   * 官方注册接纳后补作业 id（同时把阶段推进到 running）。条目已释放则安全空转。
+   * 官方注册接纳后补作业 id（同时把阶段推进到 running）。条目已释放则安全地不执行任何操作。
    *
    * 调用方**必须**把 claim 拿到的那枚条目当凭据传进来（第三位）：只按 root 写的话，
    * claim 与 attach 之间那次 await 里占位可能已被释放、同根的新 claim 可能已经顶上来，
@@ -88,9 +89,9 @@ export interface RebuildRegistry {
    * 覆盖给定 root 的活跃条目：重建根是该 root 的**祖先或同一处**时命中。
    *
    * 为什么读侧要放宽到「祖先」：重建登记用的是它自己的根，而检索/状态查询用的是调用方给的
-   * 根。卡片在 `/repo` 起重建、模型对 `/repo/pkg` 发查询时，精确键查不到——于是门禁那一侧
+   * 根。卡片在 `/repo` 起重建、模型对 `/repo/pkg` 发查询时，精确键查不到——于是门禁里
    * （先 `findIndexRoot` 找到祖先索引根）放行了，等待与状态投影却不触发，调用直接撞一条裸
-   * `LOCK.BUSY`。
+   * `LOCK.BUSY` 这一个码。
    *
    * 为什么**只**放宽到祖先、不用双向的 `pathsRelated`：zg 的锁按工作区 home 走，重建
    * `/repo/pkg` 那一格不会挡住读 `/repo` 的索引库。判成「相关」会让 `zg_status /repo` 谎报
@@ -101,7 +102,7 @@ export interface RebuildRegistry {
   covering: (root: string, messages: ZvecGrepMessages) => ActiveRebuild | undefined;
   /** 该根是否有「官方已接纳、持有作业 id」的活跃重建。 */
   /**
-   * 在给定时限内等**覆盖该根**的那条重建落定（口径同 covering）；条目中途消失也算落定
+   * 在给定时限内等**覆盖该根**的那条重建落定（规则同 covering）；条目中途消失也算落定
    * （等待者不会悬挂）。没有覆盖的重建时立刻返回 settled，不空等。
    */
   wait: (
@@ -110,7 +111,7 @@ export interface RebuildRegistry {
     timeoutMs: number,
     signal?: AbortSignal,
   ) => Promise<WaitOutcome>;
-  /** 当前全部活跃根（卸载收口与测试用）。 */
+  /** 当前全部活跃根（卸载统一处理与测试用）。 */
   keys: () => string[];
 }
 
@@ -124,7 +125,7 @@ export interface RebuildRegistry {
  *
  * 「`jobId === undefined` 就是还没起进程」这个前提不成立：claim 在 spawn **之前**登记，
  * 所以 undefined 恰恰覆盖了「进程已在跑、作业号还没补上」这段窗口期。在这段窗口里淘汰
- * 占位，调用方手里那枚凭据当场作废，它随后 attach 到一条已不存在的条目上静默空转，
+ * 占位，调用方手里那枚凭据当场作废，它随后 attach 到一条已不存在的条目上静默地什么也没做，
  * 那条 zg 就成了没人管的孤儿。
  *
  * 正常路径上表的大小由并发重建条数决定（官方注册表自己卡着并发数），条目在 release 时
@@ -165,21 +166,22 @@ function warnIfCrowded(
 /**
  * 覆盖给定 root 的那条活跃条目：重建根是 root 的祖先或同一处时命中，多条命中取
  * startedAt 最早的一条。抽成自由函数是为了让 `covering` 与 `wait` 共用同一段判据
- * ——两者一旦分叉，就会重演「门禁等得到、等待等不到」那个口径不一致的毛病。
+ * ——两者一旦分叉，就会重演「门禁等得到、等待等不到」那个规则不一致的毛病。
  */
 function coveringOf(
   entries: Map<string, ActiveRebuild>,
   root: string,
   messages: ZvecGrepMessages,
+  platform: PathPlatform,
 ): ActiveRebuild | undefined {
   let best: ActiveRebuild | undefined;
   for (const entry of entries.values()) {
     // 重建根是查询根的祖先或同一处 ⇒ 这条重建占着本次读取要用的那个索引库。
-    // 其余条目与本次读取无关，跳过（写成嵌套 if 而不是 continue：少一个控制流出口）。
+    // 其余条目与本次读取无关，跳过（写成嵌套 if 而不是 continue：少一处控制流的分叉）。
     // startedAt 相同（单测的可控时钟会让同毫秒 claim 两条）时保留先遍历到的那条，
     // 结果仍然确定：Map 的插入序在一次进程生命周期内是稳定的。
     if (
-      pathInsideRoot(root, entry.root, messages) &&
+      pathInsideRoot(root, entry.root, messages, platform) &&
       (best === undefined || entry.startedAt < best.startedAt)
     ) {
       best = entry;
@@ -195,15 +197,23 @@ export function createRebuildRegistry(
   options: {
     now?: () => number;
     maxTracked?: number;
+    /** 路径方言（缺省 posix；宿主按 runtimePlatform() 传入）。 */
+    platform?: PathPlatform;
   } = {},
 ): RebuildRegistry {
   const now = options.now ?? Date.now;
   const maxTracked = options.maxTracked ?? MAX_TRACKED_REBUILDS;
+  const platform = options.platform ?? "posix";
   const entries = new Map<string, ActiveRebuild>();
+  /** 注册表键：win32 大小写不敏感（NTFS 默认），POSIX 保持原样。 */
+  const keyOf = (root: string): string => {
+    const normalized = normalizeRoot(root, platform);
+    return platform === "win32" ? normalized.toLowerCase() : normalized;
+  };
   let crowded = false;
 
   const release = (root: string, claimed?: ActiveRebuild): boolean => {
-    const key = normalizeRoot(root);
+    const key = keyOf(root);
     const entry = entries.get(key);
     // 代次校验：传了凭据而当前条目不是它 ⇒ 这次释放属于上一代作业，不许碰新条目。
     if (entry === undefined || (claimed !== undefined && claimed !== entry)) {
@@ -220,7 +230,7 @@ export function createRebuildRegistry(
 
   return {
     claim(root, origin, startedAt): ActiveRebuild | null {
-      const key = normalizeRoot(root);
+      const key = keyOf(root);
       if (entries.has(key)) {
         return null;
       }
@@ -231,7 +241,7 @@ export function createRebuildRegistry(
         resolve(undefined);
       };
       const entry: ActiveRebuild = {
-        root: key,
+        root: normalizeRoot(root, platform),
         origin,
         startedAt: startedAt ?? now(),
         phase: "starting",
@@ -245,7 +255,7 @@ export function createRebuildRegistry(
     },
 
     attach(root: string, jobId: JobId, claimed?: ActiveRebuild): boolean {
-      const entry = entries.get(normalizeRoot(root));
+      const entry = entries.get(keyOf(root));
       // 条目已释放（超时/取消先到）或已被同根的新 claim 顶替时**不写**：那次的 zg 已经
       // 没有归属，调用方拿到 false 才能把它收掉，而不是让一条作业挂在别人的投影上。
       if (entry === undefined || (claimed !== undefined && claimed !== entry)) {
@@ -259,11 +269,11 @@ export function createRebuildRegistry(
     release,
 
     active(root: string): ActiveRebuild | undefined {
-      return entries.get(normalizeRoot(root));
+      return entries.get(keyOf(root));
     },
 
     covering(root: string, messages: ZvecGrepMessages): ActiveRebuild | undefined {
-      return coveringOf(entries, normalizeRoot(root), messages);
+      return coveringOf(entries, normalizeRoot(root, platform), messages, platform);
     },
 
     async wait(
@@ -272,7 +282,7 @@ export function createRebuildRegistry(
       timeoutMs: number,
       signal?: AbortSignal,
     ): Promise<WaitOutcome> {
-      const entry = coveringOf(entries, normalizeRoot(root), messages);
+      const entry = coveringOf(entries, normalizeRoot(root, platform), messages, platform);
       if (entry === undefined) {
         return "settled";
       }
@@ -303,7 +313,7 @@ export function createRebuildRegistry(
         if (outcome !== "settled") {
           return outcome;
         }
-        const next = coveringOf(entries, root, messages);
+        const next = coveringOf(entries, root, messages, platform);
         return next === undefined ? "settled" : waitCovering(next);
       };
       try {

@@ -103,7 +103,7 @@ describe("assertIgnoreFilesExist", () => {
       "文案就是模板填好目标的那一句，不多不少",
     );
     // 绝对条目也放在本用例自己的工作区里造一个确定不存在的路径：
-    // 借全局 tmpdir 的固定名会被上次运行残留或并行用例建出来的文件污染（偶发假绿）。
+    // 借全局 tmpdir 的固定名会被上次运行残留或并行用例建出来的文件污染（偶发误判通过）。
     const absoluteTarget = path.join(root, "absent-abs.ignore");
     const absoluteThrown = thrownBy(() => {
       assertIgnoreFilesExist({ root, ignoreFiles: [absoluteTarget] }, root, zhMessages);
@@ -117,7 +117,7 @@ describe("assertIgnoreFilesExist", () => {
 
   it("条目存在但是目录 ⇒ 按不可用拦，并点名该目录", () => {
     // 判据是 `usable = accessSync 通过 && statSync().isFile()`：只量「不存在」与「ELOOP」
-    // 等于把 isFile 那一半留成无判据的分支（把它改成恒真，本组用例当时全绿）。
+    // 等于把 isFile 那一半留成无判据的分支（把它改成永远成立，本组用例当时全绿）。
     const root = workspace();
     const dir = path.join(root, "a-directory");
     mkdirSync(dir);
@@ -144,7 +144,7 @@ describe("assertIgnoreFilesExist", () => {
   it.skipIf(ELOOP_UNAVAILABLE)(
     "环境类故障（符号链接环 ELOOP）原样上抛，不被说成「文件不可用」",
     () => {
-      // 自指软链让 accessSync 以 ELOOP 失败：把 fd 耗尽/链接环这类与用户输入无关的
+      // 自指软链让 accessSync 以 ELOOP 失败：把 fd 耗尽、符号链接成环这类与用户输入无关的
       // 故障归并进「请给一个真实存在的文件」，会把排查引向错误的方向。
       const root = workspace();
       symlinkSync("loop", path.join(root, "loop"));

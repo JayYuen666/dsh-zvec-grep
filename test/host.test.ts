@@ -1,13 +1,13 @@
-// host.ts 集成测试：注册面（0.1.7 隐式设置投影 + 页面策略 / 3 工具 / 规则段 / guard）
+// host.ts 集成测试：注册入口（0.1.7 隐式设置投影 + 页面策略 / 3 工具 / 规则段 / guard）
 // 与工具执行路径（经 mock shell 断言命令构造、文本透传、错误映射、沙箱事实、
-// stderr 降级提示），重建读面的两道锁（工作区白名单 + 目录存在），
+// stderr 降级提示），重建读取接口的两道锁（工作区白名单 + 目录存在），
 // 以及 search-first 门禁（真实 fs 临时索引目录 + 会话状态解锁）。
 //
 // 同步 fs（mkdtemp/mkdir/rm/exists）为门禁测试在真实临时目录建/清索引所必需
 // （root 现在要过 existsSync 预检，桩路径 /ws 会被判「目录不存在」），
 // 对应同步方法名已列入 oxlint.config.ts 的 node/no-sync ignores。可控延迟用
 // Promise.withResolvers（运行时 Node≥22 可用；lib=ES2024 无该静态成员故类型借道 cast）。
-import { describe, it, beforeAll, afterAll, vi, onTestFinished } from "vitest";
+import { describe, it, beforeAll, afterAll, beforeEach, vi, onTestFinished } from "vitest";
 import assert from "node:assert/strict";
 import {
   existsSync,
@@ -24,7 +24,7 @@ import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 import { Context } from "@deepseek-ai/cordis";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
-// 命名导入：缓存工厂是导出面（单测直接钉命中/TTL/LRU 行为，不必经 fs 间接观测）。
+// 命名导入：缓存工厂是导出的（单测直接钉命中/TTL/LRU 行为，不必经 fs 间接观测）。
 import plugin, {
   createIndexProbeCache,
   createRootLedger,
@@ -37,6 +37,12 @@ import { REBUILD_HISTORY_MAX } from "../lib/rebuild-remote.ts";
 import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
 import { MESSAGES, fill } from "../lib/messages.ts";
 import { MINIMUM_ZG_VERSION } from "../lib/zg-version.ts";
+import {
+  clearPersistedToken,
+  persistToken,
+  readPersistedToken,
+  tokenFilePath,
+} from "../lib/daemon-token.ts";
 import { SECRET_EXCLUDE_GLOBS } from "../lib/argv-guard.ts";
 import { LOCK_BUSY_CODE } from "../lib/zg-errors.ts";
 import { CJK_RESIDUE } from "./cjk-residue.ts";
@@ -49,6 +55,9 @@ import type {
   RebuildStatusRequest,
   RebuildStatusResult,
 } from "../lib/rebuild-shape.ts";
+
+/** JSON-RPC 初始化通知的方法名（多处桩共用，避免同一字面量重复）。 */
+const INITIALIZED_METHOD = "notifications/initialized";
 
 /** 未配置索引时 zg 的 stdout 首句：多处用例共同引用同一份事实源。 */
 const UNCONFIGURED_REPORT = "? Workspace index is not configured";
@@ -88,17 +97,26 @@ const ZG_INDEX_DIR = ".zvec-grep";
  */
 const ZG_MANIFEST_FILE = "manifest.json";
 
-/** 版本门槛的探测命令（字面量与 host.ts 的 probeZgVersion 同源，改一处两边都红）。 */
+/** 版本下限的探测命令（字面量与 host.ts 的 probeZgVersion 同源，改一处两边都红）。 */
 const ZG_VERSION_COMMAND = "zg --version";
 /**
- * 守护进程就绪门槛的探测命令（字面量与 host.ts 的 probeServerReady 同源）。
+ * 守护进程就绪门槛的探测命令（字面量与 host.ts 的 probeServerReady 同源，0.3.0 旗标形态）。
  * 上游 `--check-ready` 的契约是「就绪报告照常打在 stdout，只用退出码表达就绪与否」，
  * 所以替身按退出码给答案，而不是伪造一份状态文本。
  */
-const ZG_SERVER_COMMAND = "zg server status --check-ready";
+const ZG_SERVER_COMMAND = "zg --server status --check-ready";
+/** 自启/收尾命令（本包只在 transport=mcp 下发出）。 */
+const SERVER_START_COMMAND = "zg --server on";
+const SERVER_STOP_COMMAND = "zg --server off";
+/** 真 daemon 应答的媒体类型（MCP 桩共用）。 */
+const SSE_CONTENT_TYPE = "text/event-stream";
+/** 回执脱敏断言共用的消息（多处用例）。 */
+const TOKEN_LEAK_MESSAGE = "token 不得进工具回执";
+/** 索引通道命令前缀（多条用例共用同一份字面量）。 */
+const INDEX_COMMAND_PREFIX = "zg --index";
 /** 执行器缺席时替身抛的那句（三处共用：后台 spawn、就绪探测、版本探测）。 */
 const NO_EXECUTOR = "no such executor";
-/** 健康的本机 zg：恰好等于门槛值，故默认放行（实机 stdout 就是这一行 + 换行）。 */
+/** 健康的本机 zg：恰好等于下限值，故默认放行（实机 stdout 就是这一行 + 换行）。 */
 const ZG_VERSION_OK = `${MINIMUM_ZG_VERSION}\n`;
 
 /**
@@ -133,7 +151,7 @@ function oldVersionRun(version: string): ShellRunResult {
 const REMOTE_EMBEDDING = "qwen/text-embedding-v4";
 const REMOTE_ENDPOINT = "https://api.example.com/v1";
 const EMBED_KEY_ENV = "ZGTEST_EMBED_KEY";
-/** 凭据的字面值（一次性测试夹具，不是任何真实凭据）。 */
+/** 凭据的字面值（一次性夹具，不是任何真实凭据）。 */
 const FAKE_KEY = "sk-forwarded";
 
 /**
@@ -164,17 +182,33 @@ function withEnv(name: string, value: string): () => void {
  */
 function makeIndexed(root: string): void {
   mkdirSync(path.join(root, ZG_INDEX_DIR), { recursive: true });
+  // 0.3.0 的 manifest 形状（实测现量）：indexVersion=2，根路径在
+  // sourceRoot.recordedPath（0.2.x 的 manifestVersion/rootPaths 已不存在）。
   writeFileSync(
     path.join(root, ZG_INDEX_DIR, ZG_MANIFEST_FILE),
     `${JSON.stringify({
-      manifestVersion: 1,
-      path: path.join(root, ZG_INDEX_DIR),
-      rootPaths: [{ absolutePath: root, recursive: true }],
+      sourceRoot: { recordedPath: root, recordedUsername: "tester" },
+      scan: {
+        globs: [],
+        included_formats: [],
+        excluded_formats: [],
+        include_hidden: false,
+        follow_symlinks: false,
+        max_depth: null,
+        max_file_size_bytes: null,
+        use_default_ignores: true,
+        ignore_files: [],
+        nested_git: true,
+      },
+      indexVersion: 2,
+      storageGeneration: "00000000-0000-0000-0000-000000000000",
+      createdTime: 0,
+      updatedTime: 0,
     })}\n`,
   );
 }
 /**
- * 官方输出环的**字节**留存上限（宿主默认值，按官方件现解——见下面 `registryDefaults`，
+ * 官方环形缓冲的**字节**留存上限（宿主默认值，按官方件现解——见下面 `registryDefaults`，
  * 它在 installed `@deepseek-ai/dsh-jobs-local` 的 `DEFAULT_RETAIN_BYTES` 上取值）。
  * 换装前这里是本包自己的 `JOB_OUT_MAX_BYTES`（名义字节、实按 UTF-16 码元）；换装后
  * 裁剪归注册表，本包只在 4000 字符的尾窗那一步按码元计数，两套单位不再混用。
@@ -190,7 +224,7 @@ interface RegistryDefaults {
 /**
  * 宿主装载期怎么解析 `LocalJobRegistry.Config`，这里就怎么取默认值：走官方件的
  * `~standard.validate`（实测 `validate({})` ⇒ `{10, 262144, 16384, 150}`，给部分覆盖会
- * 与默认合并）。为什么不在测试里手抄这些数：本文件钉的是**官方件的行为**，抄来的默认值
+ * 与默认合并）。为什么不在测试里照抄这些数：本文件钉的是**官方件的行为**，抄来的默认值
  * 只给我的理解作证——宿主哪天改容量或留存窗，测试仍绿而真宿主行为已经变了。
  * 这也是本仓那条门律（"不靠抄来的字面量成立"）在本包的落地。
  */
@@ -218,7 +252,7 @@ const LIVE_CAP = HOST_DEFAULTS.maxConcurrentJobsPerOwner;
  */
 const PUMP_MS = 25;
 /** host.ts 的 `STDERR_NOTE_CHARS`（未导出，这里同值抄一份）：上限哪天改动，下面那条
- *  注脚用例的 `assertBareCutBites` 会先红，不会静默假绿。 */
+ *  注脚用例的 `assertBareCutBites` 会先红，不会静默误判通过。 */
 const STDERR_NOTE_CHARS = 400;
 
 // ── 代理对夹具（C4：入会话日志的截断）───────────────────────────────────────
@@ -229,9 +263,9 @@ const STDERR_NOTE_CHARS = 400;
 // FAMILY = 👨‍👩‍👧‍👦，11 枚码元（4 枚代理对 + 3 枚裸 ZWJ）：周期不是 2 的幂，
 // 于是"固定预算切在第几枚"是可算的，不必靠运气落在合法边界上。
 const FAMILY = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}";
-/** 用例的牙齿：先证明**裸切在这一处确实咬住了代理对**，否则整条用例断的是空气
- *  （本分支已被这种假绿夹具骗过一次，shared/test/text.test.ts 与 ocr-review 的代理
- *  用例都带同款自守）。`cut` 必须是与被测实现同一刀法的裸 slice 结果。 */
+/** 用例的牙齿：先证明**这一处不校正代理对的切法确实切开了代理对**，否则整条用例断的是空气
+ *  （本分支已被这种误判通过夹具骗过一次，shared/test/text.test.ts 与 ocr-review 的代理
+ *  用例都带同款自守）。`cut` 必须是与被测实现同一刀法、不校正代理对的 slice 结果。 */
 function assertBareCutBites(cut: string): void {
   assert.equal(
     cut.isWellFormed(),
@@ -284,13 +318,13 @@ interface ShellRunResult {
   sandbox?: {
     mode: "read-only" | "workspace-write" | "danger-full-access";
     denied: boolean;
-    /** "" 是刻意的探针：经序列化的运行态数据可能交回空串，归因层必须当「没配」。 */
+    /** "" 是刻意的探测：经序列化的运行态数据可能交回空串，归因层必须当「没配」。 */
     enforcement?: "full" | "partial" | "";
     runnerFailed?: boolean;
   };
 }
 
-/** 官方 SubprocessOutputReader 的本用例形状（observed 那条非消费面）。 */
+/** 官方 SubprocessOutputReader 的本用例形状（observed 那条不被消费的路径）。 */
 interface MockReader {
   readFrom: (fromByte: number) => {
     text: string;
@@ -316,7 +350,7 @@ interface MockProc {
    *    所以本包的源必须自己兜住。
    */
   failRead: (channel: "stdout" | "stderr", mode: "lossy" | "throw") => void;
-  /** 0.1.7 的非消费观察者面：本包的 pull source 从这里读，与 readOutput 互不偷字节。 */
+  /** 0.1.7 的非消费观察者接口：本包的 pull source 从这里读，与 readOutput 互不偷字节。 */
   observed: { stdout: MockReader; stderr: MockReader };
   kill: () => boolean;
   killCount: number;
@@ -343,22 +377,25 @@ interface ResolveRequest {
 interface ShellMock {
   resolveCalls: ResolveRequest[];
   /**
-   * 版本门槛探测（`zg --version`）的请求单。**刻意不排进 resolveCalls**：那是各用例断言
+   * 版本下限探测（`zg --version`）的请求单。**刻意不排进 resolveCalls**：那是各用例断言
    * 命令形态（命令文本/workdir/env）的地方，把基础设施探测混进去会让这些断言被一次
-   * 与被测行为无关的调用顶掉。单独记账，断言探测行为时看这里。
+   * 与被测行为无关的调用顶掉。单独记录下来，断言探测行为时看这里。
    */
   versionProbeCalls: ResolveRequest[];
-  /** 版本探测这一次执行要交回的结果；undefined = 健康的本机 zg（门槛值本身）。 */
+  /** 版本探测这一次执行要交回的结果；undefined = 健康的本机 zg（下限值本身）。 */
   zgVersionResult: ShellRunResult | undefined;
   /** 版本探测这一次执行直接抛错（模拟执行器缺席/spawn 失败）：同样必须按「读不懂」放行。 */
   versionProbeThrows: boolean;
   /**
-   * 守护进程就绪探测的记账（与 versionProbeCalls 同一个理由：它是基础设施的一次自检，
+   * 守护进程就绪探测的记录下来（与 versionProbeCalls 同一个理由：它是基础设施的一次自检，
    * 不该占被测命令的队列，也不该混进 resolveCalls 的断言里）。
    */
   serverProbeCalls: ResolveRequest[];
   /** 守护进程就绪态：缺省 false（未就绪＝直连模式），要 background 用例显式改 true。 */
   serverReady: boolean;
+  /** 自启用：置 true 后第二次就绪探测起读 true（第一发仍 false）——拉起→重探的窗口
+   *  从测试外部钉不住（重探紧跟 spawn），让 mock 自己翻面。 */
+  serverReadyAutoFlip: boolean;
   /** 就绪探测这一次执行直接抛错（模拟执行器缺席/spawn 失败）：按未就绪处理，绝不外抛。 */
   serverProbeThrows: boolean;
   runResults: ShellRunResult[];
@@ -393,7 +430,7 @@ interface MockCtx {
   sections: { name: string; order: number; text: string }[];
   routes: CapturedRoute[];
   unregistered: string[];
-  effectDisposers: (() => void)[];
+  effectDisposers: (() => unknown)[];
   noWebServer: boolean;
   /** webServer 替身的 `host` 成员（官方唯一可读的非回环信号，installed dsh-host-webserver
    *  d.ts `:50`）。缺省 undefined = 没声明绑到哪张网卡 ⇒ `servingNonLoopback` 恒 false；
@@ -426,7 +463,7 @@ interface MockCtx {
   get: (name: string) => unknown;
   /** 官方服务注册口（Remote 服务构造时用）；替身只把它存进 services。 */
   reflect: { provide: (name: string, instance: unknown) => () => void };
-  /** 经 reflect.provide 注册的服务（`ctx.get` 的兜底读面）。 */
+  /** 经 reflect.provide 注册的服务（`ctx.get` 的兜底读取接口）。 */
   services: Record<string, unknown>;
   /** ctx.on(event, handler)：登记事件监听；替身按事件名分桶保存，供 preExecuteOf 串联瀑布。 */
   on: (
@@ -451,8 +488,8 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 /**
  * 官方注册表的**实现本身**，不是假件。
  *
- * 为什么不用假件：本包这次换装删掉的是自己实现过的环/容量/淘汰，替身若按"我以为的官方
- * 语义"写，测试就是在给我的理解作证——换装类改动最典型的假绿。直接起官方件，卡片契约
+ * 为什么不用假件：本包这次换装删掉的是自己实现过的环形缓冲、容量与淘汰，替身若按"我以为的官方
+ * 语义"写，测试就是在给我的理解作证——换装类改动最典型的误判通过。直接起官方件，卡片契约
  * （status 词表、shown/total、已截断/缓冲区溢出两条打标）就被钉在真行为上；官方改了语义，
  * 这里先红。
  *
@@ -478,7 +515,7 @@ function withJobIdSink(registry: LocalJobRegistry, sink: string[]): LocalJobRegi
 }
 
 /**
- * 等过一拍注册表的周期泵。pull source 的增量是由泵搬进环的（实测：start 里同步跑第一拍，
+ * 等过一拍注册表的周期泵。pull source 的增量是由泵搬进环形缓冲的（实测：start 里同步跑第一拍，
  * 之后每 pumpPollMs 一拍），所以"起了进程 + 进程产出了输出"与"卡片读得到输出"之间隔着
  * 至少一拍——不等这一拍就等于在测最后一次排水，那正是复核点出的盲区。
  */
@@ -506,8 +543,8 @@ function noop(): void {
 
 // ── 导出 Config schema 的内省工具（0.1.7 隐式注册的三条判据都从这里来）────────
 //
-// 为什么不手抄字段名：命名空间与可编辑字段在 0.1.7 都是宿主**从 schema 反推**的，
-// 测试再手抄一份就成了第三份真相——漂移的是测试，不是代码。
+// 为什么不照抄字段名：命名空间与可编辑字段在 0.1.7 都是宿主**从 schema 反推**的，
+// 测试再照抄一份就成了第三份真相——漂移的是测试，不是代码。
 
 /** Config schema 的字段节点（读 meta/type/dict 用，不复制 schema 结构）。 */
 interface SchemaNode {
@@ -516,12 +553,12 @@ interface SchemaNode {
   dict?: Record<string, SchemaNode>;
 }
 
-/** 导出 Config schema 的 dict（单源：字段名与元数据都从宿主实际读的那份来）。 */
+/** 导出 Config schema 的 dict（唯一来源：字段名与元数据都从宿主实际读的那份来）。 */
 function configDict(): Record<string, SchemaNode> {
   return (plugin.Config as unknown as SchemaNode).dict ?? {};
 }
 
-/** 导出 Config schema 的字段名清单（单源：不手写，漏字段就是测试的事）。 */
+/** 导出 Config schema 的字段名清单（唯一来源：不手写，漏字段就是测试的事）。 */
 const CONFIG_KEYS: string[] = Object.keys(configDict());
 
 /** 逐字段 schema 默认 —— 等价于 0.1.6 交给 `settings.register(ns, schema, { base })`
@@ -572,7 +609,7 @@ function patchEntryId(): string {
 }
 
 /**
- * isZvecGrepHost 的失败样本：非对象、空对象、有壳无方法、缺一个面——
+ * isZvecGrepHost 的失败样本：非对象、空对象、有壳无方法、少某一位——
  * 守卫必须逐一识破，apply 才可能在错注入时硬报错而不是运行到一半崩。
  */
 function incompleteHosts(): unknown[] {
@@ -617,6 +654,9 @@ function makeCtx(): MockCtx {
     versionProbeThrows: false,
     serverProbeCalls: [],
     serverReady: false,
+    /** 自启用：置 true 后第二次就绪探测起读 true（第一发仍 false）——拉起→重探的
+     *  窗口从测试外部钉不住（重探紧跟在 spawn 之后），让 mock 自己翻面。 */
+    serverReadyAutoFlip: false,
     serverProbeThrows: false,
     runResults: [],
     startCalls: [],
@@ -636,7 +676,7 @@ function makeCtx(): MockCtx {
     // 0.1.7：execute 是前后台唯一入口。判据沿用宿主自身的分工——runForeground 必带
     // timeoutMs（deadline），后台 rebuild 不带（shell 契约：后台不应用超时）。
     async execute(rawSpec) {
-      // 官方 execute 的入参在替身上是 unknown（官方 abstract Service 的方法面投影），
+      // 官方 execute 的入参在替身上是 unknown（官方 abstract Service 的方法子集投影），
       // 这里只读两个字段，故先收成最小形状而不是断言成某个具体请求类型。
       const spec = rawSpec as { command: string; timeoutMs?: number };
       const isVersionProbe = spec.command === ZG_VERSION_COMMAND;
@@ -709,7 +749,11 @@ function makeCtx(): MockCtx {
             return shell.zgVersionResult ?? versionOkRun();
           }
           if (isServerProbe) {
-            return serverProbeResult(shell.serverReady);
+            const ready =
+              shell.serverReadyAutoFlip && shell.serverProbeCalls.length >= 2
+                ? true
+                : shell.serverReady;
+            return serverProbeResult(ready);
           }
           return (
             shell.runResults.shift() ?? {
@@ -819,7 +863,7 @@ function makeCtx(): MockCtx {
       }
       if (name === "jobs") {
         // 官方注册表的实现本身（不是假件，理由见 makeJobRegistry）；noJobs 那一条
-        // 复刻"宿主没装 dsh-jobs-local"的档，此时重建读面必须回答不可用而不是抛穿。
+        // 复刻"宿主没装 dsh-jobs-local"的档，此时重建读取接口必须回答不可用而不是抛穿。
         // vanished = 第 N 次后台 spawn 之后服务被换掉那一档（判据按 startCalls 计数）。
         const vanished =
           shell.vanishJobsAfterExecute > 0 &&
@@ -846,7 +890,7 @@ function makeCtx(): MockCtx {
       }
     },
     // ctx.inject(deps, fn)：cordis 立即用带齐依赖的子上下文回调一次。本包用到的
-    // settings + effect 两个面在真实宿主上同为 ctx 的成员，故直接把 ctx 交给回调。
+    // settings + effect 两项在真实宿主上同为 ctx 的成员，故直接把 ctx 交给回调。
     inject: (_deps: readonly string[], attach: (child: unknown) => void) => {
       attach(ctx);
     },
@@ -876,24 +920,6 @@ function liveConfigRefs(ctx: MockCtx): Record<string, unknown> {
     }),
   );
 }
-
-/**
- * 需要「盘上真工作区」的测试组按平台跳过（判据只有这一处，各 `describe.skipIf` 引用它）。
- *
- * 成因不是测试写错，而是插件的范围：root 判据（`lib/cli.ts` 的 `assertAbsoluteRoot`）只认以
- * `/` 开头的绝对路径，命令形态也是 POSIX 的（`shq()` 单引号 + 整串交给 `bash -c`）。Windows 上
- * `os.tmpdir()` 交回的是盘符形态（CI 实测 `C:\Users\RUNNER~1\AppData\Local\Temp\zvec-…`），
- * 每一次 `rootOf` 都拒在那一步，被测行为根本走不到 ⇒ 这批用例在 win32 上不成立，跳过而不是
- * 改成假通过。dsh 的 Windows 宿主因此不在本包支持面内（README「支持面」一节）。
- *
- * windows 那格 CI 仍跑它真正要钉的东西：同一份源码在两种字节形态下的产物 / 换行 / path.sep
- * 漂移，加上不需要 root 的判据用例；覆盖率门禁归 ubuntu 格（跳过这批用例后 `host.ts` 在
- * win32 不可能到 100%，见 ci.yml 的那段注释）。
- *
- * 写成 `describe.skipIf(realRootUnavailable)` 而不是包一层别名：oxlint 的 vitest 规则按 `describe`
- * 字面量识别 suite，别名会让整个文件被当成一个作用域，于是一片 consistent-test-it 噪声。
- */
-const realRootUnavailable = process.platform === "win32";
 
 // ── 真实临时工作区（root 存在性预检）──────────────────────────────────────
 
@@ -929,11 +955,11 @@ function wsForSuite(prefix = "zvec-root-"): string {
   return dir;
 }
 
-// 回收口那两条用例之间传话用的容器。用 const 数组而不是 let：require-hook 不允许测试文件里
+// 回统一处理那两条用例之间传话用的容器。用 const 数组而不是 let：require-hook 不允许测试文件里
 // 出现顶层可变声明，而这里要证的正是「上一条用例结束时被删掉」这条时序，与钩子无关。
 const recycleProbe: string[] = [];
 
-describe("临时目录回收口", () => {
+describe("临时目录回统一处理", () => {
   it("mkdtempSync 只出现在 tempDir 与 wsForSuite 这两个创建口", () => {
     // 判据是「创建口名单」而不是数量：用例可以随便加，这两处的形状是写死的；
     // 再多一处直接 mkdtempSync 就是再多一个可能没人负责回收的入口。
@@ -967,9 +993,9 @@ describe("临时目录回收口", () => {
   });
 });
 
-/** 索引通道的缺省命令行：既有断言反复引用，抽成常量避免三处硬编码漂移。 */
+/** 索引通道的缺省命令行（0.3.0：主查询走显式 --hybrid= 路由）：既有断言反复引用，抽成常量。 */
 const INDEXED_SEARCH_COMMAND =
-  "zg query 'hi' --limit 10 --preview short --refresh wait --device 'auto' --mode auto";
+  "zg --hybrid='hi' --limit 10 --preview short --refresh wait --device 'auto' --mode auto";
 
 /** 一个真实存在但**没有** zg 索引的目录（穷举检索路径的前提）。 */
 function bareWs(name = "bare"): string {
@@ -977,10 +1003,10 @@ function bareWs(name = "bare"): string {
 }
 
 /**
- * 一个真实存在的目录（zg 要求 root 落盘存在）。
+ * 一个真实存在的目录（zg 要求 root 写到磁盘存在）。
  *
  * 默认**已建索引**：检索工具在无索引时会自动改走穷举词法通道（见 host.ts 的
- * pickExhaustive），所以绝大多数用例要的是「有索引」这一前提，否则构造出来的命令形态
+ * pickChannel），所以绝大多数用例要的是「有索引」这一前提，否则构造出来的命令形态
  * 与被断言的东西对不上。确需「无索引」工作区时用 bareWs()。
  */
 function ws(name = "root"): string {
@@ -1019,7 +1045,7 @@ function guardOf(ctx: MockCtx): (exec: GuardExec) => string | undefined {
 
 /**
  * 跑一次 pre-execute 瀑布：按注册顺序把每个监听器串起来，任一监听器不给 `next()`
- * 就以它的返回值收口。返回的 `allow` 表示整条瀑布放行。
+ * 就以它的返回值统一处理。返回的 `allow` 表示整条瀑布放行。
  * 返回 `{ allow: false }` 那一支就是「被问/被拒/被取消」——本包只关心"没放行"。
  */
 async function preExecuteOf(
@@ -1039,7 +1065,7 @@ async function preExecuteOf(
   return { allow: kind === "allow", decision };
 }
 
-/** 一个待决 Promise 的结局文本：兑现时给空串，抛错时给错误消息（供并行断言收口）。 */
+/** 一个待决 Promise 的结局文本：兑现时给空串，抛错时给错误消息（供并行断言统一处理）。 */
 async function reasonOf(pending: Promise<unknown>): Promise<string> {
   try {
     await pending;
@@ -1093,7 +1119,7 @@ function trackRoot(ctx: MockCtx, cwd: string, id = "sess-1"): void {
   guardOf(ctx)({ name: "read", arguments: {}, agent: { session: { id, header: { cwd } } } });
 }
 
-/** 宿主服务 `zvecGrepRebuild` 的方法面投影：测试直调服务，经真实类型判读。 */
+/** 宿主服务 `zvecGrepRebuild` 的方法子集投影：测试直调服务，经真实类型判读。 */
 interface RebuildApi {
   roots: () => Promise<RebuildRoots>;
   rebuild: (request: RebuildStartRequest) => Promise<RebuildStartResult>;
@@ -1207,7 +1233,7 @@ async function settleRebuilds(ctx: MockCtx, from: number): Promise<void> {
 /**
  * 一棵真实的父子树。确认闸的判据现在与 `rootOf` 同源（都走 host.ts 的 `judgeRoot`），
  * 而那条判据要看盘上有没有这棵树——拿 `/repo` 这类假想路径用例会误把「目录不存在」
- * 那一臂当成「不必问」，判不到真正要钉的那条分支。
+ * 那一条分支当成「不必问」，判不到真正要钉的那条分支。
  */
 function askTree(name = "ask"): { parent: string; child: string } {
   const parent = bareWs(name);
@@ -1216,7 +1242,7 @@ function askTree(name = "ask"): { parent: string; child: string } {
   return { parent, child };
 }
 
-/** 一次显式要后台刷新的索引检索（守护进程收口判据的射程就在这一档）。 */
+/** 一次显式要后台刷新的索引检索（守护进程统一处理判据的射程就在这一档）。 */
 async function backgroundSearch(ctx: MockCtx, root: string): Promise<unknown> {
   const outcome = await toolOf(ctx, "zg_search").execute(
     { root, query: "hi", refresh: "background" },
@@ -1227,7 +1253,7 @@ async function backgroundSearch(ctx: MockCtx, root: string): Promise<unknown> {
 
 /**
  * 状态报告尾部那行守护进程注。替身缺省 `serverReady = false`（未就绪＝直连模式），
- * 所以绝大多数用例期望的是 OFFLINE 那一臂。
+ * 所以绝大多数用例期望的是 OFFLINE 那一条分支。
  */
 const DAEMON_OFFLINE_NOTE = `\n${MESSAGES.zh.serverUnavailableNote}`;
 
@@ -1235,7 +1261,7 @@ function okRun(stdoutText = "OK"): ShellRunResult {
   return { exitCode: 0, stdout: { text: stdoutText, truncated: false }, stderr: { text: "" } };
 }
 
-/** 坏 hfEndpoint 探针：给一个规范化后为空/无 host 的值，交回构造命令时带的 env（应缺省）。 */
+/** 坏 hfEndpoint 探测：给一个规范化后为空/无 host 的值，交回构造命令时带的 env（应缺省）。 */
 async function probeBadEndpointEnv(
   bad: string,
   root: string,
@@ -1248,9 +1274,9 @@ async function probeBadEndpointEnv(
   return probeCtx.shell.resolveCalls[0]?.env;
 }
 
-// ── 注册面 ────────────────────────────────────────────────────────────────
+// ── 注册入口 ────────────────────────────────────────────────────────────────
 
-describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
+describe("zg 版本下限门槛", () => {
   it("版本够新：放行，且探测不吃命令结果队列", async () => {
     const root = ws();
     const ctx = makeCtx();
@@ -1262,7 +1288,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
     assert.equal(ctx.shell.versionProbeCalls[0]?.command, ZG_VERSION_COMMAND);
   });
 
-  it("三个工具与后台索引都先过这道门槛（口径只有一处）", async () => {
+  it("三个工具与后台索引都先过这道门槛（规则只有一处）", async () => {
     const root = ws();
     const ctx = makeCtx();
     ctx.shell.zgVersionResult = oldVersionRun("0.2.1");
@@ -1272,7 +1298,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
       () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
       /zg 版本过低/u,
     );
-    assert.equal(ctx.shell.resolveCalls.length, 0, "门槛没过就不该发任何 zg 命令");
+    assert.equal(ctx.shell.resolveCalls.length, 0, "版本门槛没过就不该发任何 zg 命令");
     await assert.rejects(
       () => toolOf(ctx, "zg_status").execute({ root }, execOf(root)),
       /zg 版本过低/u,
@@ -1282,11 +1308,11 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
       () => toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root)),
       /zg 版本过低/u,
     );
-    assert.equal(ctx.shell.resolveCalls.length, 0, "前台索引同样没过门槛");
+    assert.equal(ctx.shell.resolveCalls.length, 0, "前台索引同样没过版本门槛");
     assert.equal(ctx.shell.startCalls.length, 0);
   });
 
-  it("后台索引（设置卡重建读面那条路）也过门槛：一条 zg 都不起", async () => {
+  it("后台索引（设置卡重建读取接口那条路）也过版本门槛：一条 zg 都不起", async () => {
     const root = ws();
     const ctx = makeCtx();
     ctx.shell.zgVersionResult = oldVersionRun("0.2.1");
@@ -1295,7 +1321,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
     const res = await postRebuild(ctx, root);
     assert.notEqual(replyCode(res), 200, "版本太老时读面不得回答成功");
     // 卡片只看得到响应体，所以可行动的文案必须真的落在 body 里（不是被吞进日志）。
-    assert.match(replyText(res), /zg 版本过低/u, "响应体要带回门槛文案");
+    assert.match(replyText(res), /zg 版本过低/u, "响应体要带回版本过低的文案");
     assert.match(replyText(res), /0\.2\.1/u, "并回显实际版本");
     assert.equal(ctx.shell.startCalls.length, 0, "一条后台 zg 都不该起");
     // 门禁那一侧同样不消费配额：门槛没过就没有「已检索」这回事。
@@ -1303,14 +1329,14 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
   });
 
   it('分支用的布尔按严格取值读：1 / "true" 静默变 false 是本仓点名要避免的失败', async () => {
-    // 参数面声明着 type: "boolean"，但宿主对 parameters 只做注册期的「输出」schema 检查，
+    // 参数表声明着 type: "boolean"，但宿主对 parameters 只做注册期的「输出」schema 检查，
     // 入参原样交给 execute —— 框架不替我们兜。所以这三处分支决策必须自己严格取值。
     const root = ws("strictbool");
     const ctx = makeCtx();
     applyTo(ctx);
     const tool = toolOf(ctx, "zg_index");
     const status = toolOf(ctx, "zg_status");
-    // 三个分支的调用面：[工具名, 入参, 期望被点名的参数名]。
+    // 三个分支的调用形态：[工具名, 入参, 期望被点名的参数名]。
     const surfaces: [typeof tool, Record<string, unknown>, string][] = [
       [tool, { root, confirm: true, rebuild: null }, "rebuild"],
       [tool, { root, confirm: true, background: null }, "background"],
@@ -1339,7 +1365,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
     }
   });
 
-  it("confirm 的类型也在工具侧收口：值语义归 guard，类型错不该借它那句文案", async () => {
+  it("confirm 的类型也在工具侧统一处理：值语义归 guard，类型错不该借它那句文案", async () => {
     // guard 的文案说的是「必须由用户明确要求且 confirm 为 true」——那是值语义；模型给
     // `confirm: "true"` 时它犯的是类型错，两件事得分开说，且类型错必须在工具自己这一层
     // 就被点名，不能靠 guard 兜（guard 是后一道，不是唯一一道）。
@@ -1357,7 +1383,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
         );
       }),
     );
-    // 真值那一档照常走到命令构造：这道收口只拦类型，不拦正常调用。
+    // 真值那一档照常走到命令构造：这道统一处理只拦类型，不拦正常调用。
     ctx.shell.runResults.push(okRun("OK"));
     await tool.execute({ root, confirm: true }, execOf(root));
     assert.equal(ctx.shell.resolveCalls.length, 1);
@@ -1390,8 +1416,8 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
     assert.equal(ctx.shell.resolveCalls.length, 1, "第二次应当真的起了一条 zg index");
   });
 
-  it("门槛失败不泄漏重建占位：否则这棵树会被永久标成「重建中」", async () => {
-    // 回归护栏：门槛曾被放在 claim **之后**，而它的失败出口不在那几条 finally 覆盖范围内
+  it("版本门槛失败不泄漏重建占位：否则这棵树会被永久标成「重建中」", async () => {
+    // 回归护栏：这道门槛曾被放在 claim **之后**，而它的失败返回路径不在那几条 finally 覆盖范围内
     // ——zg 过老时占位永不交还，之后每次重建都只得到「已有一条重建在进行中」。
     const root = ws("leak");
     const ctx = makeCtx();
@@ -1401,9 +1427,9 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
       () => toolOf(ctx, "zg_index").execute({ root, confirm: true, rebuild: true }, execOf(root)),
       /zg 版本过低/u,
     );
-    // 占位交还了吗？把时钟推过门槛的 TTL，让第二次调用真的重新探一次版本——
+    // 占位交还了吗？把时钟推过版本探测缓存的 TTL，让第二次调用真的重新探一次版本——
     // 只有占位已交还，它才可能走到「起一条重建」而不是被「已有一条重建在进行中」挡回。
-    // 只假 Date：这条用例要推的是版本门槛的 TTL（host.ts 的 now 注进去就是 Date.now），
+    // 只假 Date：这条用例要推的是版本下限的 TTL（host.ts 的 now 注进去就是 Date.now），
     // 而不是任何定时器。全套假时钟会把同一 ctx 里的真实 setTimeout/setImmediate 一并冻住——
     // 实测在 `vi.useFakeTimers({ now })` 里 `await new Promise(r => setTimeout(r, 10))`
     // 直接挂到超时，而 `toFake: ["Date"]` 既让那 10ms 真的走完、也让 advanceTimersByTime
@@ -1422,7 +1448,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
         "占位没交还：zg 过老一次就把这棵树永久标成「重建中」了",
       );
       assert.equal(ctx.shell.resolveCalls.length, 1, "第二次应当真的起了一条 zg index");
-      assert.match(ctx.shell.resolveCalls[0]?.command ?? "", /^zg index/u);
+      assert.match(ctx.shell.resolveCalls[0]?.command ?? "", /^zg --index/u);
     } finally {
       vi.useRealTimers();
     }
@@ -1438,7 +1464,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
       (error: unknown) => {
         const text = error instanceof Error ? error.message : String(error);
         assert.match(text, /0\.1\.9/u, "要回显装的是哪个版本");
-        assert.ok(text.includes(MINIMUM_ZG_VERSION), "要回显门槛值");
+        assert.ok(text.includes(MINIMUM_ZG_VERSION), "要回显阈值");
         assert.match(text, /npm install -g @zvec\/zvec-grep@latest/u, "要给出可照做的出路");
         return true;
       },
@@ -1519,7 +1545,7 @@ describe.skipIf(realRootUnavailable)("zg 版本门槛", () => {
   });
 });
 
-describe.skipIf(realRootUnavailable)("官方用户确认（tools/pre-execute → ctx.approval）", () => {
+describe("官方用户确认（tools/pre-execute → ctx.approval）", () => {
   it("默认关：该被问的显式 root 也直接放行（不打扰用户，也不改变既有行为）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -1653,7 +1679,7 @@ describe.skipIf(realRootUnavailable)("官方用户确认（tools/pre-execute →
   });
 
   it("这道闸只加不减：批准之后 rootOf 的授权判据一字未改", async () => {
-    // 越界的 root 即便假装「用户已批准」，rootOf 照旧拒——确认面不扩大可操作范围。
+    // 越界的 root 即便假装「用户已批准」，rootOf 照旧拒——确认这一步不扩大可操作范围。
     const root = ws("strict");
     const ctx = makeCtx();
     applyTo(ctx, { requireApprovalForExplicitRoot: true });
@@ -1665,7 +1691,7 @@ describe.skipIf(realRootUnavailable)("官方用户确认（tools/pre-execute →
   });
 });
 
-describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
+describe("host.apply 注册面", () => {
   it("隐式注册：Config schema 逐字段默认 = 0.1.6 交给 register 的内置底座", () => {
     // 0.1.7 删了 settings.register(ns, schema, { base })：命名空间 = profile 条目 id，
     // 默认值改由 schema 自己带（cordis 装载期用同一份 schema 填默认后交引用进 apply）。
@@ -1690,6 +1716,11 @@ describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
       stdoutMaxBytes: 400_000,
       // 传输模式缺省自动：有守护进程就走守护进程，没有就直连，两种状态实测均正常。
       clientMode: "auto",
+      // 0.3.0 起的检索传输三档（volatile，设置卡可选）：缺省 auto——daemon 就绪走 MCP、
+      // 缺席落回 CLI，不主动起进程。
+      transport: "auto",
+      // MCP 传输的守护进程端点：默认上游缺省监听地址（非 volatile 部署值）。
+      daemonUrl: "http://127.0.0.1:7999/mcp",
       // 等待同根重建落定的上限：默认两分钟，覆盖常规重建又不至于让检索无限期挂着。
       rebuildWaitMs: 2 * 60_000,
       // 远程 embedding 三件套默认**全关**：关着的时候构造期就拒掉一切非本地引用。
@@ -1727,26 +1758,27 @@ describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
     assert.ok(index.description.includes("confirm"));
   });
 
-  it("参数面：preview / refresh 带闭集 enum，符号类型逐项带 enum 且与取值器同源", () => {
+  it("参数表：preview / refresh 带闭集 enum，符号类型逐项带 enum 且与取值器同源", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const props = toolOf(ctx, "zg_search").parameters["properties"] as Record<
       string,
       { enum?: unknown; oneOf?: unknown; items?: { enum?: unknown } }
     >;
-    assert.deepEqual(props["preview"]?.enum, ["none", "short", "full"]);
+    assert.deepEqual(props["preview"]?.enum, ["none", "short", "full", "detail"]);
     assert.deepEqual(props["refresh"]?.enum, ["background", "wait", "off"]);
     assert.deepEqual(props["symbolTypes"]?.items?.enum, [
-      "module",
-      "class",
-      "interface",
-      "function",
-      "value",
       "alias",
+      "class",
+      "enum",
+      "function",
+      "interface",
+      "module",
+      "value",
     ]);
   });
 
-  it("参数面：路径过滤项用 oneOf 表达单值或数组（宿主子集不收 anyOf）", () => {
+  it("参数表：路径过滤项用 oneOf 表达单值或数组（宿主子集不收 anyOf）", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const search = toolOf(ctx, "zg_search").parameters["properties"] as Record<string, unknown>;
@@ -1806,7 +1838,7 @@ describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
     assert.equal(ctx.toolsRegistered.length, 3);
   });
 
-  it("宿主服务面不完整时 apply 直接抛错（fail-fast）", () => {
+  it("某个宿主服务不完整时 apply 直接抛错（fail-fast）", () => {
     const applyPlugin = (plugin as unknown as { apply: (arg: unknown) => void }).apply;
     for (const hostArg of incompleteHosts()) {
       assert.throws(() => {
@@ -1835,12 +1867,16 @@ describe.skipIf(realRootUnavailable)("host.apply 注册面", () => {
 /** 真实 zg 在 --check-ready 判出未就绪时写在 stderr 上的那一行（逐字抄）。 */
 const NOT_READY_STDERR = "Error: Workspace index is not ready (state: undecided)";
 
-/** 双路查询输出里重复出现的组头三行，抽成常量避免三处硬编码漂移。 */
-const GROUP_HEADER_1 = "query groups (2):";
-const GROUP_LINE_1 = "Q1 [supplemental]: parseConfig";
-const GROUP_LINE_2 = "Q2 [supplemental]: parse a config file";
+/** 0.3.0 双路查询输出的组分隔行（实测形态 `-- query N/M: <文本> --`），抽成常量。 */
+const GROUP_LINE_1 = "-- query 1/2: parseConfig --";
+/** 命中条目样例（身份键即其后整段）：多处用例共用。 */
+const HIT_BETA = "#1 src/beta.ts:1-3";
+const HIT_A = "#1 a.ts:1-1";
+/** daemon 自启应答（mock runResults 共用）。 */
+const SERVER_READY_OUTPUT = "Server: ready";
+const GROUP_LINE_2 = "-- query 2/2: parse a config file --";
 
-describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
+describe("zg_search 执行", () => {
   let ctx: MockCtx;
   let root: string;
   // 整套件共用一枚工作区：它造在 beforeAll，挂不上任何一条用例，由本 describe 自己收。
@@ -1863,11 +1899,11 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     assert.deepEqual(out, { text: "RESULT" });
   });
 
-  it("stdout 带 hits 计数行 → 尾部追加命中摘要（分组求和；未触顶不提上限）", async () => {
+  it("0.3.0 输出（#N 路径:行号 头行）→ 尾部追加去重摘要；0.2.2 的 hits: 计数行已不存在", async () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(
-      okRun("query groups (2):\nQ1: q\nhits: 3\n#1 a\nQ2: b\nhits: 2\n#1 c"),
+      okRun("freshness: fresh\n#1 a.ts:1-1\nsymbol: [function] a\n  1: line\n#2 b.ts:2-2"),
     );
     const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
       text: unknown;
@@ -1875,36 +1911,31 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     assert.ok(
       typeof out.text === "string" &&
         out.text.endsWith(
-          `\n${fill(MESSAGES.zh.hitSummary, {
-            groups: 2,
-            grouped: 5,
-            dedup: "",
-            limit: 10,
-            capped: "",
-            truncated: "",
-          })}`,
+          `\n${fill(MESSAGES.zh.hitSummary, { unique: 2, limit: 10, truncated: "" })}`,
         ),
     );
   });
 
-  it("命中数达 --limit → 摘要带上限观察片段；截尾 → 带「只含保留部分」片段", async () => {
+  it("多组命中同一处代码 → 去重后位置数（0.3.0 分组只有 -- query 分隔行，无计数行）", async () => {
     ctx = makeCtx();
     applyTo(ctx);
-    const cappedRun = okRun("Q1: q\nhits: 10\n#1 a");
-    cappedRun.stdout.truncated = true;
-    ctx.shell.runResults.push(cappedRun);
+    // 真实 0.3.0 双组输出（--hybrid + --fts，未 fuse）：a.ts:1-1 在两组各出现一次。
+    ctx.shell.runResults.push(
+      okRun([GROUP_LINE_1, HIT_A, "#2 b.ts:2-2", GROUP_LINE_2, HIT_A, "#2 c.ts:3-3"].join("\n")),
+    );
     const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
       text: unknown;
     };
     assert.ok(
       typeof out.text === "string" &&
-        out.text.includes(fill(MESSAGES.zh.hitCapped, {})) &&
-        out.text.includes(fill(MESSAGES.zh.hitTruncated, {})),
-      "触顶与截尾片段都要出现",
+        out.text.endsWith(
+          `\n${fill(MESSAGES.zh.hitSummary, { unique: 3, limit: 10, truncated: "" })}`,
+        ),
+      "4 条命中对应 3 处不同位置",
     );
   });
 
-  it("stdout 无 hits 计数行 → 不加摘要（不数就不谎称）", async () => {
+  it("stdout 无 #N 头行 → 不加摘要（不数就不谎称）", async () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("nothing recognizable"));
@@ -1912,72 +1943,18 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     assert.deepEqual(out, { text: "nothing recognizable" });
   });
 
-  it("hits: 打头但非纯数字的行不当计数（形状意外也不谎称），有效组照常求和", async () => {
+  it("截尾 → 摘要带「只含保留部分」片段", async () => {
     ctx = makeCtx();
     applyTo(ctx);
-    ctx.shell.runResults.push(okRun("hits: N/A\nQ1: q\nhits: 2\n#1 a"));
+    const truncatedRun = okRun(HIT_A);
+    truncatedRun.stdout.truncated = true;
+    ctx.shell.runResults.push(truncatedRun);
     const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
       text: unknown;
     };
     assert.ok(
-      typeof out.text === "string" &&
-        out.text.includes(
-          fill(MESSAGES.zh.hitSummary, {
-            groups: 1,
-            grouped: 2,
-            dedup: "",
-            limit: 10,
-            capped: "",
-            truncated: "",
-          }),
-        ),
-      "摘要只数有效组",
-    );
-  });
-
-  it("多组命中同一处代码 → 分组计数合计与去重后位置数分别给出（求和不再冒充命中总数）", async () => {
-    ctx = makeCtx();
-    applyTo(ctx);
-    // 真实 zg 双组输出（--fts + --vector，未 fuse）：src/beta.ts:1-3 在 fts 组排第 4、
-    // 在 vector 组排第 1，matchedBy 也不同——同一处位置被两组各命中一次。
-    ctx.shell.runResults.push(
-      okRun(
-        [
-          GROUP_HEADER_1,
-          GROUP_LINE_1,
-          "hits: 5",
-          "#1 matchedBy=fts docs/gamma.md:1-4",
-          "#2 matchedBy=fts README.md:1-2",
-          "#3 matchedBy=fts src/delta.ts:1",
-          "#4 matchedBy=fts src/beta.ts:1-3",
-          "#5 matchedBy=fts src/alpha.ts:1-3",
-          GROUP_LINE_2,
-          "hits: 5",
-          "#1 matchedBy=vector src/beta.ts:1-3",
-          "#2 matchedBy=vector src/alpha.ts:1-3",
-          "#3 matchedBy=vector docs/gamma.md:1-4",
-          "#4 matchedBy=vector src/alpha.ts:5-7",
-          "#5 matchedBy=vector src/delta.ts:1",
-        ].join("\n"),
-      ),
-    );
-    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
-      text: unknown;
-    };
-    const dedup = fill(MESSAGES.zh.hitDedup, { unique: 6 });
-    assert.ok(
-      typeof out.text === "string" &&
-        out.text.endsWith(
-          `\n${fill(MESSAGES.zh.hitSummary, {
-            groups: 2,
-            grouped: 10,
-            dedup,
-            limit: 10,
-            capped: "",
-            truncated: "",
-          })}`,
-        ),
-      "10 条分组计数对应 6 处不同位置",
+      typeof out.text === "string" && out.text.includes(fill(MESSAGES.zh.hitTruncated, {})),
+      "截尾片段要出现",
     );
   });
 
@@ -2099,7 +2076,7 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     );
   });
 
-  it("exitCode 为 null（被信号终止）也要报错，不静默成功", async () => {
+  it("exitCode 为 null（被信号终止）也要报错，不会静默成功", async () => {
     ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.runResults.push({
@@ -2212,12 +2189,13 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
       stdout: { text: "", truncated: false },
       stderr: { text: 'Failed to download model "local/qwen3-embedding-0.6b".', truncated: false },
     };
-    // 结构化失败：带 `Code:` 行，本包据此就能归因，不必再塞一条指不到方向的 --debug 提示。
+    // 结构化失败：带 `Error[码]:` 行（0.3.0 形态），本包据此就能归因，不必再塞一条
+    // 指不到方向的 --debug 提示。
     const codedRun: ShellRunResult = {
       exitCode: 1,
       stdout: { text: "", truncated: false },
       stderr: {
-        text: "Error: no workspace index\nCode: ZVEC_GREP.ENGINE.WORKSPACE_INDEX_NOT_FOUND",
+        text: "Error[ZG.ENGINE.NOT_FOUND]: no workspace index",
         truncated: false,
       },
     };
@@ -2228,7 +2206,7 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     assert.match(uncode, /Failed to download model/u, "原文照留，指引只是补在后面");
     const coded = await reasonOf(search.execute({ root, query: "x" }, execOf(root)));
     assert.ok(!coded.includes("--debug"), "带 Code: 行的失败不补无码指引");
-    assert.match(coded, /WORKSPACE_INDEX_NOT_FOUND/u);
+    assert.match(coded, /ZG\.ENGINE\.NOT_FOUND/u, "0.3.0 码行原样随行");
   });
 
   it("沙箱 runner 失败：不归因给 zg 未安装，并交代 mode/enforcement", async () => {
@@ -2380,7 +2358,9 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
     ctx.settingsValue["hfEndpoint"] = "   ";
     applyTo(ctx);
     await startJob(ctx, ws("noenv-rb"));
-    const spawn = ctx.shell.resolveCalls.find((call) => call.command.startsWith("zg index"));
+    const spawn = ctx.shell.resolveCalls.find((call) =>
+      call.command.startsWith(INDEX_COMMAND_PREFIX),
+    );
     assert.ok(spawn);
     assert.equal(spawn.env, undefined);
   });
@@ -2449,7 +2429,7 @@ describe.skipIf(realRootUnavailable)("zg_search 执行", () => {
   });
 });
 
-describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
+describe("zg_index / zg_status 执行", () => {
   let root: string;
   // 同上：beforeAll 造的那一枚由本 describe 收尾（onTestFinished 在这一刻没有「当前用例」）。
   beforeAll(() => {
@@ -2477,7 +2457,7 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
     await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
     assert.equal(
       ctx.shell.resolveCalls[0]?.command,
-      `zg index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
+      `zg --index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
     );
   });
 
@@ -2494,7 +2474,7 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
     await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
     assert.equal(
       ctx.shell.resolveCalls[1]?.command,
-      `zg index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
+      `zg --index '${root}' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
     );
   });
 
@@ -2513,7 +2493,7 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
     );
   });
 
-  describe("ignoreFiles 预检（存在 + 可读；drop 那一臂跳过）", () => {
+  describe("ignoreFiles 预检（存在 + 可读；drop 那一条分支跳过）", () => {
     // 这一层用 mock 宿主钉**本包自己的判据**（起命令之前的那段）：CI 没有真 zg 时它照跑，
     // 覆盖率不因真-zg 的集成/端到端两层按 zgAvailable 跳过而塌。上游「读不成的忽略文件会把
     // 整棵工作区索引写坏」这一事实另由 test/e2e/zg-cli.test.ts（ENOENT / EACCES 两档）与
@@ -2581,7 +2561,7 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
     );
 
     it("drop 携带索引侧参数（含 ignoreFiles）被点名拒绝，预检的误导文案不出现", async () => {
-      // drop 那一臂的命令只有 `--drop --yes`，索引用不上的参数静默收下只会让人以为生效了；
+      // drop 那一条分支的命令只有 `--drop --yes`，索引用不上的参数静默收下只会让人以为生效了；
       // 构造器点名拒绝，而存在性预检对 drop 整段跳过，那句「给一个真实存在的忽略文件」
       // 不会抢在前面出现。
       const ctx = makeCtx();
@@ -2783,7 +2763,7 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
     applyTo(ctx);
     ctx.shell.runResults.push(okRun("STATUS"), okRun("STATUS2"));
     await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
-    assert.equal(ctx.shell.resolveCalls[0]?.command, `zg status '${root}' --mode auto`);
+    assert.equal(ctx.shell.resolveCalls[0]?.command, `zg --status '${root}' --mode auto`);
     // 回归护栏的另一侧：前台必须保留宿主 deadline 的缺省 kill 语义，不得被
     // onExpiry:'none' 变成无界（那是后台重建专用）。
     assert.equal(ctx.shell.resolveCalls[0].onExpiry, undefined);
@@ -2798,7 +2778,7 @@ describe.skipIf(realRootUnavailable)("zg_index / zg_status 执行", () => {
 // 真实 zg 的契约是「preserves the normal output and exits non-zero unless the Workspace
 // index is ready」：就绪报告打在 stdout，退出码只表达就绪与否。走普通失败路径会把报告丢掉、
 // 只留一句 stderr，恰好扔掉用户最需要的输出。
-describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
+describe("zg_status 就绪判定", () => {
   it("checkReady=true 透传 --check-ready", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -2807,7 +2787,7 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
     await toolOf(ctx, "zg_status").execute({ root, checkReady: true }, execOf(root));
     assert.equal(
       ctx.shell.resolveCalls[0]?.command,
-      `zg status '${root}' --check-ready --mode auto`,
+      `zg --status '${root}' --check-ready --mode auto`,
     );
   });
 
@@ -2827,9 +2807,11 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("ready");
-    // 照抄真实 zg：stdout 是「? Workspace index is not configured …」那份报告，
-    // stderr 是「Error: Workspace index is not ready (state: undecided)」。
-    const notReady = okRun(`${UNCONFIGURED_REPORT}\n\n  Next        zg index or zg query --rg`);
+    // 未就绪报告夹具：0.3.0 的 Coverage/Embedding/FTS 布局（旧版的 `Next …` 行已随
+    // Rust 重写移除）；stderr 是「Error: Workspace index is not ready (state: undecided)」。
+    const notReady = okRun(
+      `${UNCONFIGURED_REPORT}\n\n  Embedding   Not configured\n  FTS         Not configured`,
+    );
     notReady.exitCode = 1;
     notReady.stderr.text = NOT_READY_STDERR;
     ctx.shell.runResults.push(notReady);
@@ -2944,20 +2926,15 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
   it("锁忙不被吸收：那半截 stdout 不是「未就绪」的答案", async () => {
     // 锁忙要走重建等待重试（RebuildLockBusyError），不是终局结论。这里用「别的操作占锁」
     // 这一档（重建占锁那一档由重建等待用例覆盖）：若 resolveFailure 先把失败吸收成
-    // 「索引未就绪」，runForeground 的分类分支就永远拿不到 stderr，等待臂整个失效。
+    // 「索引未就绪」，runForeground 的分类分支就永远拿不到 stderr，等待分支整个失效。
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("ready");
     const busy = okRun(UNCONFIGURED_REPORT);
     busy.exitCode = 1;
     busy.stderr.text = [
-      "Error: Index lock is busy",
-      `Code: ${LOCK_BUSY_CODE}`,
-      "Details:",
-      "  ownerOperation: index.refresh",
-      "  ownerPid: 4321",
-      `  lock: ${root}/.zvec-grep/index.lock`,
-      "",
+      `Error[${LOCK_BUSY_CODE}]: lock is busy: lock=${root}/.zvec-grep/index.lock operation=index.refresh`,
+      "Error location: crates/zg-engine/src/workspace/lock.rs:50:11",
     ].join("\n");
     ctx.shell.runResults.push(busy);
     await assert.rejects(
@@ -2990,9 +2967,9 @@ describe.skipIf(realRootUnavailable)("zg_status 就绪判定", () => {
   });
 });
 
-// ── 重建读面 ──────────────────────────────────────────────────────────────
+// ── 重建读取接口 ──────────────────────────────────────────────────────────────
 
-describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
+describe("rebuild 后台进程状态", () => {
   it("完成：status/exitCode 原样回给卡片（completed+exit≠0 不得显示成功）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3016,7 +2993,7 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
     const root = ws("noexitcode");
     const { jobId, proc } = await startJob(ctx, root);
     // 执行器把进程报成"非 killed 的落定"却没有退出码（跨 runner 的边角形态）。
-    // detail 走宿主 bash 工具同一句 `exit code: ${exitCode ?? 0}`（借来的口径），
+    // detail 走宿主 bash 工具同一句 `exit code: ${exitCode ?? 0}`（借来的规则），
     // 但**卡片契约不动**：exitCode 原样是 null，成功判据仍要求它 === 0。
     proc.status = "completed";
     proc.exitCode = null;
@@ -3148,7 +3125,7 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
     const body = await pollBody(ctx, jobId);
     assert.ok(body.output.includes("已截断"));
     assert.equal(body.output.includes("\uDC00"), false, "不得留孤立代理项");
-    // 缓冲区只经"尾部 4000 码元"的显示窗口露面，头部那枚被切掉的半代理看不见 ⇒
+    // 缓冲区只经"尾部 4000 码元"的显示窗口呈现，头部那枚被切掉的半代理看不见 ⇒
     // 牙齿落在**总长标注**上：丢掉一枚才可能是 262143，裸 slice 是 262144。
     assert.ok(
       body.output.includes(
@@ -3187,7 +3164,7 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
     assert.ok(body.output.includes("partial"));
   });
 
-  it("执行器读者抛错 → 本包兜住并按「有丢失」处理（不裸 500、也不静默少一段）", async () => {
+  it("执行器读者抛错 → 本包兜住并按「有丢失」处理（不抛成 500、也不会静默少一段）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("readthrow");
@@ -3203,19 +3180,19 @@ describe.skipIf(realRootUnavailable)("rebuild 后台进程状态", () => {
     assert.ok(res.ok, replyText(res));
     const body = res;
     assert.match(body.output, /缓冲区溢出/u);
-    // 抛错之前那一拍已经搬进环的内容不许被连带丢掉。
+    // 抛错之前那一拍已经搬进环形缓冲的内容不许被连带丢掉。
     assert.ok(body.output.includes("before the reader broke"));
     // 兜住抛错的另一 Half：官方泵一旦遇到抛错就**此后不再排这一路**（实测），所以抛错之后
-    // 再产出的内容不会进环——卡片必须仍然答 200 并把"有丢失"说清楚，而不是假装完整。
+    // 再产出的内容不会进环形缓冲——卡片必须仍然答 200 并把"有丢失"说清楚，而不是假装完整。
     assert.equal(body.status, "running");
     assert.ok(!body.output.includes("-after"));
   });
 });
 
-describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
+describe("rebuild-status 读取接口", () => {
   it("没被观测过的 root → 403 白名单拒绝，且不起进程", async () => {
     // 文件系统上存在不等于被本 daemon 观测过：不先经过一次工具调用登记，就不给重建。
-    // 这条不依赖真 zg，故放在单测面——e2e/集成层按 zgAvailable 跳过时它仍要盖住这道拒绝。
+    // 这条不依赖真 zg，故放在单测这一层——e2e/集成层按 zgAvailable 跳过时它仍要盖住这道拒绝。
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("untracked");
@@ -3306,7 +3283,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     );
     assert.ok(
       !replyText(refused).includes("background job limit reached"),
-      "宿主英文原话不得整句混进中文卡片（双语口径）",
+      "宿主英文原话不得整句混进中文卡片（双语规则）",
     );
     // 进程是先起后拒的（spawn 在注册之前）：拒绝时必须把它收掉，不能留一条没登记的 zg。
     assert.equal(ctx.shell.startedProcs[LIVE_CAP]?.killCount, 1, "被拒的那条必须立刻终止");
@@ -3329,7 +3306,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     await expectStatus(ctx, jobIdAt(ctx, 1), 200);
     // 不变量：**本 kind 在册记录（含进行中的那条）不超过 REBUILD_HISTORY_MAX 条**。裁剪发生在 start
     // 之前，剪到只剩 REBUILD_HISTORY_MAX-1 条已落定 ⇒ 新起的这条落定后正好 REBUILD_HISTORY_MAX 条，与卡片
-    // 文案「只保留最近 10 条已结束的重建」同一口径。（判据的时点是**新作业落定之后**，
+    // 文案「只保留最近 10 条已结束的重建」同一种做法。（判据的时点是**新作业落定之后**，
     // 不是剪完那一刻——只看后者会误判成"留 9 条差一格"。）
     await startRebuilds(ctx, "history", 1);
     assert.equal(ctx.shell.startedProcs.length, REBUILD_HISTORY_MAX + 1);
@@ -3337,7 +3314,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     await expectStatus(ctx, jobIdAt(ctx, 2), 200);
     await expectStatus(ctx, jobIdAt(ctx, REBUILD_HISTORY_MAX + 1), 200);
     // 侧表也必须跟着走：prune 里 `records.delete` 漏掉的话，这条幽灵会一直钉着 proc，
-    // 并在卸载那一臂被当成在跑的作业再 kill 一次（下面那条断言就是这一行的牙齿）。
+    // 并在卸载那一条分支被当成在跑的作业再 kill 一次（下面那条断言就是这一行的牙齿）。
     const [evicted] = ctx.shell.startedProcs;
     assert.ok(evicted);
     for (const dispose of ctx.effectDisposers) {
@@ -3367,7 +3344,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
   });
 
   it("同一棵树上的第二次启动复用那条在跑的重建，不再并发起第二条 zg", async () => {
-    // `zg index --rebuild` 是 drop + 重写：两条并发就是两个进程在同一份 `.zvec-grep/` 上互啃。
+    // `zg --index --rebuild` 是 drop + 重写：两条并发就是两个进程在同一份 `.zvec-grep/` 上互啃。
     // 复用只对在跑的成立，所以这条也断"落定之后再点=新作业"。
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3393,7 +3370,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
 
   it("jobs 被换成另一枚实例：新的起在正在服务的那枚里，旧面板改口 404", async () => {
     // 官方号是 `<kind>-<16 位 hex>`，换一枚实例也不会重发同一个号，所以"新的一条撞上旧记录"
-    // 这一臂已经不存在：新的照常起在正在服务的实例里，旧号在新实例查不到 ⇒ 404，不串台。
+    // 这一分支已经不存在：新的照常起在正在服务的实例里，旧号在新实例查不到 ⇒ 404，不串台。
     const ctx = makeCtx();
     applyTo(ctx);
     const rootA = ws("swap-a");
@@ -3436,7 +3413,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     assert.equal(replyCode(res), 503, replyText(res));
     assert.match(replyText(res), /ctx\.jobs/u, "要把缺的那件点名，别只回「失败」");
     assert.equal(ctx.shell.startCalls.length, 0, "没有注册表就不该先把 zg 起起来");
-    // 引导端点不依赖注册表：卡片仍能取 token 与候选（坏在最小的那一面）。
+    // 引导端点不依赖注册表：卡片仍能取 token 与候选（坏在最小的一处）。
     const issued = await fetchAccess(ctx);
     assert.ok(Array.isArray(issued.roots), "引导读面不依赖注册表");
     // 轮询端点在没有注册表时全 404（侧表是空的），不抛穿。
@@ -3477,7 +3454,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
       /历史窗口/u,
       "404 要带可行动说明，而不是让卡片只显示「查询状态失败」",
     );
-    // 进程归卸载那一臂收：重载后的注册表不再认得它，但它是本包起的（不能留孤儿 zg）。
+    // 进程归卸载那一条分支收：重载后的注册表不再认得它，但它是本包起的（不能留孤儿 zg）。
     ctx.noJobs = true;
     for (const dispose of ctx.effectDisposers) {
       dispose();
@@ -3486,7 +3463,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
   });
 
   it("同 id 指向另一条作业：身份证对不上就 404，不把别人的读数端给旧卡片", async () => {
-    // 官方号是 `<kind>-<16 位 hex>`，换一枚实例也不会重发同一个号 ⇒ 这条臂再也造不出公开入口。
+    // 官方号是 `<kind>-<16 位 hex>`，换一枚实例也不会重发同一个号 ⇒ 这条分支再也造不出公开入口。
     // 身份证是读侧唯一的闸，所以这里用一枚只交出 get/list/readAt 的替身把输入钉住；视图从
     // 官方投影复制、只改 label，形状不由本包自造。
     const ctx = makeCtx();
@@ -3496,7 +3473,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     const real = ctx.jobs;
     const [mine] = real.list();
     assert.ok(mine, "起了就该在名册里");
-    const foreign = { ...real.get(mine.id), label: "zg index /another/tree" };
+    const foreign = { ...real.get(mine.id), label: "zg --index /another/tree" };
     ctx.jobs = {
       get: () => foreign,
       list: () => [foreign],
@@ -3520,7 +3497,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
   });
 
   it("超时那一拍注册表被关掉：进程照样收掉，超时说明仍给到卡片", async () => {
-    // 超时兜底不许依赖名册还在：`jobs` 那一行被关掉时注册表侧已经没有这条可标记，
+    // 超时后备不许依赖名册还在：`jobs` 那一行被关掉时注册表侧已经没有这条可标记，
     // 但进程是本包起的，不杀它就是一条永远没人收的孤儿 zg。
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3574,14 +3551,14 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     assert.ok(!replyText(res).includes("后台作业已满"), "不是容量问题就别报容量");
     assert.equal(ctx.shell.startedProcs[0]?.killCount, 1, "起都起不来的那条 zg 必须立杀");
     assert.equal(ctx.jobs.list().length, 0, "官方件对 starter 抛错的答法是不注册（序号作废）");
-    // 侧表也不能留着它：那条记录钉着一枚 proc，卸载臂会把它当自己的作业再 kill 一次。
+    // 侧表也不能留着它：那条记录钉着一枚 proc，卸载分支会把它当自己的作业再 kill 一次。
     for (const dispose of ctx.effectDisposers) {
       dispose();
     }
     assert.equal(
       ctx.shell.startedProcs[0].killCount,
       1,
-      "只有拒绝那一臂杀过一次，卸载那一臂不该再动这条幽灵",
+      "只有拒绝那一条分支杀过一次，卸载那一条分支不该再动这条幽灵",
     );
   });
 
@@ -3646,8 +3623,8 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
     const body = await pollBody(ctx, jobId);
     assert.equal(body.status, "killed");
     assert.equal(body.exitCode, null);
-    // 官方 observers 那一侧的终态理由：信号名要写进 detail（与宿主 bash 工具 processOutcome
-    // 同口径），而 kill 的 reason 由注册表**追加**——生产者不许自己再带一遍（否则同一句两遍）。
+    // 官方 observers 那边的终态理由：信号名要写进 detail（与宿主 bash 工具 processOutcome
+    // 同一种做法），而 kill 的 reason 由注册表**追加**——生产者不许自己再带一遍（否则同一句两遍）。
     assert.equal(ctx.jobs.get(foreign.id).detail, "signal: SIGTERM; 用户取消");
   });
 
@@ -3772,7 +3749,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
       label: "bare start",
       run: () => ({ cancel: noop, done: Promise.resolve({ status: "completed" as const }) }),
     };
-    // 未经本包端点、也没有任何 controller 的裸 start 必须先被拒（这就是官方那道闸）。
+    // 没走本包端点、因此不带 controller 的 start 调用必须先被拒（这就是官方那道闸）。
     assert.throws(() => ctx.jobs.start(spec), /no job controller serves this agent/u);
     trackRoot(ctx, root);
     const res = await postRebuild(ctx, root);
@@ -3786,7 +3763,7 @@ describe.skipIf(realRootUnavailable)("rebuild-status 读面", () => {
 
 // ── 行级 config + required 校验 ───────────────────────────────────────────
 
-describe.skipIf(realRootUnavailable)("zvec-grep 行级 config 与 required 校验", () => {
+describe("zvec-grep 行级 config 与 required 校验", () => {
   it("行 config 覆盖 schema 默认，未提供字段保持 schema 默认", async () => {
     // 旧断言盯的是「行 config 合进 BUILTIN_BASE 后交给 settings.register 的 base」。
     // 0.1.7 把这两件事都收走了（底座 = schema 的 .default()，合并 = cordis 装载期），
@@ -3831,11 +3808,11 @@ describe.skipIf(realRootUnavailable)("zvec-grep 行级 config 与 required 校�
 
 // ── 部署值：超时三项 + stdout 上限走 Config（字段化，默认行为冻结）────────
 //
-// 官方 config.md:78-92：部署间可能想配不同值的都必须是配置字段。四个值此前是写死
+// 官方 config.md 的部署配置一节：部署间可能想配不同值的都必须是配置字段。四个值此前是写死
 // 的常量，现在进 Config schema（非 volatile：不占设置卡，行 config 是唯一改值入口）。
 // 这里钉两条链：前台三工具的 resolve 请求（timeoutMs/stdoutMaxBytes）与后台重建
 // （stdoutMaxBytes + kill 定时器时长），默认与行 config 覆盖两个方向都要走到。
-describe.skipIf(realRootUnavailable)("部署值：超时与 stdout 上限走 Config", () => {
+describe("部署值：超时与 stdout 上限走 Config", () => {
   it("三工具前台 resolve 带各自的默认超时与 stdout 上限（默认 = 原常量同值）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -3898,121 +3875,90 @@ describe.skipIf(realRootUnavailable)("部署值：超时与 stdout 上限走 Con
   });
 });
 
-// ── 命中摘要的口径（分组计数 vs 去重后位置数）──
+// ── 命中摘要（0.3.0：组计数维度已消失，只剩去重后位置数）──
 //
-// 断言面全是真实 zg 输出形状：`#<名次> matchedBy=<来源> <相对路径>:<行号范围>`。身份键
-// 取 `matchedBy=` 之后的整段原样文本——名次与匹配来源逐组变化，入键即失效；路径本身
+// 断言用的全是真实 zg 0.3.0 输出形状：头行 `#<名次> <相对路径>:<行号范围>`（matchedBy=
+// 已不存在），组间以 `-- query N/M: <文本> --` 分隔行衔接；--trace 的分值/轨迹是命中体后
+// 的独立 `score:` / `trace:` 行，不进头行。身份键取头行名次之后的整段原样文本——路径本身
 // 可以含空格与冒号，拆行号范围反而会误判。
 describe("hitSummary", () => {
   const { zh } = MESSAGES;
 
-  it("同一条位置被多组命中、名次与来源都不同 → 只算一处位置", () => {
+  it("同一处位置被两组各命中一次 → 去重后只算一处", () => {
+    const out = hitSummary(
+      [GROUP_LINE_1, HIT_BETA, GROUP_LINE_2, HIT_BETA].join("\n"),
+      10,
+      false,
+      zh,
+    );
+    assert.equal(out, fill(zh.hitSummary, { unique: 1, limit: 10, truncated: "" }));
+  });
+
+  it("freshness 头行（MCP 传输）与组分隔行都不入键", () => {
     const out = hitSummary(
       [
-        GROUP_HEADER_1,
+        "freshness: fresh",
         GROUP_LINE_1,
-        "hits: 1",
-        "#1 matchedBy=fts src/beta.ts:1-3",
-        GROUP_LINE_2,
-        "hits: 1",
-        "#1 matchedBy=vector src/beta.ts:1-3",
+        HIT_BETA,
+        "-- query 2/2: other --",
+        "#2 src/alpha.ts:1-3",
       ].join("\n"),
       10,
       false,
       zh,
     );
-    assert.equal(
-      out,
-      fill(zh.hitSummary, {
-        groups: 2,
-        grouped: 2,
-        dedup: fill(zh.hitDedup, { unique: 1 }),
-        limit: 10,
-        capped: "",
-        truncated: "",
-      }),
-    );
-  });
-
-  it("fuse 输出（matchedBy=fts+vector、单组）照常给出口径", () => {
-    const out = hitSummary(
-      "query groups (1):\nQ1 [supplemental]: parseConfig | parse a config file\nhits: 1\n" +
-        "#1 matchedBy=fts+vector src/beta.ts:1-3",
-      10,
-      false,
-      zh,
-    );
-    assert.ok(out?.includes(fill(zh.hitDedup, { unique: 1 })) === true, "fuse 单组也要给去重口径");
+    assert.equal(out, fill(zh.hitSummary, { unique: 2, limit: 10, truncated: "" }));
   });
 
   it("路径含空格与冒号 → 原样入键，不被拆错", () => {
     const out = hitSummary(
-      "query groups (1):\nQ1: q\nhits: 2\n" +
-        "#1 matchedBy=fts deep/a/b/c d/we:ird file.ts:1-2\n" +
-        "#2 matchedBy=fts deep/a/b/c d/we:ird file.ts:9-9",
+      "#1 deep/a/b/c d/we:ird file.ts:1-2\n#2 deep/a/b/c d/we:ird file.ts:9-9",
       10,
       false,
       zh,
     );
-    assert.ok(
-      out?.includes(fill(zh.hitDedup, { unique: 2 })) === true,
-      "两处行号不同 → 两处位置；含冒号的路径不能被截断成同一个键",
-    );
+    assert.equal(out, fill(zh.hitSummary, { unique: 2, limit: 10, truncated: "" }));
   });
 
-  // 追踪开启后条目头行多出两段装饰（真实 zg 输出照抄）。回归点：分值逐组不同，
-  // 带它入键会让同一处位置在两个组里各成"新位置"，去重彻底失效。
-  it("--trace 头行的 score= 与选择理由都不入键，同一位置仍只算一处", () => {
+  // --trace 开启时分值/轨迹是命中体后的独立行；头行保持 `#N 路径:行号`，同一处位置仍一处。
+  it("--trace 的 score:/trace: 行不误判成命中条目，去重不受影响", () => {
     const out = hitSummary(
       [
-        GROUP_HEADER_1,
-        GROUP_LINE_1,
-        "hits: 2",
-        "#1 matchedBy=fts score=0.0164 src/beta.ts:1-2",
-        "#2 [global_fill] matchedBy=fts score=0.0161 src/alpha.ts:1",
-        'trace: query "parseConfig": fts #1, vector #2; fused #1',
-        GROUP_LINE_2,
-        "hits: 2",
-        "#1 matchedBy=vector score=0.0161 src/alpha.ts:1",
-        "#2 matchedBy=vector score=0.0164 src/beta.ts:1-2",
+        "#1 src/beta.ts:1-2",
+        "symbol: [function] parseConfig",
+        "  1: source line",
+        "score: 0.0164",
+        'trace: {"recall":[{"path":"fts"}]}',
+        "#2 src/alpha.ts:1",
+        "score: 0.0161",
       ].join("\n"),
       10,
       false,
       zh,
     );
-    assert.ok(
-      out?.includes(fill(zh.hitDedup, { unique: 2 })) === true,
-      `分值与名次都变了，同一处位置仍应是 2 处：${String(out)}`,
-    );
+    assert.equal(out, fill(zh.hitSummary, { unique: 2, limit: 10, truncated: "" }));
   });
 
-  it("score 形态两种都收：整数与四位小数", () => {
-    const out = hitSummary(
-      "Q1: q\nhits: 2\n#1 matchedBy=fts score=1 src/a.ts:1-2\n#2 matchedBy=fts score=0.0325 src/a.ts:1-2",
-      10,
-      false,
-      zh,
-    );
-    assert.ok(out?.includes(fill(zh.hitDedup, { unique: 1 })) === true, String(out));
-  });
-
-  it("路径真以 score= 开头时不被误剥（纯数字才当分值）", () => {
-    const out = hitSummary(
-      "Q1: q\nhits: 2\n#1 matchedBy=fts score=1.txt:1-2\n#2 matchedBy=fts score=2.txt:1-2",
-      10,
-      false,
-      zh,
-    );
-    assert.ok(out?.includes(fill(zh.hitDedup, { unique: 2 })) === true, String(out));
-  });
-
-  it("preview 的源码行、标题行不误判成命中条目", () => {
+  it("detail 预览的头行标题剥掉尾部 score= 装饰后入键（身份退化为标题，仍有去重意义）", () => {
     const out = hitSummary(
       [
-        "query groups (1):",
-        "Q1: q",
-        "hits: 1",
-        "#1 matchedBy=fts docs/gamma.md:1-4",
+        "File: a.ts",
+        "  #1 function authService score=2.1000",
+        "  Range: 1  Status: fresh",
+        "  #2 function authService score=2.0839",
+        "  Range: 2  Status: fresh",
+      ].join("\n"),
+      10,
+      false,
+      zh,
+    );
+    assert.equal(out, fill(zh.hitSummary, { unique: 1, limit: 10, truncated: "" }));
+  });
+
+  it("preview 的源码行、标题行、score/trace 独立行都不误判成命中条目", () => {
+    const out = hitSummary(
+      [
+        "#1 docs/gamma.md:1-4",
         "heading: Config",
         "heading_level: 1",
         "source:",
@@ -4024,43 +3970,36 @@ describe("hitSummary", () => {
       false,
       zh,
     );
-    assert.ok(
-      out?.includes(fill(zh.hitDedup, { unique: 1 })) === true,
-      "只有 #n matchedBy= 开头的行才入键",
+    assert.equal(out, fill(zh.hitSummary, { unique: 1, limit: 10, truncated: "" }));
+  });
+
+  it("无 #N 头行（穷举/文件发现的输出）→ 不出摘要（不数就不谎称）", () => {
+    assert.equal(
+      hitSummary("src/beta.ts:1-3\nplain text\n-- query 1/1: x --", 10, false, zh),
+      null,
     );
   });
 
-  it("有命中条目但无 hits 计数行 → 不出摘要（没有组口径就不编）", () => {
-    assert.equal(hitSummary("#1 matchedBy=fts src/beta.ts:1-3", 10, false, zh), null);
-  });
-
-  it("输出被截尾 → 去重口径只覆盖保留部分，与截尾片段一并出现", () => {
-    const out = hitSummary("Q1: q\nhits: 4\n#1 matchedBy=fts src/beta.ts:1-3", 10, true, zh);
-    assert.ok(
-      out !== null && out.includes(fill(zh.hitTruncated, {})) && out.includes("1"),
-      "截尾事实要显式化",
+  it("输出被截尾 → 摘要带「只含保留部分」片段", () => {
+    const out = hitSummary(HIT_BETA, 10, true, zh);
+    assert.equal(
+      out,
+      fill(zh.hitSummary, { unique: 1, limit: 10, truncated: fill(zh.hitTruncated, {}) }),
     );
   });
 
-  it("英文口径同源：分组与去重两栏都在", () => {
-    const out = hitSummary(
-      "Q1: q\nhits: 2\n#1 matchedBy=fts src/beta.ts:1-3\n#2 matchedBy=fts src/alpha.ts:1-3",
-      10,
-      false,
-      MESSAGES.en,
-    );
+  it("英文规则同源", () => {
+    const out = hitSummary("#1 src/beta.ts:1-3\n#2 src/alpha.ts:1-3", 10, false, MESSAGES.en);
     assert.ok(
-      out !== null &&
-        out.includes("2 hit(s) in grouped counts") &&
-        out.includes("2 distinct location(s) after dedup"),
-      `英文摘要缺口径：${String(out)}`,
+      out?.includes("2 distinct location(s) after dedup") === true,
+      `英文摘要缺规则：${String(out)}`,
     );
   });
 });
 
 // ── 索引探测的按目录缓存（guard 每次调用至多 9 层 existsSync → 命中后 0 次）──
 //
-// 缓存实例在 apply 闭包里，工集成路径不可见 existsSync 次数；工厂是导出面，用注入的
+// 缓存实例在 apply 闭包里，工集成路径不可见 existsSync 次数；工厂是导出的，用注入的
 // 计数桩 + 时钟把命中/TTL 过期/LRU 触摸与淘汰逐分支钉死。失效策略（TTL 60s）的选型
 // 论证在 host.ts 的 createIndexProbeCache 注释里。
 describe("索引探测缓存 createIndexProbeCache", () => {
@@ -4125,7 +4064,7 @@ describe("索引探测缓存 createIndexProbeCache", () => {
 
   it("LRU：容量有界，超限淘汰最旧；命中即触摸，被用过的条目活得最久", () => {
     const probed: string[] = [];
-    // 时钟冻结 ⇒ 无 TTL 干扰；容量压到 2 让淘汰这一臂真的走到。
+    // 时钟冻结 ⇒ 无 TTL 干扰；容量压到 2 让淘汰这一分支真的走到。
     const cached = createIndexProbeCache(
       (dir) => {
         probed.push(dir);
@@ -4153,7 +4092,7 @@ describe("索引探测缓存 createIndexProbeCache", () => {
     );
   });
 
-  it("默认参数臂：不传时钟/时长/容量时用 Date.now + 60s + 32 条（生产接线形态）", () => {
+  it("默认参数分支：不传时钟/时长/容量时用 Date.now + 60s + 32 条（生产接线形态）", () => {
     const probed: string[] = [];
     const cached = createIndexProbeCache((dir) => {
       probed.push(dir);
@@ -4231,7 +4170,7 @@ describe("工具 render 全性", () => {
 // 工作区已建 zg 索引时，bash/pwsh 的 grep/rg 与原生 grep 工具在成功 zg_search
 // 一次之前会被拒绝。索引目录用真实 fs 临时目录（existsSync 真实路径）。
 
-describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
+describe("search-first 门禁", () => {
   let ctx: MockCtx;
   let tmp: string;
 
@@ -4511,7 +4450,7 @@ describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
   });
 
   it("宿主交回空引用（退化）时门禁仍开启：fail-closed", () => {
-    // 0.1.7 的默认值住在 schema 的 .default()，正常装载下 enforceSearchFirst 恒为
+    // 0.1.7 的默认值定义在 schema 的 .default() 里，正常装载下 enforceSearchFirst 恒为
     // boolean。这里刻意把 volatile 引用背后的值清空（= 条目没被投影 / 宿主退化），
     // 锁死「读不到」不等于「用户关了门禁」——静默放行检索顺序违规才是更坏的失败。
     tmp = tempDir("zvec-grep-gate-empty-");
@@ -4538,7 +4477,7 @@ describe.skipIf(realRootUnavailable)("search-first 门禁", () => {
 // 错误全自带字典（lib/messages.ts），语言只读官方 locale 命名空间的 preference。
 // 见 lib/locale.ts 的契约：读不到（没装 locale 插件）即中文默认。
 
-describe.skipIf(realRootUnavailable)("host 侧文案双语", () => {
+describe("host 侧文案双语", () => {
   it("locale 命名空间未注册 → 中文默认，且不抛", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -4606,17 +4545,18 @@ describe.skipIf(realRootUnavailable)("host 侧文案双语", () => {
 // 它**拦不住**的（仍靠真实宿主启动或人工核对）：profile 里实际装配出来的条目 id
 // （本包 cordis.patch.yml 只是它的来源），以及"cordis 真把这份 Config 挂上了 runtime"。
 describe("0.1.7 隐式注册验收", () => {
-  /** zvec-grep 条目该能编辑的六项（全是实时项，一个都不该漏）。 */
+  /** zvec-grep 条目该能编辑的七项（全是实时项，一个都不该漏；0.3.0 起 transport 上卡）。 */
   const EDITABLE = [
     "defaultEmbedding",
     "defaultLimit",
     "enforceSearchFirst",
     "grepBudgetPerSearch",
     "hfEndpoint",
+    "transport",
     "unlockWindowMin",
   ];
 
-  it("volatileForm(Config) 的字段集恰为 zvec-grep 条目的六项可编辑字段", () => {
+  it("volatileForm(Config) 的字段集恰为 zvec-grep 条目的七项可编辑字段", () => {
     // 命名空间 = 本包 cordis.patch.yml 的裸条目 id（0.1.7 隐式注册取的就是它）。
     assert.equal(patchEntryId(), "zvec-grep");
     const form = volatileFormOf(plugin.Config as unknown as SchemaNode);
@@ -4624,7 +4564,7 @@ describe("0.1.7 隐式注册验收", () => {
     assert.deepEqual(form.toSorted(), EDITABLE, "投影字段集与设置卡预期可编辑项不一致");
   });
 
-  it("schema 字段全集 = 投影可编辑六项 + 十项非 volatile 部署值（W4）", () => {
+  it("schema 字段全集 = 投影可编辑七项 + 十一项非 volatile 部署值（W4）", () => {
     // 部署值（超时三项 + stdout 上限 + 传输模式 + 重建等待 + 远程 embedding 三件）
     // 不该标 volatile：标了会挤上设置卡——尤其远程 embedding 那三项，一个是「允许把
     // 工作区内容送出本机」的安全闸、一个是端点、一个是凭据的环境变量名，都不该由
@@ -4638,6 +4578,7 @@ describe("0.1.7 隐式注册验收", () => {
         "indexTimeoutMs",
         "stdoutMaxBytes",
         "clientMode",
+        "daemonUrl",
         "rebuildWaitMs",
         "allowRemoteEmbedding",
         "remoteEmbeddingEndpoint",
@@ -4674,16 +4615,12 @@ function makeIndexedTemp(): string {
   return dir;
 }
 
-/** zg 重建持锁时的一次失败执行（锁名、操作名、进程号都按实测抄；ownerOperation 可缺）。 */
+/** zg 0.3.0 重建持锁时的一次失败执行（成因串形态，锁名与操作名按 lock.rs 原文抄；op 可缺）。 */
 function lockBusyRun(ownerOperation: string | null = "index.rebuild"): ShellRunResult {
+  const opPart = ownerOperation === null ? "" : ` operation=${ownerOperation}`;
   const stderr = [
-    "Error: Index unavailable",
-    "Code: ZVEC_GREP.ENGINE.LOCK.BUSY",
-    "Details:",
-    "  lock: /ws/.zvec-grep/locks/home.write",
-    "  operation: info",
-    ...(ownerOperation === null ? [] : [`  ownerOperation: ${ownerOperation}`]),
-    "  ownerPid: 14962",
+    `Error[${LOCK_BUSY_CODE}]: lock is busy: lock=/ws/.zvec-grep/locks/home.write${opPart}`,
+    "Error location: crates/zg-engine/src/workspace/lock.rs:50:11",
   ].join("\n");
   return {
     exitCode: 1,
@@ -4742,7 +4679,7 @@ function grepVerdict(
 //
 // 一次 zg_index(background=true) 应当把「起进程 + 登记作业 + 挂超时回收」全做完，把可轮询的
 // 作业号交回后立刻返回；起的作业与设置卡那条重建在名册上同形，所以卡片也能看见。
-describe.skipIf(realRootUnavailable)("模型侧后台索引", () => {
+describe("模型侧后台索引", () => {
   it("返回可轮询的作业号，且本次调用不挂着", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -4753,7 +4690,7 @@ describe.skipIf(realRootUnavailable)("模型侧后台索引", () => {
     )) as { text: string };
     assert.match(out.text, /root|后台/u);
     assert.ok(out.text.includes(root), "要带上根");
-    assert.match(out.text, /zg index/u, "要把实际命令交回，便于模型复述");
+    assert.match(out.text, /zg --index/u, "要把实际命令交回，便于模型复述");
     assert.equal(ctx.shell.resolveCalls.length, 1, "只起一条 zg");
     assert.equal(ctx.shell.resolveCalls[0]?.onExpiry, "none", "后台路径要无界执行");
   });
@@ -4881,7 +4818,7 @@ describe.skipIf(realRootUnavailable)("模型侧后台索引", () => {
   });
 });
 
-describe.skipIf(realRootUnavailable)("宿主没有会话存储时的降级", () => {
+describe("宿主没有会话存储时的降级", () => {
   it("上溯停在已知的最后一跳，功能不中断（仍不阻断任何调用）", async () => {
     const ctx = makeCtx();
     ctx.noSessions = true;
@@ -4992,7 +4929,7 @@ describe("工作区白名单的有效期与最近使用", () => {
   });
 });
 
-describe.skipIf(realRootUnavailable)("解锁表的最近使用淘汰", () => {
+describe("解锁表的最近使用淘汰", () => {
   it("重新检索即刷新时效：额度在窗内一直可用", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5045,17 +4982,24 @@ async function searchWithStderr(stderr: string): Promise<string> {
 
 // ── 成功执行的 stderr 分类 ──
 //
-// zg 在成功时也往 stderr 写索引进度（非 TTY 下逐行落盘）。这些行每次建索引都在，写进回执
+// zg 在成功时也往 stderr 写索引进度（非 TTY 下逐行写到磁盘）。这些行每次建索引都在，写进回执
 // 只是噪声；真正要交回的是降级提示、锁冲突与任何**不认识**的新告警——所以判据是「只丢
 // 认得的进度行」，而不是「只留认得的告警」。
-describe.skipIf(realRootUnavailable)("成功执行的 stderr 分类", () => {
+describe("成功执行的 stderr 分类", () => {
   const runWithStderr = searchWithStderr;
 
-  it("整段都是索引进度 → 一句注脚都不加", async () => {
+  it("整段都是索引进度 → 一句注脚都不加（0.3.0 进度行前缀词表）", async () => {
     const text = await runWithStderr(
-      ["Scanning files...", "Preparing local/qwen3-embedding-0.6b", "Indexing complete", ""].join(
-        "\n",
-      ),
+      [
+        "Preparing model: local/potion-code-16m-v2",
+        "Scanning — scanning files",
+        "Indexing: 0/5 files",
+        "Files processed: 5/5 files — indexed m5.ts",
+        "Optimizing index: 5/5 files",
+        "Saving index: 5/5 files",
+        "Finishing index: 5/5 files",
+        "",
+      ].join("\n"),
     );
     assert.equal(text, "OUT", `不该有任何注脚：${text}`);
   });
@@ -5063,39 +5007,51 @@ describe.skipIf(realRootUnavailable)("成功执行的 stderr 分类", () => {
   it("降级提示原样交回（进度行滤掉、告警留下）", async () => {
     const text = await runWithStderr(
       [
-        "Scanning files...",
-        "warning: --refresh background requires Server mode; Direct mode uses --refresh off",
+        "Scanning — scanning files",
+        "Warning: --refresh background is unavailable in direct mode; falling back to off",
       ].join("\n"),
     );
-    assert.ok(text.includes("refresh background requires Server mode"), text);
-    assert.ok(!text.includes("Scanning files"), "进度行要滤掉");
+    assert.ok(text.includes("falling back to off"), text);
+    assert.ok(!text.includes("Scanning"), "进度行要滤掉");
   });
 
-  it("部分文件失败的信号必须留着：Indexing completed with N failed file(s)", async () => {
+  it("部分文件失败的信号必须留着：indexing completed with N failed files", async () => {
     const text = await runWithStderr(
-      ["Indexing complete", "Indexing completed with 3 failed files"].join("\n"),
+      [
+        "Finishing index: 5/5 files",
+        "indexing completed with 3 failed files; workspace index is not ready",
+      ].join("\n"),
     );
-    assert.ok(
-      text.includes("3 failed files"),
-      `字面上以「Indexing complete」开头，不能被前缀误伤：${text}`,
-    );
+    assert.ok(text.includes("3 failed files"), `失败信号不是进度前缀，不能被词表吞掉：${text}`);
   });
 
   it("不认识的新告警一律留下（只丢认得的进度行，不做白名单式过滤）", async () => {
     const text = await runWithStderr(
-      ["Something Entirely New Appeared In zg 9.9", "Downloading model · 42% · 1.0 MB/2.0 MB"].join(
-        "\n",
-      ),
+      [
+        "Something Entirely New Appeared In zg 9.9",
+        "Downloading model: local/potion-code-16m-v2 42% (1.0/2.0 MiB)",
+      ].join("\n"),
     );
     assert.ok(text.includes("Entirely New"), text);
     assert.ok(!text.includes("Downloading"), "下载进度是噪声");
+  });
+
+  it("model warning 是告警不是进度：保留（它不受节流，语义是降级/异常提示）", async () => {
+    const text = await runWithStderr(
+      [
+        "Model ready: local/potion-code-16m-v2",
+        "Model warning: local/potion-code-16m-v2 — fell back to CPU",
+      ].join("\n"),
+    );
+    assert.ok(text.includes("Model warning"), `告警行要留下：${text}`);
+    assert.ok(!text.includes("Model ready"), "就绪行是噪声");
   });
 
   it("signalStderr 直测：空白行一并去掉，保留顺序", () => {
     assert.equal(signalStderr(""), "");
     assert.equal(signalStderr("\n\n  \n"), "");
     assert.equal(signalStderr("Model ready: m\nwarning: w\n"), "warning: w");
-    assert.equal(signalStderr("Indexing complete\nIndexing complete\n"), "");
+    assert.equal(signalStderr("Indexing: 3/5 files\nSaving index\n"), "");
   });
 });
 
@@ -5103,7 +5059,7 @@ describe.skipIf(realRootUnavailable)("成功执行的 stderr 分类", () => {
 //
 // 只判「文件在不在」会把两种实况误判成有索引：文件在但不是一份清单，以及清单在但根路径
 // 不覆盖这个目录（此时在该目录检索必然失败，而门禁却按「已建索引」拦着 grep/rg）。
-describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
+describe("索引探测的清单校验", () => {
   const withManifest = withWorkspaceManifest;
   const makeApplied = appliedCtx;
 
@@ -5120,13 +5076,21 @@ describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
     assert.notEqual(reason, undefined, "合法清单应被认成已建索引");
   });
 
-  it("清单不是 JSON / 缺字段 / rootPaths 为空 → 判为无索引（不因为坏文件把门禁关死）", () => {
+  it("清单不是 JSON / 缺字段 / indexVersion 不对 / sourceRoot 缺失 → 判为无索引（不因为坏文件把门禁关死）", () => {
     for (const body of [
       "not json at all",
       "{}",
-      JSON.stringify({ manifestVersion: 1 }),
-      JSON.stringify({ manifestVersion: 1, rootPaths: [] }),
-      JSON.stringify({ manifestVersion: 1, rootPaths: [{ recursive: true }] }),
+      // 合法 JSON 但不是对象（JSON.parse 交回 null）：同样不是一份清单。
+      "null",
+      // 0.2.x 的旧形状（manifestVersion/rootPaths）：下限钉 0.3.0 后不再认。
+      JSON.stringify({
+        manifestVersion: 1,
+        rootPaths: [{ absolutePath: "/somewhere", recursive: true }],
+      }),
+      JSON.stringify({ indexVersion: 2 }),
+      JSON.stringify({ indexVersion: 2, sourceRoot: {} }),
+      JSON.stringify({ indexVersion: 2, sourceRoot: { recordedPath: "" } }),
+      JSON.stringify({ indexVersion: 1, sourceRoot: { recordedPath: "/somewhere" } }),
     ]) {
       const dir = withManifest("bad", body);
       const ctx = makeApplied();
@@ -5143,8 +5107,8 @@ describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
     const dir = withManifest(
       "other",
       JSON.stringify({
-        manifestVersion: 1,
-        rootPaths: [{ absolutePath: "/somewhere/else", recursive: true }],
+        indexVersion: 2,
+        sourceRoot: { recordedPath: "/somewhere/else", recordedUsername: "tester" },
       }),
     );
     const ctx = makeApplied();
@@ -5164,13 +5128,13 @@ describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
     () => {
       const dir = bareWs("private");
       mkdirSync(path.join(dir, ZG_INDEX_DIR), { recursive: true });
-      // 实测上游清单里的 absolutePath 是**未解析**那一支，而调用方完全可能交来解析过的形式。
-      // 两边都再剥一次 /private 前缀再比，故两种写法都能对上。
+      // 0.3.0 实测清单里的 recordedPath 是**解析过**的那一支（/private/tmp/…），而会话 cwd
+      // 通常是未解析形式。两边都再剥一次 /private 前缀再比，故两种写法都能对上。
       writeFileSync(
         path.join(dir, ZG_INDEX_DIR, ZG_MANIFEST_FILE),
         JSON.stringify({
-          manifestVersion: 1,
-          rootPaths: [{ absolutePath: `/private${dir}`, recursive: true }],
+          indexVersion: 2,
+          sourceRoot: { recordedPath: `/private${dir}`, recordedUsername: "tester" },
         }),
       );
       const ctx = makeApplied();
@@ -5183,10 +5147,10 @@ describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
     },
   );
 
-  it("清单在但缺 manifestVersion → 判为无索引", () => {
+  it("清单在但缺 indexVersion → 判为无索引", () => {
     const dir = withManifest(
       "noversion",
-      JSON.stringify({ rootPaths: [{ absolutePath: "/x", recursive: true }] }),
+      JSON.stringify({ sourceRoot: { recordedPath: "/x", recordedUsername: "tester" } }),
     );
     const ctx = makeApplied();
     const reason = guardOf(ctx)({
@@ -5197,18 +5161,18 @@ describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
     assert.equal(reason, undefined, "不是本包认的清单版本");
   });
 
-  it("清单版本不是当前认的那一版 → 判为无索引（上游读它会硬失败，索引一次也读不了）", () => {
-    // 上游 isWorkspaceManifest 要求 manifestVersion 严格等于 CURRENT_MANIFEST_VERSION，
-    // 不等就抛 MANIFEST.INVALID。此处若宽松放行，门禁会按「已建索引」拦住 grep/rg，
-    // 而 zg_search 每次都只会撞上那个硬失败——用户等于被卡死在没有出口的状态。
+  it("清单 indexVersion 低于 2 判无索引；更高的整数照常认（前向兼容）", () => {
+    // 0.3.0 的清单带 indexVersion（实测现量 2）。低于它的旧形状（0.2.x 的 manifestVersion:1）
+    // 判「无索引」；更高的整数不再判无索引：插件只按 manifest 判「这棵树有没有索引」，
+    // 能否读它由安装的那枚 zg 决定（版本门已保证 zg >= 0.3.0）。
     // 根路径一律写成本目录，确保命中的判据只有版本这一条。
-    for (const version of [2, 0, "1", null, undefined]) {
+    for (const version of [1, 0, "2", null, undefined]) {
       const dir = bareWs(`ver${String(version)}`);
       const body: Record<string, unknown> = {
-        rootPaths: [{ absolutePath: dir, recursive: true }],
+        sourceRoot: { recordedPath: dir, recordedUsername: "tester" },
       };
       if (version !== undefined) {
-        body["manifestVersion"] = version;
+        body["indexVersion"] = version;
       }
       mkdirSync(path.join(dir, ZG_INDEX_DIR), { recursive: true });
       writeFileSync(path.join(dir, ZG_INDEX_DIR, ZG_MANIFEST_FILE), JSON.stringify(body));
@@ -5220,10 +5184,29 @@ describe.skipIf(realRootUnavailable)("索引探测的清单校验", () => {
       });
       assert.equal(reason, undefined, `版本 ${String(version)} 不该被认成可检索索引`);
     }
+
+    // 上游未发布的 HEAD 已把 CURRENT_INDEX_VERSION 抬到 3：更高版本必须仍被认成索引，
+    // 否则门禁静默关闭、检索静默改走穷举通道。
+    const newer = bareWs("ver3");
+    mkdirSync(path.join(newer, ZG_INDEX_DIR), { recursive: true });
+    writeFileSync(
+      path.join(newer, ZG_INDEX_DIR, ZG_MANIFEST_FILE),
+      JSON.stringify({
+        sourceRoot: { recordedPath: newer, recordedUsername: "tester" },
+        indexVersion: 3,
+      }),
+    );
+    const newerCtx = makeApplied();
+    const newerReason = guardOf(newerCtx)({
+      name: "grep",
+      arguments: { path: newer },
+      agent: { session: { id: "probe", header: { cwd: newer } } },
+    });
+    assert.notEqual(newerReason, undefined, "indexVersion=3 的索引应当被认成可检索索引");
   });
 });
 
-describe.skipIf(realRootUnavailable)("子代理共享检索解锁", () => {
+describe("子代理共享检索解锁", () => {
   it("主代理搜过之后，它的子代理立刻能用那份额度（不必自己再搜一次）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5275,7 +5258,7 @@ describe.skipIf(realRootUnavailable)("子代理共享检索解锁", () => {
   });
 });
 
-describe.skipIf(realRootUnavailable)("穷举词法检索通道", () => {
+describe("穷举词法检索通道", () => {
   it("无索引：自动改走 --rg，并在结果前显式声明这次是字面匹配", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5286,7 +5269,7 @@ describe.skipIf(realRootUnavailable)("穷举词法检索通道", () => {
     };
     assert.equal(
       ctx.shell.resolveCalls[0]?.command,
-      "zg query --rg 'hit' --limit 10 --device 'auto' --mode auto",
+      "zg --rg 'hit' --limit 10 --device 'auto' --mode auto",
     );
     assert.ok(
       out.text.startsWith(MESSAGES.zh.exhaustiveFallbackNote),
@@ -5330,11 +5313,11 @@ describe.skipIf(realRootUnavailable)("穷举词法检索通道", () => {
       { root, query: "hi", rg: true },
       execOf(root),
     )) as { text: string };
-    assert.ok((ctx.shell.resolveCalls[0]?.command ?? "").startsWith("zg query --rg 'hi'"));
+    assert.ok((ctx.shell.resolveCalls[0]?.command ?? "").startsWith("zg --rg 'hi'"));
     assert.equal(out.text, "RESULT", "模型自己要的就不要再加旁白");
   });
 
-  it("rg=false 显式只要索引检索：无索引时不静默改道，交给 zg 报未建索引", async () => {
+  it("rg=false 显式只要索引检索：无索引时不会静默改道，交给 zg 报未建索引", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = bareWs();
@@ -5343,7 +5326,7 @@ describe.skipIf(realRootUnavailable)("穷举词法检索通道", () => {
     assert.ok(!(ctx.shell.resolveCalls[0]?.command ?? "").includes("--rg"));
   });
 
-  it("rg 给了非法类型即报错，绝不静默当成「没给」而换掉通道", async () => {
+  it("rg 给了非法类型即报错，绝不会静默当成「没给」而换掉通道", async () => {
     // 静默当「没给」的后果不是报错而是**换通道**：已建索引的工作区会把模型要的逐行字面
     // 匹配换成语义检索，无索引时反过来——退出码 0、答案形态与请求不符，正是上面那条
     // 自动改道声明要避免的静默错误答案。两个方向都钉一遍。
@@ -5396,7 +5379,7 @@ describe.skipIf(realRootUnavailable)("穷举词法检索通道", () => {
     assert.equal(reason, undefined, "索引检索成功后 grep/rg 应被放行");
   });
 
-  it("穷举模式收到索引侧参数即在构造阶段拒绝（不静默丢弃，也不丢给 zg 去失败）", async () => {
+  it("穷举模式收到索引侧参数即在构造阶段拒绝（不会静默丢弃，也不丢给 zg 去失败）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = bareWs();
@@ -5420,7 +5403,7 @@ async function searchIn(ctx: MockCtx, root: string, cwd?: string): Promise<unkno
   return toolOf(ctx, "zg_search").execute({ root, query: "x" }, execOf(cwd));
 }
 
-describe.skipIf(realRootUnavailable)("root 授权", () => {
+describe("root 授权", () => {
   it("缺省 root（会话工作区本身）：放行", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -5536,8 +5519,8 @@ describe.skipIf(realRootUnavailable)("root 授权", () => {
 
 // ── 重建期检索通道 ──────────────────────────────────────────────────────────
 
-describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
-  it("等待期间被取消：按中止收口而不是继续挂着", async () => {
+describe("重建期检索通道", () => {
+  it("等待期间被取消：按中止统一处理而不是继续挂着", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws();
@@ -5579,14 +5562,14 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
       (error: unknown) => {
         const text = (error as Error).message;
         assert.match(text, /正被其他操作占用/u);
-        assert.match(text, /ownerOperation: context\.refresh/u);
-        assert.match(text, /LOCK\.BUSY/u, "原始失败原文必须随行，不吞证据");
+        assert.match(text, /operation: context\.refresh/u);
+        assert.match(text, /RESOURCE_BUSY/u, "原始失败原文必须随行，不吞证据");
         return true;
       },
     );
   });
 
-  it("锁忙回执缺 ownerOperation：占锁方按 unknown 点名，不退回裸失败", async () => {
+  it("锁忙回执缺 ownerOperation：占锁方按 unknown 点名，不退回成只说失败、不说原因的那句", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws();
@@ -5594,7 +5577,7 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
     ctx.shell.runResults.push(lockBusyRun(null));
     await assert.rejects(
       () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
-      /ownerOperation: unknown[\s\S]*LOCK\.BUSY/u,
+      /operation: unknown[\s\S]*RESOURCE_BUSY/u,
     );
   });
 
@@ -5609,9 +5592,9 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
     await started.release();
   });
 
-  it("祖先根在重建：子目录的状态查询也给合成投影（等待与门禁必须是同一个口径）", async () => {
-    // 门禁那一侧先 findIndexRoot 找到祖先索引根，本来就会放行；等待/投影若还按精确键查，
-    // 子目录查询就会漏掉那条重建、撞一条裸 LOCK.BUSY。
+  it("祖先根在重建：子目录的状态查询也给合成投影（等待与门禁必须是同一个规则）", async () => {
+    // 门禁里先 findIndexRoot 找到祖先索引根，本来就会放行；等待/投影若还按精确键查，
+    // 子目录查询就会漏掉那条重建、撞上 LOCK.BUSY 这一个码。
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("anc");
@@ -5832,13 +5815,13 @@ describe.skipIf(realRootUnavailable)("重建期检索通道", () => {
   });
 });
 
-describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", () => {
+describe("守护进程（zg server）就绪门槛", () => {
   it("守护进程缺席：background 在构造期即拒，那条会静默关掉刷新的命令不发出去", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("bg-offline");
     const before = ctx.shell.resolveCalls.length;
-    await assert.rejects(() => backgroundSearch(ctx, root), /zg server on/u);
+    await assert.rejects(() => backgroundSearch(ctx, root), /zg --server on/u);
     assert.equal(ctx.shell.resolveCalls.length, before, "被拒的调用不该把命令发出去");
     assert.equal(ctx.shell.serverProbeCalls.length, 1, "为这一档起了一发就绪探测");
     assert.equal(
@@ -5868,9 +5851,11 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     );
   });
 
-  it("守护进程就绪：background 照常下发 --refresh background", async () => {
+  it("守护进程就绪：background 照常下发 --refresh background（CLI 档；auto 档此时走 MCP，见传输判定组）", async () => {
     const ctx = makeCtx();
-    applyTo(ctx);
+    // 传输钉在 cli：这条用例验证的是 CLI 通道的命令构造。auto 档下 daemon 就绪会走 MCP
+    // （那条 lane 没有命令行可言），传输判定的用例归 searchLaneOf 自己的套件。
+    applyTo(ctx, { transport: "cli" });
     ctx.shell.serverReady = true;
     const root = ws("bg-ready");
     ctx.shell.runResults.push(okRun("hits: 1"));
@@ -5880,19 +5865,21 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
   });
 
   it("clientMode 被钉死 direct：background 拒在 mode-direct 那一档，且不起探测", async () => {
-    // 这一档叫用户去 `zg server on` 是指错方向的：模式是行 config 定的，守护进程起也到不了
+    // 这一档叫用户去 `zg --server on` 是指错方向的：模式是行 config 定的，守护进程起也到不了
     // server 模式。既然结论与探测结果无关，就不该为它花一发子进程。
     const ctx = makeCtx();
     applyTo(ctx, { clientMode: "direct" });
     const root = ws("bg-pinned");
     await assert.rejects(() => backgroundSearch(ctx, root), /clientMode/u);
-    assert.equal(ctx.shell.serverProbeCalls.length, 0, "模式已经判死了，探测无从改变结论");
+    // transport=auto 的传输判定先探一发（它决定走 MCP 还是 CLI，与 refresh 无关）；
+    // backgroundSupportFor 的 mode-direct 拒绝发生在 lane 判定**之后**，不再额外起探测。
+    assert.equal(ctx.shell.serverProbeCalls.length, 1, "传输判定起了一发探测");
     await assert.rejects(
       () => backgroundSearch(ctx, root),
       (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
         assert.ok(
-          !message.includes("zg server on"),
+          !message.includes("zg --server on"),
           "钉死 direct 时不该给出「去起守护进程」那句出路",
         );
         return true;
@@ -5900,13 +5887,25 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     );
   });
 
-  it("缺省 refresh 不为没人要的档位起探测", async () => {
+  it("auto 档的索引通道为传输判定起探测（TTL 内共享；CLI 落回时 --refresh wait 照旧）", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("bg-default");
-    ctx.shell.runResults.push(okRun("hits: 0"));
+    ctx.shell.runResults.push(okRun(HIT_A));
     await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
-    assert.equal(ctx.shell.serverProbeCalls.length, 0, "wait 用不到守护进程，不必探");
+    // transport=auto：daemon 缺席 → CLI。这一发探测是传输判定（它决定 MCP/CLI），
+    // 与 refresh 无关；refresh=background 那一档的探测由 backgroundSupportFor 另算。
+    assert.equal(ctx.shell.serverProbeCalls.length, 1, "auto 档的传输判定探了一发");
+    assert.match(String(ctx.shell.resolveCalls[0]?.command), /--refresh wait/u);
+  });
+
+  it("transport=cli 档不起传输判定探测（恒走 CLI，探测是白给的开销）", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "cli" });
+    const root = ws("bg-cli");
+    ctx.shell.runResults.push(okRun(HIT_A));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.equal(ctx.shell.serverProbeCalls.length, 0, "cli 档不探测");
     assert.match(String(ctx.shell.resolveCalls[0]?.command), /--refresh wait/u);
   });
 
@@ -5914,20 +5913,20 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("bg-ttl");
-    await assert.rejects(() => backgroundSearch(ctx, root), /zg server on/u);
-    await assert.rejects(() => backgroundSearch(ctx, root), /zg server on/u);
+    await assert.rejects(() => backgroundSearch(ctx, root), /zg --server on/u);
+    await assert.rejects(() => backgroundSearch(ctx, root), /zg --server on/u);
     assert.equal(ctx.shell.serverProbeCalls.length, 1, "第二次走的是缓存");
   });
 
-  it("探测自身失败按未就绪收口，不外抛基础设施故障", async () => {
+  it("探测自身失败按未就绪统一处理，不外抛基础设施故障", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     ctx.shell.serverProbeThrows = true;
     const root = ws("bg-probe-throw");
     await assert.rejects(
       () => backgroundSearch(ctx, root),
-      /zg server on/u,
-      "模型该拿到的是收口文案，而不是 spawn 失败",
+      /zg --server on/u,
+      "模型该拿到的是统一处理文案，而不是 spawn 失败",
     );
   });
 
@@ -5944,7 +5943,7 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     );
   });
 
-  it("zg_status 尾部回显就绪态：就绪与未就绪两臂各说各的", async () => {
+  it("zg_status 尾部回显就绪态：就绪与未就绪两分支各说各的", async () => {
     const offline = makeCtx();
     applyTo(offline);
     const root = ws("status-daemon");
@@ -5953,7 +5952,7 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
       text: string;
     };
     assert.ok(off.text.endsWith(MESSAGES.zh.serverUnavailableNote), "未就绪要说清后果与出路");
-    assert.match(off.text, /zg server on/u);
+    assert.match(off.text, /zg --server on/u);
 
     const ready = makeCtx();
     applyTo(ready);
@@ -5966,7 +5965,7 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     assert.ok(!on.text.includes(MESSAGES.zh.serverUnavailableNote), "就绪时不报未就绪的文案");
   });
 
-  it("重建期合成投影那一臂不另起探测：契约本就是「不启子进程」", async () => {
+  it("重建期合成投影那一条分支不另起探测：契约本就是「不启子进程」", async () => {
     const ctx = makeCtx();
     applyTo(ctx);
     const root = ws("status-rebuild");
@@ -5980,7 +5979,7 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     assert.equal(
       ctx.shell.serverProbeCalls.length,
       before,
-      "这一臂连 zg status 都不起子进程，守护进程探测也不该起",
+      "这一分支连 zg status 都不起子进程，守护进程探测也不该起",
     );
   });
 
@@ -5994,5 +5993,1222 @@ describe.skipIf(realRootUnavailable)("守护进程（zg server）就绪门槛", 
     ready.shell.serverReady = true;
     const on = await fetchAccess(ready);
     assert.equal(on.serverReady, true);
+  });
+});
+
+// ── 传输判定与 MCP lane（0.3.0 起）──
+//
+// fetch 经 vi.stubGlobal 替换：daemonClient 在 apply 期绑定 globalThis.fetch，桩须先于
+// apply 落位。会话握手 + tools/call 的应答形状与 lib/daemon-client.test.ts 同一套。
+
+/** MCP fetch 桩：握手/通知受理、tools/call 按脚本应答；记录请求头与调用体。 */
+function stubDaemonFetch(script: { text: string; isError: boolean }[]): {
+  calls: { authorization: string | undefined; body: string }[];
+} {
+  const calls: { authorization: string | undefined; body: string }[] = [];
+  const impl = (async (_url: unknown, init: unknown) => {
+    const headers = (init as { headers?: Record<string, string> }).headers ?? {};
+    const body: string = (init as { body?: string }).body ?? "";
+    const authorization: string | undefined = headers["Authorization"];
+    calls.push({ authorization, body });
+    const request = JSON.parse(body) as { id?: number; method?: string };
+    if (request.method === "initialize") {
+      return new Response(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 0, result: {} })}\n\n`, {
+        status: 200,
+        headers: { "content-type": SSE_CONTENT_TYPE, "mcp-session-id": "sess-h" },
+      });
+    }
+    if (request.method === INITIALIZED_METHOD) {
+      return new Response("", { status: 202 });
+    }
+    const reply = script.shift() ?? { text: "unexpected", isError: true };
+    return new Response(
+      `data: ${JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id ?? -1,
+        result: { content: [{ type: "text", text: reply.text }], isError: reply.isError },
+      })}\n\n`,
+      { status: 200, headers: { "content-type": SSE_CONTENT_TYPE } },
+    );
+  }) as unknown as typeof fetch;
+  vi.stubGlobal("fetch", impl);
+  return { calls };
+}
+
+describe("传输判定与 MCP lane", () => {
+  // token 持久化会读写 ZVEC_GREP_HOME：整个套件指向一个临时 home，避免碰用户真实的
+  // ~/.zvec-grep。套件级目录必须就地配 afterAll 回收（wsForSuite 的文档约束）。
+  const suiteHome = wsForSuite("zg-host-home-");
+  const previousHome = process.env["ZVEC_GREP_HOME"];
+  beforeAll(() => {
+    process.env["ZVEC_GREP_HOME"] = suiteHome;
+  });
+
+  // 认领语义把「文件存在」当成「已有宿主先到」：同一 suite 共用一个 home，上一条用例
+  // 留下的 token 会让下一条的 claim 变成 owned=false，卸载路径就都不发 off。逐条清空，
+  // 让每条用例都从「本进程第一个认领者」开始；要预置文件的用例自己在用例内写。
+  beforeEach(async () => {
+    await clearPersistedToken(tokenFilePath());
+  });
+
+  afterAll(() => {
+    if (previousHome === undefined) {
+      delete process.env["ZVEC_GREP_HOME"];
+    } else {
+      process.env["ZVEC_GREP_HOME"] = previousHome;
+    }
+    rmSync(suiteHome, { recursive: true, force: true });
+  });
+
+  it("auto 档 + daemon 就绪：索引通道检索走 MCP（无 CLI 命令递出），成功文本带命中摘要", async () => {
+    const { calls } = stubDaemonFetch([
+      { text: "#1 a.ts:1-1\nsymbol: [function] a", isError: false },
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-auto");
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.equal(ctx.shell.resolveCalls.length, 0, "MCP lane 不经 shell 执行器");
+    assert.ok(calls.length > 0, "fetch 桩应被 daemon client 调到");
+    assert.equal(calls[0]?.authorization, undefined, "非插件自启的 daemon 无 token，不带鉴权头");
+    assert.match(out.text, /命中摘要/u);
+    assert.match(out.text, /去重后 1 个不同位置/u);
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=cli：恒走 CLI，fetch 桩不被触到", async () => {
+    const { calls } = stubDaemonFetch([]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "cli" });
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-cli");
+    ctx.shell.runResults.push(okRun(HIT_A));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.equal(ctx.shell.resolveCalls.length, 1, "cli 档走 shell 执行器");
+    assert.equal(calls.length, 0, "cli 档不触 fetch");
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp + daemon 缺席：自动拉起（zg --server on + token env），起不来明确报错不回退", async () => {
+    stubDaemonFetch([]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-start");
+    // serverReady=false：ensure 走拉起；拉起命令退出非零 → daemonStartFailed
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "port busy", truncated: false },
+    });
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /自动拉起失败[\s\S]*port busy/u,
+    );
+    const startCall = ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND);
+    assert.ok(startCall !== undefined, "拉起命令是 zg --server on");
+    const issued = startCall.env?.["ZVEC_GREP_SERVER_TOKEN"] ?? "";
+    assert.match(
+      issued,
+      /^[0-9a-f]{48}$/u,
+      "自启 token 是 48 位 hex（randomBytes(24)），只经 env 下发",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp lane 的锁忙错误（重建占锁）走重建等待后重试", async () => {
+    const { calls } = stubDaemonFetch([
+      {
+        text: "error[ZG.ENGINE.RESOURCE_BUSY]: lock is busy: lock=/x.lock operation=index.rebuild",
+        isError: true,
+      },
+      { text: HIT_A, isError: false },
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-lock");
+    const inflight = await rebuildInFlight(ctx, root);
+    // 先让检索跑到「等重建落定」那一步，再落定：顺序反了它根本不会走等待分支。
+    // MCP lane 比 CLI 多一道 serverGate 探测（async），固定 tick 数不可靠——轮询到
+    // fetch 桩被消费（第一发锁忙应答已交出）再多让几轮微任务（catch + wait 注册），
+    // 然后才落定重建。
+    const pending = toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    // 递归让出微任务直到 fetch 桩被消费（no-await-in-loop 不许循环里 await）。
+    const waitUntilCalled = async (left: number): Promise<void> => {
+      if (left <= 0 || calls.length > 0) {
+        return;
+      }
+      await microTicks(4);
+      return waitUntilCalled(left - 1);
+    };
+    await waitUntilCalled(200);
+    await microTicks(20);
+    await inflight.release();
+    const out = (await pending) as { text: string };
+    assert.match(out.text, /命中摘要/u, "重试成功");
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp lane 的授权拒绝（PERMISSION_DENIED）补部署开关与 grant 指引", async () => {
+    stubDaemonFetch([
+      {
+        text: "error[ZG.ENGINE.PERMISSION_DENIED]: Remote embedding authorization required for qwen/text-embedding-v4",
+        isError: true,
+      },
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-auth");
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /remoteAuthDenied|授权拦下|allowRemoteEmbedding/u,
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp lane 的通用错误文本折成 genericFailure；超时 AbortError 归因超时；大文本截尾打标", async () => {
+    // 通用错误（无锁/授权语义）→ genericFailure 原样带文本
+    stubDaemonFetch([{ text: "Error: model download failed and no code line", isError: true }]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-generic");
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /执行失败（exit=1）[\s\S]*model download failed/u,
+    );
+    vi.unstubAllGlobals();
+
+    // fetch 抛 AbortError 且 signal 未中止 → 超时预算耗尽 → timeoutFailure
+    vi.stubGlobal("fetch", async () => {
+      throw Object.assign(new Error("budget elapsed"), { name: "AbortError" });
+    });
+    const ctx2 = makeCtx();
+    applyTo(ctx2);
+    ctx2.shell.serverReady = true;
+    await assert.rejects(
+      () => toolOf(ctx2, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /超时/u,
+    );
+    vi.unstubAllGlobals();
+
+    // 大文本：超过 stdoutMaxBytes 就地截尾并打标（MCP 无 spill）
+    stubDaemonFetch([{ text: `#1 a.ts:1-1\n${"x".repeat(500_000)}`, isError: false }]);
+    const ctx3 = makeCtx();
+    applyTo(ctx3, { stdoutMaxBytes: 1000 });
+    ctx3.shell.serverReady = true;
+    const out = (await toolOf(ctx3, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.match(out.text, /截断/u, "超限要打标");
+    assert.ok(out.text.length < 500_000, "文本确实被裁过");
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp lane 的错误详情超长时首尾各留一段；非重建占锁点名操作名", async () => {
+    // 超长错误文本：详情走首尾各 400 的裁剪（detailMiddle），原文保留在两端
+    stubDaemonFetch([{ text: `error[ZG.ENGINE.INTERNAL]: ${"y".repeat(2000)}`, isError: true }]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-long");
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      (error: unknown) => {
+        const text = (error as Error).message;
+        assert.match(text, /中间省略/u, "超长详情首尾各留一段");
+        assert.ok(text.includes("yyyy"), "首段保留");
+        return true;
+      },
+    );
+    vi.unstubAllGlobals();
+
+    // 非重建占锁（context.refresh）：点名占锁方，原始失败随行，不排队等待
+    stubDaemonFetch([
+      {
+        text: "error[ZG.ENGINE.RESOURCE_BUSY]: lock is busy: lock=/x.lock operation=context.refresh",
+        isError: true,
+      },
+    ]);
+    const ctx2 = makeCtx();
+    applyTo(ctx2);
+    ctx2.shell.serverReady = true;
+    await assert.rejects(
+      () => toolOf(ctx2, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /正被其他操作占用[\s\S]*context\.refresh/u,
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp lane 的锁忙文本缺 operation=：占锁方按 unknown 点名", async () => {
+    stubDaemonFetch([
+      { text: "error[ZG.ENGINE.RESOURCE_BUSY]: lock is busy: lock=/x.lock", isError: true },
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-noop");
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+      /operation: unknown/u,
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp lane 成功但输出无 #N 头行：无注脚原样返回（daemonSuccessText 的空 notes 臂）；外部中止归因 aborted", async () => {
+    // 成功但无 #N 头行（例如穷举形态的纯文本）→ 无摘要无截尾 → 原样
+    stubDaemonFetch([{ text: "plain daemon text without hit headers", isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-plain");
+    const out = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi", rg: false },
+      execOf(root),
+    )) as { text: string };
+    assert.equal(out.text, "plain daemon text without hit headers", "无注脚原样返回");
+    vi.unstubAllGlobals();
+
+    // 外部 signal 已中止 → fetch 抛 AbortError 且 signal.aborted=true → abortedFailure
+    const controller = new AbortController();
+    controller.abort();
+    vi.stubGlobal("fetch", async () => {
+      throw Object.assign(new Error("aborted"), { name: "AbortError" });
+    });
+    const ctx2 = makeCtx();
+    applyTo(ctx2);
+    ctx2.shell.serverReady = true;
+    await assert.rejects(
+      () =>
+        toolOf(ctx2, "zg_search").execute(
+          { root, query: "hi", rg: false },
+          { ...execOf(root), signal: controller.signal },
+        ),
+      /被中止/u,
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("cli 档的后台索引：daemonEnv 交 undefined（无自启 token），spawn env 不带 TOKEN", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "cli" });
+    const root = ws("bg-routes");
+    ctx.shell.runResults.push(okRun(HIT_A));
+    const out = (await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, background: true },
+      execOf(root),
+    )) as { text: string };
+    assert.match(out.text, /已在后台为/u);
+    // startBackgroundIndex 的 routes.daemonEnv 被调用（undefined 臂——cli 档无自启 token）
+    assert.equal(
+      ctx.shell.resolveCalls.find((row) => row.command.startsWith(INDEX_COMMAND_PREFIX))?.env?.[
+        "ZVEC_GREP_SERVER_TOKEN"
+      ],
+      undefined,
+      "cli 档无 token，spawn env 不带它",
+    );
+  });
+
+  it("transport=mcp 自启后的模型侧后台索引：daemonEnv 把自启 token 带进 spawn env", async () => {
+    // transport=mcp 自启成功（token 留存）后，模型侧 background=true 的 spawn env 带同一枚。
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    const root = ws("bg-routes-tok");
+    // 先跑一次检索（rg=false 强制索引通道）触发自启并留存 token，再起后台索引。
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    // 版本门 TTL（10min）推过之后，第二次工具调用的版本重探带上自启 token
+    // （probeZgVersion 的 token-present 臂）：mock 对 zg --version 交回健康应答。
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(11 * 60_000);
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    try {
+      await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    } finally {
+      vi.useRealTimers();
+    }
+    ctx.shell.runResults.push(okRun(HIT_A));
+    const out = (await toolOf(ctx, "zg_index").execute(
+      { root, confirm: true, background: true },
+      execOf(root),
+    )) as { text: string };
+    assert.match(out.text, /已在后台为/u);
+    const issued = ctx.shell.resolveCalls.find((row) =>
+      row.command.startsWith(INDEX_COMMAND_PREFIX),
+    )?.env?.["ZVEC_GREP_SERVER_TOKEN"];
+    assert.match(
+      issued ?? "",
+      /^[0-9a-f]{48}$/u,
+      "自启 token 经 startBackgroundIndex 的 daemonEnv 下发",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp lane 成功且无索引 root：不发配额（grant 的 false 臂）", async () => {
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = bareWs("mcp-noidx");
+    // rg=false 强制索引通道（无索引时缺省会自动改道穷举，就到不了 MCP lane）
+    const out = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi", rg: false },
+      execOf(root),
+    )) as { text: string };
+    assert.match(out.text, /命中摘要/u);
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp 自启后的后台重建：daemonEnv 把自启 token 带进 spawn env", async () => {
+    // 先造一个「插件自启成功」的态：transport=mcp + daemon 缺席 + 拉起退 0 + 二次探测过。
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReady = false;
+    const root = ws("mcp-tok");
+    // 拉起命令退 0；serverGate 失效后重探——把 mock 置 true 使 ensure 通过并留存 token。
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    // 时序：ensure 先探（false）→ 生成 token → spawn on（退 0）→ invalidate → 重探读 true
+    //（mock 的 autoFlip 让第二次探测起翻面）→ ensure 通过、token 留存。
+    ctx.shell.serverReadyAutoFlip = true;
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    const inflight = await rebuildInFlight(ctx, root);
+    const spawnCall = ctx.shell.resolveCalls.find((row) =>
+      row.command.startsWith(INDEX_COMMAND_PREFIX),
+    );
+    assert.ok(spawnCall !== undefined, "后台重建起了 CLI 命令");
+    const issued = spawnCall.env?.["ZVEC_GREP_SERVER_TOKEN"] ?? "";
+    assert.match(issued, /^[0-9a-f]{48}$/u, "自启后的后台写必须带同一枚 token");
+    // token 只许走 env：官方作业的 label 是命令本身，回显在 job_list / 卡片里。
+    const jobId = ctx.jobIds.at(-1);
+    const view = ctx.jobs.list().find((job) => job.id === jobId);
+    assert.ok(view !== undefined, "后台作业已登记");
+    assert.ok(!view.label.includes(issued), "token 不得进官方作业的 label");
+    await inflight.release();
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp 拉起命令退 0 但探测仍不过：token 留在文件里，重试沿用同一枚", async () => {
+    stubDaemonFetch([]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-stale");
+    // serverReady=false：拉起命令退 0（runResults 第一条），但二次探测仍 false（serverReady 未变）
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /exited 0 but the readiness probe still fails/u,
+    );
+    // 失败后内存 token 被收回，但持久化文件仍在；重试从文件读回同一枚（不再另生成）。
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "again", truncated: false },
+    });
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /自动拉起失败/u,
+    );
+    const startCalls = ctx.shell.resolveCalls.filter((row) => row.command === SERVER_START_COMMAND);
+    const retryCall = startCalls.at(-1);
+    const firstToken = startCalls[0]?.env?.["ZVEC_GREP_SERVER_TOKEN"];
+    assert.equal(
+      retryCall?.env?.["ZVEC_GREP_SERVER_TOKEN"],
+      firstToken,
+      "持久化 token 让重试沿用同一枚",
+    );
+    rmSync(tokenFilePath(), { force: true });
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp 并发冷启动：只拉起一次 daemon，两个 agent 各用一条会话并行拿到结果", async () => {
+    const { calls } = stubDaemonFetch([
+      { text: HIT_A, isError: false },
+      { text: HIT_A, isError: false },
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReadyAutoFlip = true;
+    // 一次冷启动只应消费一条 `zg --server on` 的结果；第二个并发调用共享同一条在途 promise。
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    const root = ws("mcp-concurrent");
+    const [first, second] = await Promise.all([
+      toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)) as Promise<{
+        text: string;
+      }>,
+      toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)) as Promise<{
+        text: string;
+      }>,
+    ]);
+    assert.match(first.text, /命中摘要/u, "第一个并发调用成功");
+    assert.match(second.text, /命中摘要/u, "第二个并发调用成功");
+    const startCalls = ctx.shell.resolveCalls.filter((row) => row.command === SERVER_START_COMMAND);
+    assert.equal(startCalls.length, 1, "并发冷启动只能拉起一次 daemon");
+    assert.match(
+      startCalls[0]?.env?.["ZVEC_GREP_SERVER_TOKEN"] ?? "",
+      /^[0-9a-f]{48}$/u,
+      "两个调用共用同一枚 token",
+    );
+    assert.equal(
+      calls.filter((call) => call.body.includes('"method":"initialize"')).length,
+      2,
+      "并发调用各用一条 MCP 会话（同会话并发会被上游串行化）",
+    );
+    assert.equal(
+      calls.filter((call) => call.body.includes('"method":"tools/call"')).length,
+      2,
+      "两次检索都真的发到了 daemon",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp：共享 daemon 被另一宿主停掉后，同一次调用内重新 ensure 并重试成功", async () => {
+    let sessions = 0;
+    let toolAttempts = 0;
+    vi.stubGlobal("fetch", async (_url: unknown, init: unknown) => {
+      const body: string = (init as { body?: string }).body ?? "";
+      const request = JSON.parse(body) as { id?: number; method?: string };
+      if (request.method === "initialize") {
+        sessions += 1;
+        return new Response(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 0, result: {} })}\n\n`, {
+          status: 200,
+          headers: { "content-type": SSE_CONTENT_TYPE, "mcp-session-id": `sess-${sessions}` },
+        });
+      }
+      if (request.method === INITIALIZED_METHOD) {
+        return new Response("", { status: 202 });
+      }
+      toolAttempts += 1;
+      // daemon-client 自身会对传输失败换会话重试一次；前两发都失败后它把错误交给
+      // tryDaemonLane，由后者重新 ensure（另一宿主停掉共享 daemon 的场景）再试第三发。
+      if (toolAttempts <= 2) {
+        throw new TypeError("fetch failed: ECONNREFUSED");
+      }
+      return new Response(
+        `data: ${JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id ?? -1,
+          result: { content: [{ type: "text", text: HIT_A }], isError: false },
+        })}\n\n`,
+        { status: 200, headers: { "content-type": SSE_CONTENT_TYPE } },
+      );
+    });
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-reconnect");
+    const out = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi", rg: false },
+      execOf(root),
+    )) as { text: string };
+    assert.match(out.text, /命中摘要/u, "第三发成功后仍返回正常结果");
+    assert.equal(toolAttempts, 3, "两次内部失败 + 一次显式 mcp 重连重试");
+    vi.unstubAllGlobals();
+  });
+
+  it("自启命令的基础设施失败折成 daemonStartFailed，并脱敏 token", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-start-throw");
+    const originalExecute = ctx.shell.execute;
+    ctx.shell.execute = async (rawSpec: unknown) => {
+      const spec = rawSpec as ResolveRequest;
+      if (spec.command === SERVER_START_COMMAND) {
+        throw new Error(`spawn failed for ${spec.env?.["ZVEC_GREP_SERVER_TOKEN"] ?? ""}`);
+      }
+      return originalExecute(rawSpec);
+    };
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /自动拉起失败/u);
+        assert.match(message, /spawn failed/u);
+        assert.ok(message.includes("[token]"), "回显里的 token 被脱敏");
+        return true;
+      },
+    );
+  });
+
+  it("拉起期间另一宿主写入新 token：探测前对齐并成功，卸载不停止共享 daemon", async () => {
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    const root = ws("mcp-adopt");
+    const shared = "b".repeat(48);
+    const originalExecute = ctx.shell.execute;
+    ctx.shell.execute = async (rawSpec: unknown) => {
+      const spec = rawSpec as ResolveRequest;
+      // 模拟另一宿主在本次拉起期间抢到了 token 文件。
+      if (spec.command === SERVER_START_COMMAND) {
+        await persistToken(tokenFilePath(), shared);
+      }
+      return originalExecute(rawSpec);
+    };
+    const out = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi", rg: false },
+      execOf(root),
+    )) as { text: string };
+    assert.match(out.text, /命中摘要/u);
+    assert.equal(await readPersistedToken(tokenFilePath()), shared, "文件里的生效 token");
+    const startToken = ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND)
+      ?.env?.["ZVEC_GREP_SERVER_TOKEN"];
+    assert.notEqual(startToken, shared, "本次拉起用的是先认领的 token");
+    await Promise.all(ctx.effectDisposers.map((dispose) => dispose()));
+    assert.equal(
+      ctx.shell.resolveCalls.some((row) => row.command === SERVER_STOP_COMMAND),
+      false,
+      "生效 token 已被另一宿主替换，本进程不认定自启、不停共享 daemon",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("拉起期间 token 文件消失：用内存 token 探活并认定自启", async () => {
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    const root = ws("mcp-token-gone");
+    const originalExecute = ctx.shell.execute;
+    ctx.shell.execute = async (rawSpec: unknown) => {
+      const spec = rawSpec as ResolveRequest;
+      if (spec.command === SERVER_START_COMMAND) {
+        rmSync(tokenFilePath(), { force: true });
+      }
+      return originalExecute(rawSpec);
+    };
+    const out = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi", rg: false },
+      execOf(root),
+    )) as { text: string };
+    assert.match(out.text, /命中摘要/u);
+    await Promise.all(ctx.effectDisposers.map((dispose) => dispose()));
+    assert.ok(
+      ctx.shell.resolveCalls.some((row) => row.command === SERVER_STOP_COMMAND),
+      "文件消失不改变「本次自启」的认定，卸载仍会停 daemon",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp + daemon 就绪：ensure 直接通过，检索走 MCP；files 通道恒走 CLI", async () => {
+    // transport=mcp + daemon 在场：ensure 的 ready 分支直接通过（不拉起）
+    const { calls } = stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-ready");
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.equal(calls.length, 3, "新 apply 即新客户端：握手 + 通知 + 调用三发");
+    assert.match(out.text, /命中摘要/u);
+    vi.unstubAllGlobals();
+
+    // files 通道恒走 CLI（上游 --files 是 direct 语义，MCP 面没有对应工具）
+    const ctx2 = makeCtx();
+    applyTo(ctx2);
+    ctx2.shell.serverReady = true;
+    ctx2.shell.runResults.push(okRun("a.ts\nb.ts"));
+    const filesOut = (await toolOf(ctx2, "zg_search").execute(
+      { root, files: true },
+      execOf(root),
+    )) as { text: string };
+    assert.equal(ctx2.shell.resolveCalls.length, 1, "files 通道起了一条 CLI 命令");
+    assert.match(String(ctx2.shell.resolveCalls[0]?.command), /--rg --files/u);
+    assert.ok(!filesOut.text.includes("命中摘要"), "文件清单没有 #N 头行，不出摘要");
+  });
+
+  it("transport=mcp 拉起命令退非零且 stderr 空：detail 用 exit 码兜底；锁忙非重建点名占锁方", async () => {
+    // 拉起失败且 stderr 空：detail 折成 `exit N`
+    stubDaemonFetch([]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-silent");
+    ctx.shell.runResults.push({
+      exitCode: 7,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "", truncated: false },
+    });
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /exit 7/u,
+    );
+    vi.unstubAllGlobals();
+
+    // MCP 错误文本锁忙但占锁方是普通索引（非重建）：点名操作名、不排队
+    stubDaemonFetch([
+      {
+        text: "error[ZG.ENGINE.RESOURCE_BUSY]: lock is busy: lock=/x.lock operation=index",
+        isError: true,
+      },
+    ]);
+    const ctx2 = makeCtx();
+    applyTo(ctx2);
+    ctx2.shell.serverReady = true;
+    await assert.rejects(
+      () => toolOf(ctx2, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+      /正被其他操作占用[\s\S]*operation: index/u,
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp 自启后：前台 zg_status / zg_index / 穷举检索的 CLI 子进程都带同一枚 token", async () => {
+    // 根因回归：自启 daemon 的 token 只在探测与后台写路径上被带进 env，三条前台 CLI
+    // 通道各写各的，于是 zg --status/--index 以 --mode auto 撞上带鉴权的 daemon 时返回 401。
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-fg-token");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    // 先跑一次索引通道检索触发自启并留存 token（该次走 MCP，不消耗 runResults 队列）。
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    const startToken = ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND)
+      ?.env?.["ZVEC_GREP_SERVER_TOKEN"];
+    assert.match(startToken ?? "", /^[0-9a-f]{48}$/u, "自启 token 是 48 位 hex");
+
+    ctx.shell.runResults.push(okRun("STATUS"), okRun("INDEX"), okRun("RG"));
+    await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: true }, execOf(root));
+
+    const statusCall = ctx.shell.resolveCalls.find((row) => row.command.startsWith("zg --status"));
+    const indexCall = ctx.shell.resolveCalls.find((row) => row.command.startsWith("zg --index"));
+    const rgCall = ctx.shell.resolveCalls.find((row) => row.command.startsWith("zg --rg"));
+    for (const [name, call] of [
+      ["zg_status", statusCall],
+      ["zg_index", indexCall],
+      ["zg --rg", rgCall],
+    ] as const) {
+      assert.equal(
+        call?.env?.["ZVEC_GREP_SERVER_TOKEN"],
+        startToken,
+        `${name} 必须与自启 daemon 的 token 同源`,
+      );
+    }
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=cli：前台三通道不带 ZVEC_GREP_SERVER_TOKEN", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "cli" });
+    const root = ws("cli-fg-notoken");
+    ctx.shell.runResults.push(okRun("STATUS"), okRun("INDEX"), okRun("RG"));
+    await toolOf(ctx, "zg_status").execute({ root }, execOf(root));
+    await toolOf(ctx, "zg_index").execute({ root, confirm: true }, execOf(root));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: true }, execOf(root));
+    for (const call of ctx.shell.resolveCalls) {
+      assert.equal(
+        call.env?.["ZVEC_GREP_SERVER_TOKEN"],
+        undefined,
+        `${call.command} 不该带自启 token`,
+      );
+    }
+  });
+
+  it("卸载：仅对自启的 daemon 执行 zg --server off，且带同一枚 token", async () => {
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-dispose");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    const startToken = ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND)
+      ?.env?.["ZVEC_GREP_SERVER_TOKEN"];
+    assert.match(startToken ?? "", /^[0-9a-f]{48}$/u);
+
+    // 断言只关心「有没有发 off」，与各 disposer 的先后无关，故并行触发。
+    await Promise.all(ctx.effectDisposers.map((dispose) => dispose()));
+    const offCall = ctx.shell.resolveCalls.find((row) => row.command === SERVER_STOP_COMMAND);
+    assert.ok(offCall !== undefined, "自启后卸载必须停掉 daemon");
+    assert.equal(offCall.env?.["ZVEC_GREP_SERVER_TOKEN"], startToken);
+    vi.unstubAllGlobals();
+  });
+
+  it("卸载：用户自启（无 token）的 daemon 不被本插件停掉", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const root = ws("cli-dispose");
+    ctx.shell.runResults.push(okRun(HIT_A));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: true }, execOf(root));
+    await Promise.all(ctx.effectDisposers.map((dispose) => dispose()));
+    assert.equal(
+      ctx.shell.resolveCalls.some((row) => row.command === SERVER_STOP_COMMAND),
+      false,
+      "没有自启 token 就没有 stopping 权限，也不该去动用户的 daemon",
+    );
+  });
+
+  it("自启失败：上游回显的 token 在回给模型的文案里被脱敏，token 也不进 argv/label", async () => {
+    stubDaemonFetch([]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-redact-start");
+    // 拉起命令的 stderr 在**执行后**才含 token（token 是插件刚生成的，测试事先不知道）：
+    // 包装 execute，从 spec.env 取到真 token 再写进那条待交回的结果里。
+    const failure: ShellRunResult = {
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "", truncated: false },
+    };
+    ctx.shell.runResults.push(failure);
+    const originalExecute = ctx.shell.execute;
+    ctx.shell.execute = async (spec: unknown) => {
+      const proc = await originalExecute(spec);
+      const token = (spec as ResolveRequest).env?.["ZVEC_GREP_SERVER_TOKEN"];
+      if (token !== undefined) {
+        failure.stderr.text = `server rejected token ${token}`;
+      }
+      return proc;
+    };
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const startCall = ctx.shell.resolveCalls.find(
+          (row) => row.command === SERVER_START_COMMAND,
+        );
+        const token = startCall?.env?.["ZVEC_GREP_SERVER_TOKEN"] ?? "";
+        assert.match(token, /^[0-9a-f]{48}$/u, "先确认取得的是真 token");
+        assert.ok(message.includes("[token]"), "回执要标出被脱敏的位置");
+        assert.ok(!message.includes(token), TOKEN_LEAK_MESSAGE);
+        assert.ok(!(startCall?.command ?? "").includes(token), "token 不得进 argv");
+        return true;
+      },
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("mcp 失败文本回显 Bearer 时同样脱敏：token 不进工具回执", async () => {
+    // 恶意/多话的 daemon 把 Authorization 头写进错误文本：插件回给模型的那段也必须脱敏。
+    const impl = (async (_url: unknown, init: unknown) => {
+      const headers = (init as { headers?: Record<string, string> }).headers ?? {};
+      const body = JSON.parse((init as { body?: string }).body ?? "{}") as {
+        id?: number;
+        method?: string;
+      };
+      if (body.method === "initialize") {
+        return new Response(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 0, result: {} })}\n\n`, {
+          status: 200,
+          headers: { "content-type": SSE_CONTENT_TYPE, "mcp-session-id": "sess-redact" },
+        });
+      }
+      if (body.method === INITIALIZED_METHOD) {
+        return new Response("", { status: 202 });
+      }
+      const auth = headers["Authorization"] ?? "";
+      return new Response(
+        `data: ${JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id ?? -1,
+          result: {
+            content: [{ type: "text", text: `error[ZG.ENGINE.NOT_FOUND]: rejected ${auth}` }],
+            isError: true,
+          },
+        })}\n\n`,
+        { status: 200, headers: { "content-type": SSE_CONTENT_TYPE } },
+      );
+    }) as unknown as typeof fetch;
+    vi.stubGlobal("fetch", impl);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-redact-call");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const token =
+          ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND)?.env?.[
+            "ZVEC_GREP_SERVER_TOKEN"
+          ] ?? "";
+        assert.match(token, /^[0-9a-f]{48}$/u);
+        assert.ok(message.includes("[token]"), "回执要标出被脱敏的位置");
+        assert.ok(!message.includes(token), TOKEN_LEAK_MESSAGE);
+        return true;
+      },
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("卸载：停 daemon 的命令抛错被吞掉，不阻断其余清理", async () => {
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-dispose-fail");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    const originalResolve = ctx.shell.resolve;
+    let stopAttempts = 0;
+    ctx.shell.resolve = (spec) => {
+      if (spec.command === SERVER_STOP_COMMAND) {
+        stopAttempts += 1;
+        throw new Error("shell gone");
+      }
+      return originalResolve(spec);
+    };
+    // 不抛出即为通过：卸载路径的清理失败不能变成未处理拒绝。
+    await Promise.all(ctx.effectDisposers.map((dispose) => dispose()));
+    assert.equal(stopAttempts, 1, "确实尝试过停 daemon");
+    vi.unstubAllGlobals();
+  });
+
+  it("cli 通道失败：stderr 回显的自启 token 在工具回执里脱敏", async () => {
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-redact-cli");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    const token =
+      ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND)?.env?.[
+        "ZVEC_GREP_SERVER_TOKEN"
+      ] ?? "";
+    assert.match(token, /^[0-9a-f]{48}$/u);
+    const failure = okRun("");
+    failure.exitCode = 1;
+    failure.stderr.text = `zg failed with env ZVEC_GREP_SERVER_TOKEN=${token}`;
+    ctx.shell.runResults.push(failure);
+    await assert.rejects(
+      () => toolOf(ctx, "zg_status").execute({ root }, execOf(root)),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.ok(message.includes("[token]"), "CLI 失败详情要脱敏");
+        assert.ok(!message.includes(token), TOKEN_LEAK_MESSAGE);
+        return true;
+      },
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("cli 通道成功：stderr 注里的自启 token 也脱敏", async () => {
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-redact-note");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    const token =
+      ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND)?.env?.[
+        "ZVEC_GREP_SERVER_TOKEN"
+      ] ?? "";
+    assert.match(token, /^[0-9a-f]{48}$/u);
+    const result = okRun("STATUS-OK");
+    result.stderr.text = `warning: token ${token} echoed`;
+    ctx.shell.runResults.push(result);
+    const out = (await toolOf(ctx, "zg_status").execute({ root }, execOf(root))) as {
+      text: string;
+    };
+    assert.ok(out.text.includes("STATUS-OK"));
+    assert.ok(out.text.includes("[token]"), "stderr 注要脱敏");
+    assert.ok(!out.text.includes(token), TOKEN_LEAK_MESSAGE);
+    vi.unstubAllGlobals();
+  });
+
+  it("transport=mcp 自启命令按 daemonUrl 的 host:port 传 --listen（自定义端点不再起在默认 7999）", async () => {
+    stubDaemonFetch([]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp", daemonUrl: "http://127.0.0.1:17999/mcp" });
+    const root = ws("mcp-listen");
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "boom", truncated: false },
+    });
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+      /自动拉起失败/u,
+    );
+    const startCall = ctx.shell.resolveCalls.find((row) =>
+      row.command.startsWith(SERVER_START_COMMAND),
+    );
+    assert.equal(startCall?.command, "zg --server on --listen 127.0.0.1:17999");
+    vi.unstubAllGlobals();
+  });
+
+  it("daemonUrl 解析边界：无端口补默认；畸形/非 http(s)/非 /mcp 在装载期拒绝", async () => {
+    const valid = [
+      ["https://127.0.0.1/mcp", `${SERVER_START_COMMAND} --listen 127.0.0.1:443`],
+      ["http://127.0.0.1/mcp", `${SERVER_START_COMMAND} --listen 127.0.0.1:80`],
+    ] as const;
+    await Promise.all(
+      valid.map(async ([daemonUrl, expected], index) => {
+        const ctx = makeCtx();
+        applyTo(ctx, { transport: "mcp", daemonUrl });
+        const root = ws(`mcp-listen-${String(index)}`);
+        ctx.shell.runResults.push({
+          exitCode: 1,
+          stdout: { text: "", truncated: false },
+          stderr: { text: "boom", truncated: false },
+        });
+        await assert.rejects(
+          () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+          /自动拉起失败/u,
+        );
+        const startCall = ctx.shell.resolveCalls.find((row) =>
+          row.command.startsWith(SERVER_START_COMMAND),
+        );
+        assert.equal(startCall?.command, expected, daemonUrl);
+      }),
+    );
+    for (const bad of ["ftp://127.0.0.1:21/mcp", "not a url", "http://127.0.0.1:7999/other"]) {
+      const ctx = makeCtx();
+      assert.throws(
+        () => {
+          applyTo(ctx, { daemonUrl: bad });
+        },
+        /daemonUrl 不是可用的 MCP 端点/u,
+        bad,
+      );
+    }
+  });
+
+  it("auto 档 MCP 传输失败：同一次调用回退 CLI 并附可见说明；下一次仍走 CLI", async () => {
+    // 第一次：探测说就绪 → auto 走 MCP；桩返回网络层失败（非 AbortError）→ 同调用回退 CLI。
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("connect ECONNREFUSED");
+    });
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-invalidate");
+    ctx.shell.runResults.push(okRun(HIT_A));
+    const first = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.match(first.text, /回退到 CLI 通道/u);
+    assert.match(first.text, /守护进程调用失败[\s\S]*ECONNREFUSED/u);
+    assert.match(first.text, /a\.ts:1-1/u, "回退后的 CLI 真输出要交回");
+    // 缓存已失效：daemon 已死（探测改 false）时下一次直接走 CLI，不再带回退说明。
+    ctx.shell.serverReady = false;
+    ctx.shell.runResults.push(okRun(HIT_A));
+    const second = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi" },
+      execOf(root),
+    )) as { text: string };
+    assert.ok(!second.text.includes("回退到 CLI 通道"), "当场探测到未就绪就不必回退");
+    assert.ok(
+      ctx.shell.resolveCalls.filter((row) => row.command.startsWith("zg --hybrid=")).length >= 2,
+      "两次都走了 CLI",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("自启前读取持久化 token：崩溃/重启后沿用同一枚，不重新生成", async () => {
+    const known = "a".repeat(48);
+    const file = tokenFilePath();
+    await persistToken(file, known);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-persist");
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "boom", truncated: false },
+    });
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+      /自动拉起失败/u,
+    );
+    const startCall = ctx.shell.resolveCalls.find((row) =>
+      row.command.startsWith(SERVER_START_COMMAND),
+    );
+    assert.equal(
+      startCall?.env?.["ZVEC_GREP_SERVER_TOKEN"],
+      known,
+      "应复用持久化 token，而不是另生成一枚",
+    );
+    rmSync(file, { force: true });
+  });
+
+  it("卸载：停 daemon 失败时保留 token 文件，成功时清理", async () => {
+    // 失败路径：off 命令退非零 → 文件保留（供下一次恢复）。
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-token-keep");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "still running", truncated: false },
+    });
+    await Promise.all(ctx.effectDisposers.map((dispose) => dispose()));
+    assert.ok(
+      (await readPersistedToken(tokenFilePath())) !== undefined,
+      "停失败必须保留 token 文件",
+    );
+    vi.unstubAllGlobals();
+
+    // 成功路径用新的 apply：上一条失败路径刻意留下了文件，那是另一条宿主进程的认领结果；
+    // 这一条要从「无文件」开始，才能再次成为认领者并在卸载时发 off。
+    await clearPersistedToken(tokenFilePath());
+
+    // 成功路径：默认 off 退 0 → 文件清理。
+    stubDaemonFetch([{ text: HIT_A, isError: false }]);
+    const ctx2 = makeCtx();
+    applyTo(ctx2, { transport: "mcp" });
+    const root2 = ws("mcp-token-clear");
+    ctx2.shell.serverReadyAutoFlip = true;
+    ctx2.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await toolOf(ctx2, "zg_search").execute({ root: root2, query: "hi", rg: false }, execOf(root2));
+    assert.ok((await readPersistedToken(tokenFilePath())) !== undefined, "自启后文件存在");
+    await Promise.all(ctx2.effectDisposers.map((dispose) => dispose()));
+    assert.equal(await readPersistedToken(tokenFilePath()), undefined, "停成功后清理 token 文件");
+    vi.unstubAllGlobals();
+  });
+
+  it("卸载：自启成功后 token 又被收回（后续重启失败）时不发停 daemon 命令", async () => {
+    stubDaemonFetch([
+      { text: HIT_A, isError: false },
+      { text: HIT_A, isError: false },
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    const root = ws("mcp-dispose-lost");
+    ctx.shell.serverReadyAutoFlip = true;
+    ctx.shell.runResults.push(okRun(SERVER_READY_OUTPUT));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root));
+    // 第二次：daemon 仍就绪且内存已有 token → ready 分支不再读文件（tokenOf 有值的另一侧）。
+    const stillReady = (await toolOf(ctx, "zg_search").execute(
+      { root, query: "hi", rg: false },
+      execOf(root),
+    )) as { text: string };
+    assert.match(stillReady.text, /a\.ts:1-1/u);
+    // daemon 之后挂了：把就绪缓存推过 60s TTL，下一次 ensure 重新探测到未就绪，
+    // 尝试重启但失败 → token 被收回，startedByUs 仍为 true。
+    ctx.shell.serverReady = false;
+    ctx.shell.serverReadyAutoFlip = false;
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: { text: "restart failed", truncated: false },
+    });
+    vi.useFakeTimers();
+    try {
+      vi.advanceTimersByTime(61_000);
+      await assert.rejects(
+        () => toolOf(ctx, "zg_search").execute({ root, query: "hi", rg: false }, execOf(root)),
+        /自动拉起失败/u,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    const before = ctx.shell.resolveCalls.length;
+    await Promise.all(ctx.effectDisposers.map((dispose) => dispose()));
+    assert.ok(
+      !ctx.shell.resolveCalls.slice(before).some((row) => row.command === SERVER_STOP_COMMAND),
+      "没有 token 就不发停 daemon 命令",
+    );
+    vi.unstubAllGlobals();
+  });
+
+  it("cli lane 部署开放远程后：zg 侧 PERMISSION_DENIED 走专用指引（不再是无码文案）", async () => {
+    // 部署开放 allowRemoteEmbedding：构造期放行 + 命令带 --allow-remote；zg 仍以
+    // PERMISSION_DENIED 拒（workspace grant 缺失）——runForegroundOnce 的专用分支把
+    // 本部署侧两条出路补在原文之后（host.ts 的 permission-denied 分支）。
+    const ctx = makeCtx();
+    applyTo(ctx, {
+      transport: "cli",
+      allowRemoteEmbedding: true,
+      remoteEmbeddingEndpoint: REMOTE_ENDPOINT,
+      remoteEmbeddingApiKeyFrom: EMBED_KEY_ENV,
+    });
+    const root = ws("cli-auth-open");
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: {
+        text: "Error[ZG.ENGINE.PERMISSION_DENIED]: Remote embedding authorization required for qwen/text-embedding-v4. Run zg --auth grant ...",
+        truncated: false,
+      },
+    });
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_index").execute(
+          { root, confirm: true, embedding: REMOTE_EMBEDDING },
+          execOf(root),
+        ),
+      (error: unknown) => {
+        const text = (error as Error).message;
+        assert.match(text, /PERMISSION_DENIED[\s\S]*授权拦下/u, "原文随行 + 指引点名");
+        return true;
+      },
+    );
+    // 部署开放 + 远程闭集引用 ⇒ 命令自动带 --allow-remote（构造层的发旗逻辑）。
+    const call = ctx.shell.resolveCalls.find((row) => row.command.startsWith(INDEX_COMMAND_PREFIX));
+    assert.match(call?.command ?? "", /--allow-remote/u, "命令里带了旗标（部署已开放）");
+  });
+
+  it("cli lane 的远程授权拒绝：PERMISSION_DENIED 补 grant 指引", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "cli" });
+    const root = ws("cli-auth");
+    ctx.shell.runResults.push({
+      exitCode: 1,
+      stdout: { text: "", truncated: false },
+      stderr: {
+        text: "Error[ZG.ENGINE.PERMISSION_DENIED]: Remote embedding authorization required for qwen/text-embedding-v4. Run zg --auth grant ...",
+        truncated: false,
+      },
+    });
+    await assert.rejects(
+      () =>
+        toolOf(ctx, "zg_index").execute(
+          { root, confirm: true, embedding: "qwen/text-embedding-v4" },
+          execOf(root),
+        ),
+      (error: unknown) => {
+        const text = (error as Error).message;
+        // 构造期 allowlist 先拦（部署未开放远程时到不了 zg）：这里把部署开放后的
+        // CLI lane 授权门槛补上——zg 的 PERMISSION_DENIED 原文随行，指引补两条出路。
+        assert.match(text, /授权拦下|allowRemoteEmbedding/u);
+        return true;
+      },
+    );
+  });
+
+  it("mcp lane 的 fetch 层失败折成 mcpCallFailed；device 参数被点名拒绝", async () => {
+    // fetch 层失败：桩抛普通错误 → mcpCallFailed（显式 mcp 档不回退）。
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("ECONNREFUSED");
+    });
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "mcp" });
+    ctx.shell.serverReady = true;
+    const root = ws("mcp-net");
+    await assert.rejects(
+      () => toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root)),
+      /守护进程调用失败[\s\S]*ECONNREFUSED/u,
+    );
+    vi.unstubAllGlobals();
+
+    // device 在 MCP lane 被拒：daemon 检索面没有这一位
+    const stubs = stubDaemonFetch([]);
+    void stubs;
+    const ctx2 = makeCtx();
+    applyTo(ctx2);
+    ctx2.shell.serverReady = true;
+    await assert.rejects(
+      () => toolOf(ctx2, "zg_search").execute({ root, query: "hi", device: "metal" }, execOf(root)),
+      /device 参数仅 CLI 传输消费/u,
+    );
+    vi.unstubAllGlobals();
   });
 });

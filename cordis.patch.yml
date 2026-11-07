@@ -3,7 +3,7 @@
 # confirm 强制 true）/ zg_status（索引状态）。后端 zg CLI 缺省 --mode auto
 # （守护进程就绪走 server，缺席落回 direct），经 ctx.shell 调用；root 走
 # workdir/转义位置参数，防注入。
-# systemPrompt 规则段 order 1550 + tools.guard 安全兜底；本地 embedding 设置
+# systemPrompt 规则段 order 1550 + tools.guard 的安全兜底；本地 embedding 设置
 # 卡片（defaultEmbedding 默认 local/qwen3-embedding-0.6b，qwen3 需 node-llama-cpp）。
 # hfEndpoint 默认 https://modelscope.cn/models（国内 HF 不可达，已实测可下载 qwen3）。
 #

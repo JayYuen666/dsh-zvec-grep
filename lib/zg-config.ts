@@ -1,27 +1,28 @@
 // lib/zg-config.ts —— 起一条 zg 命令要读的部署值（hf 镜像、传输模式、默认 embedding、
 // 远程 embedding 的端点与凭据转发）。
 //
-// 为什么单列：工具面（search / index / status）与后台重建**必须**从同一处读出同一批值。
+// 为什么单列：工具这一层（search / index / status）与后台重建**必须**从同一处读出同一批值。
 // 四条命令路径各读各的会在守护进程持有索引租约时把写侧和读侧配成不同传输模式；而
 // 「默认 embedding 是哪一档」同时决定命令构造期的 allowlist 与设置卡的候选列表。
 //
 // 入参是结构子集而不是 host.ts 的 Config 整接口：本模块只读这几个字段，写成子集后
 // 宿主侧改名/改型会在这里编译失败，而不是运行到某次 spawn 才发现读不到。
 
-import { DEFAULT_EMBEDDING, isLocalEmbedding } from "./embedding-catalog.ts";
+import { DEFAULT_EMBEDDING, isKnownEmbedding } from "./embedding-catalog.ts";
 import { clientModeOf } from "./cli.ts";
 import type { ClientMode } from "./cli.ts";
+import { fill } from "./messages.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
 
 /** 端点末尾斜杠。 */
 const TRAILING_SLASHES = /\/+$/u;
 
-/** 本模块读的部署值面（宿主 Config 的结构子集）。 */
+/** 本模块读的部署值（宿主 Config 的结构子集）。 */
 export interface ZgDeployConfig {
   readonly defaultEmbedding: { get: () => string | undefined };
   /** 宿主退化时可能交回非域值；收窄由 clientModeOf 负责，故这里声明 unknown。 */
   readonly clientMode: unknown;
-  /** 命令构造与重建超时也用同一份部署值；本模块不读，但类型面共用一个结构子集。 */
+  /** 命令构造与重建超时也用同一份部署值；本模块不读，但类型上共用一个结构子集。 */
   readonly stdoutMaxBytes: number;
   readonly indexTimeoutMs: number;
   readonly hfEndpoint: { get: () => string | undefined };
@@ -70,7 +71,7 @@ function trimmedConfigString(value: string | undefined): string | undefined {
 /**
  * 远程 embedding 是否被本部署显式开放。默认 false ⇒ 命令构造期就拒掉一切非本地引用。
  * 取值直接用字段本身：schema 声明的是 boolean，cordis 装载期已按它校验过行 config，
- * 再写一遍 `=== true` 只会多一条恒真判断（lint 会当场判它 unnecessary）。
+ * 再写一遍 `=== true` 只会多一条永远成立判断（lint 会当场判它 unnecessary）。
  */
 export function allowRemoteEmbedding(config: ZgDeployConfig): boolean {
   return config.allowRemoteEmbedding;
@@ -84,14 +85,16 @@ export function allowRemoteEmbedding(config: ZgDeployConfig): boolean {
 const ENV_NAME_SHAPE = /^[A-Za-z_]\w*$/u;
 
 /**
- * zg 子进程的环境变量：HF 镜像 + （仅在部署开放远程 embedding 时的）远程端点与凭据。
+ * zg 子进程的环境变量：HF 镜像 + （仅在部署开放远程 embedding 时的）远程端点与凭据，
+ * 外加调用方要求追加的变量（transport=mcp 自启 daemon 时是 ZVEC_GREP_SERVER_TOKEN——
+ * 该名含 TOKEN 会被官方 subprocess 层从继承环境剔掉，必须显式注入才到得了 zg 与它的
+ * 子进程；同一名也作为 MCP 调用的 Bearer，见 host.ts 的 daemon 句柄）。
  *
  * **密钥只走环境变量，绝不进 argv**。两道原因，都是实测/读源码得来的：
  *   - 本包把整条命令当官方作业的 `JobSpec.label` 回显给卡片，argv 里的密钥会进界面、
  *     进日志、进 `ps` 的进程列表；
- *   - 上游自己就优先读环境变量（zvec-grep v0.2.2 `src/engine/config.ts` 的
- *     `nonEmptyEnvironmentValue(environment.ZVEC_GREP_ENDPOINT)` / `environmentApiKey()`），
- *     走 env 既是它的正路，也省掉一条 argv 泄露面。
+ *   - 上游自己就优先读环境变量（0.3.0 authorization.rs 的 remote_endpoint 读
+ *     `ZVEC_GREP_ENDPOINT`，凭据同理），走 env 既是它的正路，也省掉一处 argv 泄露。
  *
  * **凭据为什么是「宿主进程里某个环境变量的名字」而不是值本身**：官方 subprocess 层会把
  * 名字命中 `/KEY|PASSWORD|SECRET|TOKEN/i` 的变量从子进程环境里**剔掉**
@@ -100,8 +103,11 @@ const ENV_NAME_SHAPE = /^[A-Za-z_]\w*$/u;
  * 于是配置里只记**名字**、值现读现转：密钥不必落进插件配置文件，也不进 argv、不进日志。
  * 两项都只在 allowRemoteEmbedding 打开时才读：默认部署下这段代码根本不执行。
  */
-export function zgEnv(config: ZgDeployConfig): Record<string, string> | undefined {
-  const env = { ...hfEndpointEnv(config) };
+export function zgEnv(
+  config: ZgDeployConfig,
+  extra?: Record<string, string>,
+): Record<string, string> | undefined {
+  const env = { ...hfEndpointEnv(config), ...extra };
   if (allowRemoteEmbedding(config)) {
     // 与 HF 镜像同一套规范化与校验：畸形的远程端点宁可不带，也不再原样递给 zg
     // 把失败推迟到真正发请求时才暴露。
@@ -124,10 +130,57 @@ export function zgEnv(config: ZgDeployConfig): Record<string, string> | undefine
 
 export function readDefaultEmbedding(config: ZgDeployConfig): string {
   const raw = config.defaultEmbedding.get();
-  if (typeof raw === "string" && isLocalEmbedding(raw)) {
+  // 设置卡 0.3.0 起允许把默认模型选成远程 qwen 组（部署开放 allowRemoteEmbedding 的前提
+  // 由命令构造期的闭集 allowlist 兜），所以这里的域是全集；未知引用仍回落默认。
+  if (typeof raw === "string" && isKnownEmbedding(raw)) {
     return raw.trim();
   }
   return DEFAULT_EMBEDDING;
+}
+
+/**
+ * 传输方式（插件级，与 CLI 的 `--mode` 是两层）：auto = daemon 就绪时检索走 MCP、否则 CLI；
+ * cli = 恒 CLI spawn；mcp = 检索恒走 MCP，daemon 缺席时由插件拉起（起不来明确报错，
+ * 不静默回退——用户显式选 mcp 就是显式承担了 daemon 的存在）。
+ * 值域由 host schema 保证，这里只处理「字段缺省」与宿主退化：退回 auto（最保守的一档，
+ * 不主动起进程也不主动绕开 daemon）。
+ */
+const TRANSPORT_TABLE = { auto: "auto", cli: "cli", mcp: "mcp" } as const;
+
+export type ZgTransportMode = keyof typeof TRANSPORT_TABLE;
+
+function isTransportMode(value: string): value is ZgTransportMode {
+  return value === "auto" || value === "cli" || value === "mcp";
+}
+
+export function readTransport(value: unknown): ZgTransportMode {
+  return typeof value === "string" && isTransportMode(value) ? value : "auto";
+}
+
+/**
+ * 校验部署里的 `daemonUrl`：MCP 传输只认 `http(s)://host[:port]/mcp`。畸形值若放到
+ * 调用期才炸，表现是「每次检索都失败一次」，这里在装载期就点名配置项与允许形状。
+ * @param value 行 config 里的 daemonUrl（schema 只保证是字符串）
+ * @param messages 文案表
+ * @returns 原值（已 trim）
+ */
+export function readDaemonUrl(value: string, messages: ZvecGrepMessages): string {
+  const trimmed = value.trim();
+  let parsed: URL | undefined;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    parsed = undefined;
+  }
+  if (
+    parsed === undefined ||
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    parsed.hostname.length === 0 ||
+    parsed.pathname !== "/mcp"
+  ) {
+    throw new Error(fill(messages.daemonUrlInvalid, { received: value }));
+  }
+  return trimmed;
 }
 
 /**

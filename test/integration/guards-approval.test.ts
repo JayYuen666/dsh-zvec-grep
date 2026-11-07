@@ -1,7 +1,7 @@
 // guard 与用户确认的**真实宿主**集成测试。
 //
-// 与 test/host.test.ts 的分工：那边直接调本包的谓词函数（纯函数口径），这里把谓词挂回
-// 官方的调用管线上——`ctx.tools.execute()` 会依次跑 `tools/pre-execute` 瀑布（可问）与
+// 与 test/host.test.ts 的分工：那边直接调本包的谓词函数（纯函数规则），这里把谓词挂回
+// 官方的调用流水线上——`ctx.tools.execute()` 会依次跑 `tools/pre-execute` 瀑布（可问）与
 // `tools.guard`（单调拒绝），问出来的 `ask` 由官方 dsh-tools 路由到 `ctx.approval`。
 // 于是三件只有真栈能验的事在这里被钉住：
 //   1. 本包 guard 的返回值确实被官方当成拒绝理由（而不是被忽略）；
@@ -49,7 +49,7 @@ function tree(cleanups: Cleanups): { root: string; pkg: string } {
   return { root, pkg };
 }
 
-describe.skipIf(!zgAvailable())("真实宿主：安全兜底 guard 被官方管线当成拒绝", () => {
+describe.skipIf(!zgAvailable())("真实宿主：安全兜底 guard 被官方流水线当成拒绝", () => {
   const cleanups: Cleanups = [];
 
   afterAll(() => {
@@ -66,7 +66,7 @@ describe.skipIf(!zgAvailable())("真实宿主：安全兜底 guard 被官方管�
       expect(host.textOf(outcome)).toContain("confirm");
       // 被 guard 拒掉 ⇒ 一条 zg 都不该起来。
       expect(
-        host.shellCalls.filter((row) => row.request.command.startsWith("zg index")),
+        host.shellCalls.filter((row) => row.request.command.startsWith("zg --index")),
       ).toStrictEqual([]);
     } finally {
       await host.dispose();
@@ -226,7 +226,7 @@ describe.skipIf(!zgAvailable())(
         assert.equal(typeof reason, "string", `询问理由应是字符串，实际 ${String(reason)}`);
         expect(reason).toContain(root);
         // 执行期回显的是真 zg 的状态报告（说明放行后真的跑了命令）。
-        expect(host.textOf(outcome)).toContain("Workspace index is not configured");
+        expect(host.textOf(outcome)).toContain("index not configured");
       } finally {
         await host.dispose();
       }
@@ -242,7 +242,7 @@ describe.skipIf(!zgAvailable())(
         const second = await host.call(ASKED_TOOL, { root }, host.agentOf(pkg));
         assert.ok(!second.isError, host.textOf(second));
         // 只问一次：rootOf 成功后 ledger 登记了这棵树，第二次不再打扰用户。
-        // 这与「拒绝不登记」是同一枚硬币的两面（下一条用例钉拒绝那一侧）。
+        // 这与「拒绝不登记」是同一枚硬币的两处（下一条用例钉的是拒绝那条分支）。
         expect(asked).toHaveLength(1);
       } finally {
         await host.dispose();

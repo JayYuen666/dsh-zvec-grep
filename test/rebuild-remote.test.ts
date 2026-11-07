@@ -1,4 +1,4 @@
-// 重建读面的宿主侧直测：服务注册、三个方法的源模式契约，以及官方网关要读的 Remote 标记。
+// 重建读取接口的宿主侧直测：服务注册、三个方法的源模式契约，以及官方网关要读的 Remote 标记。
 //
 // 端到端（真作业注册表 + 真进程）在 test/integration/rebuild-endpoints.test.ts；这一份只钉
 // 服务本身，不启任何进程，也不经 HTTP/网关。
@@ -28,19 +28,8 @@ import { REBUILD_DESCRIPTORS, createRebuildReader } from "../src/rebuild-reader.
 import type { RemoteHost } from "../src/rebuild-reader.ts";
 import { MESSAGES } from "../lib/messages.ts";
 
-/** 本包重建作业的命令形状：多处用例共用，避免同一字面量散落。 */
-const REBUILD_COMMAND = "zg index --rebuild";
-
-/**
- * 要「盘上真工作区」的用例按平台跳过：本包 root 判据（`lib/cli.ts` 的 `assertAbsoluteRoot`）
- * 只认以 `/` 开头的绝对路径，而 win32 上 `os.tmpdir()` 交回的是盘符形态（CI 实测
- * `C:\Users\RUNNER~1\AppData\Local\Temp`）——`rebuild` 在 root 那一步就答「不是绝对路径」，
- * 被测的「注册表缺席」分支根本走不到。
- *
- * 与 `test/host.test.ts` 的 `realRootUnavailable` 同因同判据；那一处的长注释讲了为什么是跳过
- * 而不是放宽判据（Windows 宿主不在本包支持面内，见 README「支持面」一节）。
- */
-const posixRootUnavailable = process.platform === "win32";
+/** 本包重建作业的命令形状（0.3.0 旗标形态）：多处用例共用，避免同一字面量散落。 */
+const REBUILD_COMMAND = "zg --index /repo --rebuild";
 
 /** 最小依赖：方法在这些用例里只会走到「注册表缺席 / 空侧表 / 空白名单」三支。 */
 function depsOf(): ZvecRebuildDeps {
@@ -60,8 +49,9 @@ function depsOf(): ZvecRebuildDeps {
         },
       },
     } as unknown as RebuildHost,
-    // 只用到几面，但**按字段类型**转换而不是 `as never`：字段名写错、或这几面的签名
+    // 只用到几处，但**按字段类型**转换而不是 `as never`：字段名写错、或这几处的签名
     // 变了，返回值就不满足 ZvecRebuildDeps，编译期当场红；`as never` 会把这些静默吃掉。
+    platform: "posix",
     config: {} as unknown as ZgDeployConfig,
     messages: () => MESSAGES.zh,
     jobsOf: () => {
@@ -124,7 +114,7 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
     }
   });
 
-  it("注册口缺席时返回 false（可选读面，不让 apply 下线）", () => {
+  it("注册口缺席时返回 false（可选读取接口，不让 apply 下线）", () => {
     assert.equal(installRebuildRemote({} as never, depsOf()), false);
   });
 
@@ -177,9 +167,9 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
           },
         }),
         records: new Map(),
-        // 这条用例只需要这两面（错误路径在 `start` 之前就抛），而函数签名要整个
-        // IndexWriteRoutes：按索引面收窄只能落在注释上。真实约束由实现保证——它必须先碰
-        // 这两面，一旦把 versionGate/config 挪到裁剪之前，这条用例会在这里就崩成红。
+        // 这条用例只需要这两处（错误路径在 `start` 之前就抛），而函数签名要整个
+        // IndexWriteRoutes：按索引类型收窄只能落在注释上。真实约束由实现保证——它必须先碰
+        // 这两处，一旦把 versionGate/config 挪到裁剪之前，这条用例会在这里就崩成红。
       } as unknown as IndexWriteRoutes,
       "/repo",
       MESSAGES.zh,
@@ -256,7 +246,7 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
     assert.match(timeoutNote, /1 分钟/u);
   });
 
-  it("卸载效应：每条独立收口，remove 抛错时只收自己那条进程，侧表仍旧清空", async () => {
+  it("卸载效应：每条独立统一处理，remove 抛错时只收自己那条进程，侧表仍旧清空", async () => {
     // 回归用例：`releaseRebuildRecords` 的逐条 try/catch。`jobs.remove` 在跑作业上会抛，
     // 若不接住，异常会穿过卸载效应、后面的记录一条都收不成，而侧表还钉着一批已死的记录。
     const killed: string[] = [];
@@ -303,17 +293,14 @@ describe("官方 Typert Remote 源模式：重建服务", () => {
     assert.equal(records.size, 0, "一条收失败不能跳过 records.clear()");
   });
 
-  it.skipIf(posixRootUnavailable)(
-    "rebuild 在注册表缺席时给可行动错误（root 要过得了绝对路径那关，故只在 POSIX 上成立）",
-    async () => {
-      const ctx = new Context();
-      installRebuildRemote(ctx, depsOf());
-      const service = ctx.get(REBUILD_REMOTE_NAMESPACE) as ZvecRebuildService;
-      const rebuilt = await service.rebuild({ root: tmpdir() });
-      assert.equal(rebuilt.ok, false);
-      assert.match((rebuilt as { error: string }).error, /jobs/u);
-    },
-  );
+  it("rebuild 在注册表缺席时给可行动错误（root 要过得了绝对路径那关，故只在 POSIX 上成立）", async () => {
+    const ctx = new Context();
+    installRebuildRemote(ctx, depsOf());
+    const service = ctx.get(REBUILD_REMOTE_NAMESPACE) as ZvecRebuildService;
+    const rebuilt = await service.rebuild({ root: tmpdir() });
+    assert.equal(rebuilt.ok, false);
+    assert.match((rebuilt as { error: string }).error, /jobs/u);
+  });
 });
 
 // ── 客户端读取器（卡片那半的直测：remote 现读 + 挂载缓存的成功后才留）───────────
@@ -382,7 +369,7 @@ function hostOf(opts: HostStubOptions = {}): { host: RemoteHost; mountCalls: num
 
 const MOUNT_FAILURE = new Error("gateway restarted");
 
-/** codec 的替身取法：descriptor.parameters 是官方泛型面，测试按 codec 形状取用。 */
+/** codec 的替身取法：descriptor.parameters 用的是官方泛型，测试按 codec 形状取用。 */
 interface CodecFace {
   create: () => { parse: (value: unknown) => unknown };
 }
@@ -397,11 +384,17 @@ function codecAt(method: string): CodecFace {
   return codec;
 }
 
+/** 读取器错误文案的测试替身（与 src/ui-messages.ts 的中文条目同文，断言仍按原文匹配）。 */
+const READER_MESSAGES = {
+  remoteMissing: () => "工作区重建读面不可用：宿主网关没有提供 remote 服务",
+  namespaceMissing: (serviceKey: string) => `${serviceKey} 未提供：宿主网关没有挂上这枚命名空间`,
+};
+
 describe("客户端读取器：remote 现读与挂载缓存", () => {
   it("ctx 没有 get 面时返回 undefined；有 get 面就给读取器（remote 是否在场不在 apply 期判）", () => {
-    assert.equal(createRebuildReader({}), undefined);
+    assert.equal(createRebuildReader({}, READER_MESSAGES), undefined);
     const { host } = hostOf({ remote: 42 });
-    assert.notEqual(createRebuildReader(host), undefined);
+    assert.notEqual(createRebuildReader(host, READER_MESSAGES), undefined);
   });
 
   it("remote 晚到不把读取器定死：apply 时缺席、调用时在场的部署也能读", async () => {
@@ -412,7 +405,7 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
     const host: RemoteHost = {
       get: (name: string) => (name === "remote" ? remoteBox.value : services.get(name)),
     };
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.roots(), /没有提供 remote 服务/u);
     remoteBox.value = { $mount: () => Promise.resolve({ mounted: true }) };
@@ -422,7 +415,7 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
 
   it("挂载失败不留在缓存里：下一轮轮询重新挂，重试真的会发生", async () => {
     const { host, mountCalls } = hostOf({ mountResults: [MOUNT_FAILURE, MOUNT_FAILURE] });
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.roots(), /gateway restarted/u);
     await assert.rejects(() => reader.roots(), /gateway restarted/u);
@@ -431,7 +424,7 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
 
   it("挂载成功后缓存 promise：反复轮询只挂一次", async () => {
     const { host, mountCalls } = hostOf();
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     await reader.roots();
     await reader.roots();
@@ -442,7 +435,7 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
     // mounted ??= mount() 是在 await 之前赋值的，所以「还没落定的那一枚」就是共享点。
     // 串行跑两遍测不到这件事：第二轮一定命中已落定的缓存，与并发共享走的是不同分支。
     const { host, mountCalls } = hostOf();
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     const [first, second] = await Promise.all([reader.roots(), reader.roots()]);
     assert.deepEqual(first, second);
@@ -451,7 +444,7 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
 
   it("rebuild 成功交回宿主的应答，重复发起仍只挂一次", async () => {
     const { host, mountCalls } = hostOf();
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     assert.deepEqual(await reader.rebuild("/repo"), { ok: true, jobId: "job-1" });
     assert.deepEqual(await reader.rebuild("/other"), { ok: true, jobId: "job-1" });
@@ -460,7 +453,7 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
 
   it("命名空间缺席（网关没认这枚贡献）点名抛错，不冒充成别的失败", async () => {
     const { host } = hostOf({ namespace: { roots: 1 } });
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.roots(), /未提供：宿主网关没有挂上这枚命名空间/u);
   });
@@ -473,7 +466,7 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
         status: { ok: false, error: { code: "E-STATUS", message: "status down" } },
       }),
     });
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.roots(), /E-ROOTS: roots down/u);
     await assert.rejects(() => reader.rebuild("/repo"), /E-REBUILD: rebuild down/u);
@@ -488,17 +481,17 @@ describe("客户端读取器：remote 现读与挂载缓存", () => {
         status: { ok: true, value: { ok: false, error: "unknown jobId" } },
       }),
     });
-    const reader = createRebuildReader(host);
+    const reader = createRebuildReader(host, READER_MESSAGES);
     assert.ok(reader !== undefined);
     await assert.rejects(() => reader.rebuild("/repo"), /该工作区已有一条重建/u);
     await assert.rejects(() => reader.status("job-1"), /unknown jobId/u);
-    // 成功那一侧：status 摊平成普通对象（卡片只认 status/exitCode/output 三个键）。
+    // 成功那条分支：status 摊平成普通对象（卡片只认 status/exitCode/output 三个键）。
     const okHost = hostOf({
       namespace: namespaceStub({
         status: { ok: true, value: { ok: true, status: "completed", exitCode: 0, output: "done" } },
       }),
     });
-    const okReader = createRebuildReader(okHost.host);
+    const okReader = createRebuildReader(okHost.host, READER_MESSAGES);
     assert.ok(okReader !== undefined);
     assert.deepEqual(await okReader.status("job-1"), {
       ok: true,

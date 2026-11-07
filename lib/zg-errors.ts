@@ -1,160 +1,122 @@
-// lib/zg-errors.ts —— zg 结构化失败的**识别层**：把子进程输出里的错误码与明细抽成
+// lib/zg-errors.ts —— zg 结构化失败的**识别层**：把子进程输出里的错误码与成因抽成
 // 可判定的事实，供错误文案与「要不要等锁」两条路径共用。
 //
 // 为什么要单独一层：失败文案只回一句人话，模型据此无法区分「本插件正在重建、等一会就好」
 // 与「别的进程占着锁、我该另想办法」。等待策略必须拿到**结构化**结论，文案侧只需要人话，
 // 两边同源于此，不得各自正则一遍。
 //
-// zg 的失败输出形状（实测）：
-//   Error: <标题>
-//   Code: <错误码>
-//   Details:
-//     <键>: <值>
-//     ...
-// 明细键随错误码而变，故这里只抽「认得出的那几个」，认不出的键不猜、不透传。
+// zg 0.3.0 的失败输出形状（上游 zg-cli/src/diagnostics.rs 的 format_error_report，非 TTY）：
+//   Error[<CODE>]: <一句话成因>
+//   Help: <出路>            （可选）
+//   Error location: <file:line:col>
+// 与 0.2.2 的 `Error: <标题>` + `Code: <码>` + `Details:` 缩进明细块不同：0.3.0 的码在
+// 首行的方括号里、成因紧跟其后，明细不再单独成块（锁的占用方直接写进成因串：
+// `lock is busy: lock=<路径> operation=<op>`）。MCP 传输的同一错误文本首行是小写
+// `error[<CODE>]:`，故码行的定位大小写不敏感。
+// 普通非引擎错误仍是单行 `Error: <message>`（无码）——「有码 / 无码」的判读分界见
+// host.ts 的 noCodeHint。
 
-/** zg 会给出的、与并发相关的两类错误码。 */
-export const LOCK_BUSY_CODE = "ZVEC_GREP.ENGINE.LOCK.BUSY";
-export const DAEMON_LEASE_CODE = "ZVEC_GREP.ENGINE.DAEMON_LEASE_ACTIVE";
+/** zg 会给出的、与本插件策略相关的错误码（0.3.0 全部落在 `ZG.ENGINE.*` 一族）。 */
+export const LOCK_BUSY_CODE = "ZG.ENGINE.RESOURCE_BUSY";
+export const PERMISSION_DENIED_CODE = "ZG.ENGINE.PERMISSION_DENIED";
 
-/** 索引重建与其它占用者分开：等与不等是两回事。 */
+/** 索引重建与其它占用者分开：等与不等是两回事。0.3.0 的重建持锁方自报名仍为此串
+ *  （上游 indexing/service.rs：`options.rebuild ? "index.rebuild" : …`）。 */
 export const REBUILD_OPERATION = "index.rebuild";
 
-/** 明细块的表头行（`Details:`）。 */
-const DETAILS_HEADER = /^\s*Details:\s*$/u;
-/** 行首空白：明细键值行以缩进起始，零缩进内容属于下一段。 */
-const INDENTED_LINE = /^\s/u;
+/**
+ * 码行的**定位与取值**形状：`Error[<码>]:`（行首，MCP 文本为小写 `error[`）。
+ * 码字符集取 `[A-Za-z0-9_.]`：0.3.0 的码形如 `ZG.ENGINE.RESOURCE_BUSY`；定位与取值
+ * 同一条正则完成——0.3.0 没有独立的 `Code:` 行，码只在首行出现一次。
+ */
+/** 码行的定位形状（行首零个以上空格 + error[码]:；`\]` 之后的成因在代码里切片取）。 */
+const CODE_LINE_PREFIX = /^ *error\[[a-z][\w.]*\]:/iu;
+/** 成因串分隔符（码行里 `]:` 之后的部分；indexOf 定位，不与正则量词相邻）。 */
+const MESSAGE_DELIMITER = "]:";
 
 export interface LockBusyFailure {
   kind: "lock-busy";
-  /** 占锁方自报的操作名；老版本或明细缺失时为 undefined。 */
+  /** 占锁方自报的操作名；成因串缺失或形状变化时为 undefined。 */
   ownerOperation: string | undefined;
-  /** 占锁方进程号；明细缺失时为 undefined。 */
-  ownerPid: string | undefined;
-  /** 占的是哪把锁。 */
+  /** 占的是哪把锁（成因串里的 `lock=` / `storage_dir=`；缺失时为 undefined）。 */
   lockPath: string | undefined;
   /** 占锁方是否是一次重建（重建可等，其它占用者不归本插件管）。 */
   readonly rebuild: boolean;
 }
 
-export interface DaemonLeaseFailure {
-  kind: "daemon-lease";
-  /** 持有租约的守护进程号。 */
-  pid: string | undefined;
+/** 远程 embedding 授权被拒（`ZG.ENGINE.PERMISSION_DENIED`）：出路在宿主侧，见 host.ts。 */
+export interface PermissionDeniedFailure {
+  kind: "permission-denied";
 }
 
-export type ConcurrentZgFailure = LockBusyFailure | DaemonLeaseFailure;
+export type ConcurrentZgFailure = LockBusyFailure | PermissionDeniedFailure;
 
 /**
- * zg 明细块的键值行。三个细节都来自「明细行是缩进的」这一实测形状：
- *   - 缩进**必填**（`\s+`）：明细块之后任何含冒号的非空行（第二个错误块的 `Error:` /
- *     `Code:`、尾注 `Hint:`）都不该被当成明细键收进表，与已知键同名时会污染判断；
- *   - 键字符集放宽到字母开头 + `[\w-]`：上游若改用 `owner_operation` 这类拼写，行至少
- *     还能被认出来（值是否被消费由查表侧决定），不至于整块收集在此中断；
- *   - 值必须以非空白开头：把只含空白的行当成有效值没有意义。
+ * daemon 传输层失败（fetch 层）：非工具错误、非协议拒绝。auto 档据此在同一次调用里
+ * 回退 CLI；`aborted` 为真表示超时/取消，不回退（等待已经花掉了）。
  */
-const DETAIL_LINE = /^\s+(?<key>[A-Za-z][\w-]*):\s*(?<value>\S.*)$/u;
+export class DaemonCallFailureError extends Error {
+  public readonly aborted: boolean;
 
-/** 错误码行的**定位**形状（只认行首，不核内容）。 */
-const CODE_LINE_PREFIX = /^\s*Code:/u;
+  public constructor(message: string, aborted: boolean) {
+    super(message);
+    this.name = "DaemonCallFailureError";
+    this.aborted = aborted;
+  }
+}
 
-/** 错误码行的**取值**形状：`Code:` 之后是单一 token。 */
-const CODE_LINE = /^\s*Code:\s*(?<code>\S+)\s*$/u;
+/** 成因串里占锁方操作名的取值形状（`operation=<token>`）。 */
+const OPERATION_IN_MESSAGE = /\boperation=(?<op>\S+)/u;
+/** 成因串里锁路径的两种写法（立即失败 `lock=` / 等待超时 `storage_dir=`）。 */
+const LOCK_IN_MESSAGE = /\b(?:lock|storage_dir)=(?<lock>\S+)/u;
 
 /**
- * 抽错误码。没有该行就不是 zg 的结构化失败（旁路返回 null，交给通用失败文案）。
- * 先定位第一条 `Code:` 行、再核它的内容是否为单一 token：一次失败只应有一个码，
- * 首处写成 `Code: XXX (detail)` 说明输出形状已变——宁可不判，也不许顺延到后文
- * 捞一个可能属于别的错误块的码回来。
+ * 抽错误码。没有该行就不是 zg 的结构化失败（旁路返回 undefined，交给通用失败文案）。
+ * 只认第一条码行：一次失败只应有一个码，首处之后的行不属于这次判读。
  */
 export function zgErrorCode(stderr: string): string | undefined {
-  const firstCodeLine = stderr.split("\n").find((line) => CODE_LINE_PREFIX.test(line));
-  return firstCodeLine === undefined ? undefined : CODE_LINE.exec(firstCodeLine)?.groups?.["code"];
+  const line = stderr.split("\n").find((candidate) => CODE_LINE_PREFIX.test(candidate));
+  // 定位正则已保证两枚分隔符都在：这里只是把码从「[码]:」里切出来，切空按形状已变处理。
+  const from = line === undefined ? -1 : line.indexOf("[") + 1;
+  const to = line === undefined ? -1 : line.indexOf(MESSAGE_DELIMITER, from);
+  const code = line !== undefined && from > 0 && to > from ? line.slice(from, to) : undefined;
+  return code;
 }
 
 /**
- * 在第一个错误块的码行之后找明细表头。明细必须属于第一个错误块：码行之后遇到下一条
- * 无缩进内容（第二个块的 Error:/Code: 或散文）就说明这一块没有明细，不能顺延去捡后面
- * 块的键值。找不到返回 -1。
+ * 抽首条码行的成因串（`]:` 之后的文本）。0.3.0 没有独立明细块，占锁方信息全在这一段里。
+ * 没有码行、或码行上没有分隔符时交回**空串**——调用方（classifyConcurrentFailure）只在
+ * 码已命中的前提下读它，空串即「成因缺失」；要区分「没有码行」用 {@link zgErrorCode}。
  */
-function detailsStartAfter(lines: readonly string[], codeIndex: number): number {
-  const rest = lines.slice(codeIndex + 1);
-  for (const [offset, line] of rest.entries()) {
-    if (DETAILS_HEADER.test(line)) {
-      return codeIndex + 1 + offset;
-    }
-    if (line.trim().length > 0 && !INDENTED_LINE.test(line)) {
-      return -1;
-    }
-  }
-  return -1;
+export function zgErrorMessage(stderr: string): string {
+  const line = stderr.split("\n").find((candidate) => CODE_LINE_PREFIX.test(candidate)) ?? "";
+  const at = line.indexOf(MESSAGE_DELIMITER);
+  const message = at === -1 ? "" : line.slice(at + MESSAGE_DELIMITER.length).trim();
+  return message;
 }
 
 /**
- * 明细块的键值表。`Details:` 之后的缩进行才是明细，标题与错误码行不参与。
- * 重复键取首次出现（zg 不会重复输出同一个键，重复即形状异常，不覆盖）。
- * 明细块遇到非键值行即终止：其后多半是尾部截断的散文，继续收只会捡到假键值。
- * 导出只为把「没有 Code 行时不捡明细」这一支钉进单测；生产侧只经
- * `classifyConcurrentFailure` 调用（那里已先确认有码）。
- */
-/** 明细块的协议键：查表侧只许从这里取值，键名改名不会漏改一条。 */
-const DETAIL_KEY = {
-  ownerOperation: "ownerOperation",
-  ownerPid: "ownerPid",
-  lock: "lock",
-  pid: "pid",
-} as const;
-
-export function zgErrorDetails(stderr: string): Map<string, string> {
-  const details = new Map<string, string>();
-  const lines = stderr.split("\n");
-  const codeIndex = lines.findIndex((line) => CODE_LINE_PREFIX.test(line));
-  if (codeIndex === -1) {
-    return details;
-  }
-  const start = detailsStartAfter(lines, codeIndex);
-  if (start === -1) {
-    return details;
-  }
-  for (const line of lines.slice(start + 1)) {
-    const matched = DETAIL_LINE.exec(line);
-    const key = matched?.groups?.["key"];
-    const value = matched?.groups?.["value"]?.trimEnd();
-    if (key !== undefined && value !== undefined) {
-      if (!details.has(key)) {
-        details.set(key, value);
-      }
-    } else if (line.trim().length > 0) {
-      break;
-    }
-  }
-  return details;
-}
-
-/**
- * 识别并发类失败；不是并发失败（或输出形状不认识）一律返回 null。
+ * 识别本插件策略关心的失败；不关心的失败（或输出形状不认识）一律返回 null。
  *
  * `rebuild` 只在占锁方自报重建时为真：等待策略据此决定要不要排队。把「别人占锁」也
- * 当成重建去等，会在永远不会被本插件放开的锁上无界挂起。
+ * 当成重建去等，会在永远不会被本插件放开的锁上无界挂起。0.3.0 的成因串里没有占锁方
+ * 进程号（0.2.2 Details 块的 ownerPid），故该字段不再存在。
  */
 export function classifyConcurrentFailure(stderr: string): ConcurrentZgFailure | null {
   const code = zgErrorCode(stderr);
-  if (code === undefined) {
-    return null;
-  }
-  const details = zgErrorDetails(stderr);
-  const ownerOperation = details.get(DETAIL_KEY.ownerOperation);
   if (code === LOCK_BUSY_CODE) {
+    // 码已命中 ⇒ 码行必在 ⇒ 成因串非 undefined（契约见 zgErrorMessage），空串即成因缺失。
+    const message = zgErrorMessage(stderr);
+    const ownerOperation = OPERATION_IN_MESSAGE.exec(message)?.groups?.["op"];
     return {
       kind: "lock-busy",
       ownerOperation,
-      ownerPid: details.get(DETAIL_KEY.ownerPid),
-      lockPath: details.get(DETAIL_KEY.lock),
+      lockPath: LOCK_IN_MESSAGE.exec(message)?.groups?.["lock"],
       rebuild: ownerOperation === REBUILD_OPERATION,
     };
   }
-  if (code === DAEMON_LEASE_CODE) {
-    return { kind: "daemon-lease", pid: details.get(DETAIL_KEY.pid) };
+  if (code === PERMISSION_DENIED_CODE) {
+    return { kind: "permission-denied" };
   }
   return null;
 }

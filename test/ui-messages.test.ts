@@ -1,5 +1,5 @@
 // src/ui-messages.ts 单测：设置卡两语字典的键集/占位符同源（卡片没有 jsdom 渲染
-// 用例，字典完整性就是这半边 i18n 的守门人；产物层面的断言在 build-client.test.ts）。
+// 用例，字典完整性就是这半边 i18n 的把关的那一步；产物层面的断言在 build-client.test.ts）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { UI_MESSAGES } from "../src/ui-messages.ts";
@@ -7,7 +7,7 @@ import type { UiMessages } from "../src/ui-messages.ts";
 import { CJK_RESIDUE } from "./cjk-residue.ts";
 
 /**
- * 渲染这面字典的官方插值器是 `template.replace(/\{(\w+)\}/g, …)`
+ * 渲染这份字典的官方插值器是 `template.replace(/\{(\w+)\}/g, …)`
  * （实测 `@deepseek-ai/dsh-client-locale/lib/client.js`），两处都要照它来：
  *   · 名字语法取 `\w+`，比它宽就会去比渲染器根本不填的名字，比它窄就漏判；
  *   · 它是 `g` 档全替换 ⇒ 同一个占位符出现两次就该被填两次，所以这里交回**列表**
@@ -17,7 +17,7 @@ import { CJK_RESIDUE } from "./cjk-residue.ts";
  */
 const PLACEHOLDER = /\{(?<name>\w+)\}/gu;
 
-/** 捕获组对每一条匹配必然参与（整个模式就是它），这里的 `?? ""` 只给类型收窄一个落点。 */
+/** 捕获组对每一条匹配必然参与（整个模式就是它），这里的 `?? ""` 只是给类型收窄提供一个位置。 */
 function placeholders(template: string): string[] {
   return Array.from(template.matchAll(PLACEHOLDER), (found) => found.groups?.["name"] ?? "");
 }
@@ -79,6 +79,7 @@ describe("设置卡双语字典", () => {
       windowHint: ["default"],
       rebuildHint: ["embedding", "roots"],
       rebuildExitCode: ["exitCode"],
+      rebuildNamespaceMissing: ["serviceKey"],
       modelOption: ["reference", "dimension"],
     };
     for (const [key, expected] of Object.entries(EXPECTED) as [
@@ -93,7 +94,7 @@ describe("设置卡双语字典", () => {
         );
       }
     }
-    // 反向：字典里出现带花括号的模板却没登记，等于新增了一个没人守的插值面。
+    // 反向：字典里出现带花括号的模板却没登记，等于新增了一个没人守的插值规则。
     for (const key of KEYS) {
       if (placeholders(UI_MESSAGES.zh[key]).length > 0) {
         assert.ok(key in EXPECTED, `${key} 带占位符，却没登记到期望表`);

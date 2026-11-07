@@ -1,10 +1,10 @@
 // lib/rebuild-state.ts 的单元测试：占位的互斥、作业 id 的补写时机、释放的幂等、
-// 等待者的四种出口，以及容量上限。纯逻辑，不触宿主面。
+// 等待者的四种返回路径，以及容量上限。纯逻辑，不碰宿主接口。
 import { describe, it, vi, afterEach } from "vitest";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import { getEventListeners } from "node:events";
-// 官方作业品牌串的**值**形式（JobId("x") 只是给同一个字符串贴牌，不做校验）。
+// 带 brand 标记的官方作业 id，取其**值**形式（JobId("x") 只打 brand 标记，不做校验）。
 // 测试不是产物，值导入不破坏 host.js 的自包含；生产侧一律 type-only。
 import { JobId as jobIdOf } from "@deepseek-ai/dsh-jobs";
 import { MESSAGES } from "../lib/messages.ts";
@@ -18,7 +18,7 @@ const PKG = "/repo/pkg";
 const { zh } = MESSAGES;
 
 /**
- * 告警收集面：整个文件只改 `console.warn` 一次，并由 afterEach 统一还原。
+ * 告警收集范围：整个文件只改 `console.warn` 一次，并由 afterEach 统一还原。
  *
  * 原先三处用例各自 `const original = console.warn; console.warn = …` 再在 finally 里手工
  * 还原：try 之前抛错（claim 断言失败之外的那一档）或还原语句本身被跳过时，全局就被留在
@@ -95,7 +95,7 @@ describe("占位不是可轮询记录", () => {
     assert.equal(rebuilds.active("/ws")?.jobId, "job-1");
   });
 
-  it("条目已释放时 attach 安全空转，不复活一条占位", () => {
+  it("条目已释放时 attach 安全地不执行任何操作，不复活一条占位", () => {
     const rebuilds = createRebuildRegistry();
     rebuilds.claim("/ws", "card");
     rebuilds.release("/ws");
@@ -250,7 +250,7 @@ describe("覆盖判据（covering）", () => {
   it("精确键命中：active 与 covering 对同一根给同一条", () => {
     const rebuilds = createRebuildRegistry();
     // 基准必须是 claim 交回的那枚条目：两侧都从注册表读的话，占位一旦回归成 no-op，
-    // covering 与 active 会同时给出 undefined，这条判据反而恒绿。
+    // covering 与 active 会同时给出 undefined，这条判据反而永远通过。
     const entry = rebuilds.claim(REPO, "card");
     assert.ok(entry !== null, "claim 应当登记条目");
     assert.equal(rebuilds.covering(REPO, zh), entry);
@@ -307,7 +307,7 @@ describe("覆盖判据（covering）", () => {
     const rebuilds = createRebuildRegistry();
     const entry = rebuilds.claim(REPO, "card");
     // claim 必须真的登记了条目：不登记的话 wait 在没有覆盖条目时立刻返回 settled，
-    // 后面的断言照样成立，本用例就成了恒绿（不变量根本量不到）。
+    // 后面的断言照样成立，本用例就成了永远通过（不变量根本量不到）。
     assert.ok(entry !== null, "占位应当成功");
     let settled = false;
     const waiting = (async () => {

@@ -1,10 +1,10 @@
 // test/host-freshness.test.ts —— 新鲜度夹具自己的形状判据。
 //
 // 为什么单列：host-freshness.ts 是被各包 build-host.test.ts 使用的**夹具**，
-// 它读的是别的包的 build-host.mjs —— builder 交回什么东西，类型面只是断言，运行期什么都可能。
+// 它读的是别的包的 build-host.mjs —— builder 交回什么东西，类型上只是断言，运行期什么都可能。
 // 缺了这两条判据时，症状是一句与包名无关的 `files.entries is not a function`，
 // 或一条看着像「产物过期」的误报红（相对键会按 runner 的 cwd 解析），
-// 排查的人会先去查构建，而不是查清单口径。
+// 排查的人会先去查构建，而不是查清单规则。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -23,7 +23,7 @@ const INLINE_CODE = "inline-code";
 /** 夹具包的 build-host.mjs 实现体：按包根拼路径。 */
 type BuilderBody = (pkgDir: string) => string;
 
-/** 两份产物的 builder：键是包根下的绝对路径，正文与落盘内容一致。 */
+/** 两份产物的 builder：键是包根下的绝对路径，正文与写到磁盘内容一致。 */
 const twoArtifacts: BuilderBody = (pkgDir) => {
   const root = JSON.stringify(pkgDir);
   return [

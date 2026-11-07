@@ -106,7 +106,7 @@ describe("实参是 Schema.object(...) 时的取法", () => {
     assert.deepEqual(
       hostSchemaFields(source).unresolved,
       [],
-      "无关文本不该变成一条指向 host.ts 的假红",
+      "无关文本不该变成一条指向 host.ts 的误报",
     );
   });
 
@@ -117,10 +117,10 @@ describe("实参是 Schema.object(...) 时的取法", () => {
   });
 });
 
-describe("绑定面的扫描范围按目录名收口", () => {
-  it("名为 test / tests / spec / __tests__ 的目录不进绑定面", async () => {
+describe("绑定环节的扫描范围按目录名统一处理", () => {
+  it("名为 test / tests / spec / __tests__ 的目录不进绑定检查的范围", async () => {
     // TEST_FILE_SHAPE 只认文件形状（`x.test.ts`、`__tests__/`），目录叫 test 时它匹配不上，
-    // 于是那里的断言式 set('x') 会被当成"已绑定"—— 本门禁最忌讳的假绿方向。
+    // 于是那里的断言式 set('x') 会被当成"已绑定"—— 本门禁最忌讳的误判通过方向。
     const root = await mkdtemp(path.join(tmpdir(), "zg-walk-skip-"));
     try {
       await mkdir(path.join(root, "card"), { recursive: true });

@@ -15,8 +15,8 @@ export const REBUILD_REMOTE_NAMESPACE = "zvecGrepRebuild";
 /** 官方作业状态在卡片契约里的取值域。 */
 export type RebuildJobStatus = "running" | "stopping" | "completed" | "killed" | "failed";
 
-/** 引导读面：白名单里的工作区 + 守护进程就绪态。
- *  `serverReady` 的 undefined 是**必要**的一臂：读不到这一位时卡片不显示，而不是把
+/** 引导读取接口：白名单里的工作区 + 守护进程就绪态。
+ *  `serverReady` 为 undefined 是**必需**的一种取值：读不到这一位时卡片不显示，而不是把
  *  「不知道」说成「未就绪」（判据收在 lib/card-logic.ts 的 daemonNoteKey）。 */
 export interface RebuildRoots {
   readonly roots: readonly string[];
@@ -36,7 +36,7 @@ export interface RebuildStarted {
 }
 
 /**
- * 拒绝应答的语义码，字面沿用自本包还没有 Remote 数据面时那套 HTTP 应答（本包现在不自建
+ * 拒绝应答的语义码，字面沿用自本包还没有 Remote 数据那一栏时那套 HTTP 应答（本包现在不自建
  * HTTP 路由，这些码随 Typert Remote 的拒绝回执返回），逐字取自构造点的实发值
  * （lib/rebuild-remote.ts 的 400/403/404/409/500/503）。收敛成字面量联合而不是裸 `number`：
  * 构造点误填别的数字在编译期就红，而不是带着一个没人认识的码上线。客户端只读 error，

@@ -1,4 +1,4 @@
-// src/rebuild-reader.ts —— 设置卡读**宿主侧工作区重建**的那一面（官方 Typert Remote 的消费侧）。
+// src/rebuild-reader.ts —— 设置卡经官方 Typert Remote 读取宿主进程里的工作区重建状态。
 //
 // 为什么需要它：卡片跑在浏览器里，而重建是宿主进程里的动作（占位、官方作业注册表、zg
 // 子进程）。设置面没有「宿主执行动作」的口子，唯一的官方通道就是 Remote。
@@ -11,11 +11,11 @@
 //
 // ⚠ **为什么走 `ctx.get("remote")` 而不是把 `remote` 写进 `inject`**：cordis 对**未 inject 的
 // 服务**读取是**抛错**（`cannot get property "remote" without inject`）。而本卡的其余部分在
-// "没装远程面"的部署里也必须照常渲染（远程读面是可选能力），`inject: ["remote", …]` 却会把
-// 整条 client 入口绑死在远程面上——缺它就不激活。`ctx.get` 是**显式读取**，不受 inject 门禁
+// "没装远程通道"的部署里也必须照常渲染（远程读取接口是可选能力），`inject: ["remote", …]` 却会把
+// 整条 client 入口绑死在远程通道上——缺它就不激活。`ctx.get` 是**显式读取**，不受 inject门禁
 // 约束——官方网关自己也是这么读可选服务的。
 //
-// ⚠ 类型一律 `import type`（产物里零新说明符）：`@deepseek-ai/*` 只作类型消费。
+// ⚠ 类型一律 `import type`：`@deepseek-ai/*` 只作类型消费，产物里不新增模块说明符。
 import type {
   InvocationDescriptor,
   RemoteResult,
@@ -43,7 +43,7 @@ const REBUILD_SERVICE_KEY = `remote.${REBUILD_NAMESPACE}`;
 /** 卡片所在 bundle 的包名（`$mount` 的 `package` 位与槽位键同源，见 client-entry.ts 的 BUNDLE_PKG）。 */
 const PACKAGE_NAME = "@jayyuen66/dsh-zvec-grep";
 
-/** strict codec 的统一出口：失败交给 zod 的 `prettifyError`，读到的是一份带字段路径的说明。 */
+/** strict codec 的统一的返回点：失败交给 zod 的 `prettifyError`，读到的是一份带字段路径的说明。 */
 function parseOrThrow<Result>(schema: z.ZodType<Result>, value: unknown): Result {
   const parsed = schema.safeParse(value);
   if (!parsed.success) {
@@ -97,7 +97,7 @@ const STATUS_CODEC: TypertCodec<RebuildStatusRequest> = {
   }),
 };
 
-/** 把宿主那三个方法挂到客户端远程面上的描述符（`id` 的形状照生成器：`<包>#<命名空间>/<方法>`）。
+/** 把宿主那三个方法挂到客户端远程通道上的描述符（`id` 的形状照生成器：`<包>#<命名空间>/<方法>`）。
  *  导出它只为一件事：`test/rebuild-remote.test.ts` 拿它与宿主侧 `remoteMethods()` 的标记对质
  *  —— 两侧分叉时卡片不会报错，只会"读不到"，所以那条比较必须在门禁里。 */
 export const REBUILD_DESCRIPTORS: readonly InvocationDescriptor[] = [
@@ -135,7 +135,15 @@ export interface RemoteHost {
   get?: (name: string, strict?: boolean) => unknown;
 }
 
-/** 官方网关的客户端服务面：本卡只用 `$mount` 一位（挂载一枚手写贡献）。 */
+/** 读取器抛出文案的来源：由卡片入口按当前 locale 现取，读取器本身不绑定语言。 */
+export interface RebuildReaderMessages {
+  /** `remote` 服务缺席（可选服务未装）。 */
+  readonly remoteMissing: () => string;
+  /** 挂载后读不到命名空间服务键：入参是 `remote.<namespace>`。 */
+  readonly namespaceMissing: (serviceKey: string) => string;
+}
+
+/** 官方网关的客户端宿主服务：本卡只用 `$mount` 一位（挂载一枚手写贡献）。 */
 interface RemoteMounter {
   $mount: (contribution: {
     package: string;
@@ -143,7 +151,7 @@ interface RemoteMounter {
   }) => Promise<unknown>;
 }
 
-/** 挂载后由网关提供的命名空间服务面（方法名 = descriptor.method，位置参数）。 */
+/** 挂载后由网关提供的命名空间宿主服务（方法名 = descriptor.method，位置参数）。 */
 interface RebuildNamespace {
   roots: () => Promise<RemoteResult<RebuildRoots>>;
   rebuild: (request: RebuildStartRequest) => Promise<RemoteResult<RebuildStartResult>>;
@@ -157,7 +165,7 @@ export interface RebuildReader {
   status: (jobId: string) => Promise<Record<string, unknown>>;
 }
 
-/** 这个值能当远程面用吗（只核我们要调的那一位；服务来自别的实现或版本时保守当作没有）。 */
+/** 这个值能当远程通道用吗（只核我们要调的那一位；服务来自别的实现或版本时保守当作没有）。 */
 const isRemoteMounter = (value: unknown): value is RemoteMounter =>
   isRecord(value) && typeof value["$mount"] === "function";
 
@@ -177,7 +185,7 @@ async function unwrapWire<Value>(
   call: Promise<RemoteResult<Value>>,
 ): Promise<Value> {
   const result = await call;
-  // 两个分支都写成真实语句（if-return / throw）：裸 if-throw 的隐式空 else 在 v8 的块覆盖
+  // 两个分支都写成真实语句（if-return / throw）：只写 if-throw 时，隐式的空 else 在 v8 的块覆盖
   // 里会记成一个无处落位的空块，整包 100% 门禁会被这条伪块随机打红。
   if (result.ok) {
     return result.value;
@@ -190,15 +198,15 @@ async function unwrapWire<Value>(
  * @param ctx - 客户端上下文
  * @returns 读取器
  */
-function buildRebuildReader(ctx: RemoteHost): RebuildReader {
+function buildRebuildReader(ctx: RemoteHost, messages: RebuildReaderMessages): RebuildReader {
   let mounted: Promise<unknown> | undefined;
   const namespaceOf = async (): Promise<RebuildNamespace> => {
     // remote 是未写进 inject 的可选服务，cordis 不保证提供方在卡片 apply 之前完成注册：
-    // 每次调用现读（与宿主侧可选服务的既定口径一致），缺席时点名抛错——把 apply 期读到
+    // 每次调用现读（与宿主侧可选服务的既定规则一致），缺席时点名抛错——把 apply 期读到
     // 的 undefined 定死，读取器就永远起不来，且没有任何时机重新解析。
     const mounter = ctx.get?.("remote");
     if (!isRemoteMounter(mounter)) {
-      throw new Error("工作区重建读面不可用：宿主网关没有提供 remote 服务");
+      throw new Error(messages.remoteMissing());
     }
     try {
       mounted ??= mounter.$mount({ package: PACKAGE_NAME, descriptors: REBUILD_DESCRIPTORS });
@@ -219,7 +227,7 @@ function buildRebuildReader(ctx: RemoteHost): RebuildReader {
     // 已经卸下的实现。
     const namespace = ctx.get?.(REBUILD_SERVICE_KEY);
     if (!isRebuildNamespace(namespace)) {
-      throw new Error(`${REBUILD_SERVICE_KEY} 未提供：宿主网关没有挂上这枚命名空间`);
+      throw new Error(messages.namespaceMissing(REBUILD_SERVICE_KEY));
     }
     return namespace;
   };
@@ -259,8 +267,11 @@ function buildRebuildReader(ctx: RemoteHost): RebuildReader {
  * @param ctx - 客户端上下文（只用 `get` 一位）
  * @returns 读取器；ctx 没有 get 面时 `undefined`
  */
-export function createRebuildReader(ctx: RemoteHost): RebuildReader | undefined {
+export function createRebuildReader(
+  ctx: RemoteHost,
+  messages: RebuildReaderMessages,
+): RebuildReader | undefined {
   // 单 return（三元的另一支是 `undefined`）：`consistent-return` 不接受"早退 undefined + 晚退函数"
-  // 这种混合形状，而这里两种结果本来就是同一件事的两面。
-  return typeof ctx.get === "function" ? buildRebuildReader(ctx) : undefined;
+  // 这种混合形状，而这里两种结果本来就是同一件事的两头。
+  return typeof ctx.get === "function" ? buildRebuildReader(ctx, messages) : undefined;
 }

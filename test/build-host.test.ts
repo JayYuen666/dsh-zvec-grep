@@ -46,7 +46,7 @@ describe("buildHost()", () => {
       !/from\s+["']schemastery["']/u.test(out),
       "host.js 不得再值导入公共 schemastery（0.1.7 volatile 解析只在宿主 fork 里）",
     );
-    // 子路径说明符：external 字符串项匹配不到的那个坑。**逐个说明符**列名——只查
+    // 子路径说明符：external 字符串项匹配不到的那个坑。**逐个说明符** 列名——只查
     // `@jayyuen66/dsh-plugin-shared/` 前缀会被 http 一条满足，看不见新接进来的
     // lib/text（终审指出的 Minor：那种断言对"某个子路径被内联"是瞎的）。
     for (const subpath of [
@@ -62,7 +62,7 @@ describe("buildHost()", () => {
       );
     }
     // 自有 lib/cli.ts 的转义器要"在产物内"（内联成功）而不是留成相对说明符：
-    // 三个字符的子串匹配几乎恒真（标识符/路径都可能撞上），这里锚定函数定义本身。
+    // 三个字符的子串匹配几乎永远成立（标识符/路径都可能撞上），这里锚定函数定义本身。
     assert.ok(out.includes("function shq("), "lib/cli.ts 的转义器须已并入单文件产物");
     assert.ok(!/from\s*["']\.\/lib\/cli/u.test(out), "lib/cli 不得留成相对说明符");
   });
@@ -70,11 +70,11 @@ describe("buildHost()", () => {
   it("产物 host.js：不残留 ./x.ts 形态的相对说明符", async () => {
     const out = await buildHost();
     // lib/*.ts 应已被吃进单文件；留着即"发布后 Node 直接拒载"的形态
-    assert.ok(!/["']\.\/[^"']*\.ts["']/u.test(out), "不得有 ./x.ts 说明符残留");
+    assert.ok(!/["']\.\/[^"']*\.ts["']/u.test(out), "不得有 ./x.ts说明符残留");
   });
 });
 
-describe("换装的产物面（ctx.jobs 只有类型面）", () => {
+describe("换装的产物（ctx.jobs 只有类型上）", () => {
   it("host.js 里不得出现 @deepseek-ai/dsh-jobs 的运行时说明符", async () => {
     const out = await buildHost();
     // 注册表那枚实例由宿主注入（dsh-base 默认装载 dsh-jobs-local），本包只借它的**类型**；
@@ -82,11 +82,11 @@ describe("换装的产物面（ctx.jobs 只有类型面）", () => {
     // 消费方的 node_modules 里解析得到，而它只在 devDependencies 里。
     // 判据只看 `from "…"` 位置：源码注释会随 rolldown 一起进产物，整串匹配会被注释误伤
     // （第一版就是这么把自己判红的）。
-    // 负向先行（dsh-jobs(?![\w-])）让两条断言各自独立可败：否则 -local 说明符
+    // 负向先行（dsh-jobs(?![\w-])）让两条断言各自独立可败：否则 -local 那条说明符
     // 总是先被第一条吞掉，第二条永远只剩「已通过」的那一半信息。
     assert.ok(
       !/from\s*["']@deepseek-ai\/dsh-jobs(?![\w-])/u.test(out),
-      "dsh-jobs 只能是类型面：产物里出现它的运行时说明符即值导入",
+      "dsh-jobs 只能是类型这一侧：产物里出现它的运行时说明符即值导入",
     );
     assert.ok(
       !/from\s*["']@deepseek-ai\/dsh-jobs-local/u.test(out),
@@ -143,7 +143,7 @@ describe("单文件产物的输出守卫", () => {
     assert.throws(() => singleEntryChunk(output, "entry.ts"), /2 项输出/u);
   });
 
-  it("拒绝 asset：单文件产物没有落盘 asset 的位置", () => {
+  it("拒绝 asset：单文件产物没有写到磁盘 asset 的位置", () => {
     const output = [
       outputItem("chunk", ARTIFACT_FILE, { isEntry: true, code: CHUNK_CODE }),
       outputItem("asset", "x.css"),

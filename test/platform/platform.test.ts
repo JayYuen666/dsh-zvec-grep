@@ -1,7 +1,6 @@
-// 跨平台语义钉：本包的根判据按 POSIX 形设计（README Support surface 明写 Windows 主机
-// 不在支持面内，失败形态是 fail-fast），但 CI 有 windows 格，命令串可能带着 Windows 侧
-// 的换行（CRLF）进来，shq 的转义也要经真 shell 验一遍。这一层钉「平台无关的拒绝档」
-// 与「平台相关的容忍档」，不重述单测已有的形状。
+// 跨平台语义钉：root 判据按平台档位（POSIX 默认 / win32 显式传入）分流，命令串可能带着
+// Windows 侧的换行（CRLF）进来，shq 的转义也要经真 POSIX shell 验一遍。这一层钉
+// 「平台无关的拒绝档」与「平台相关的容忍档」，不重述单测已有的形状。
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, it } from "vitest";
@@ -13,6 +12,7 @@ import type { Readable } from "node:stream";
 import fc from "fast-check";
 
 import { comparablePath } from "../../host.ts";
+import { BACKSLASH, runtimePlatform } from "../../lib/platform.ts";
 
 import { MESSAGES } from "../../lib/messages.ts";
 import { isGrepRgCommand, normalizeRoot } from "../../lib/search-predicates.ts";
@@ -62,25 +62,44 @@ describe("comparablePath 的平台门控（真 bug 的机制级门禁）", () =>
     );
   });
 
-  it("门控只在剥离分支：非 darwin 平台的原样返回路径不得夹带剥除", () => {
-    // 三元结构：条件为 darwin 才剥。用「darwin 比较出现在 startsWith 之前」钉结构。
+  it("门控只在剥离分支：darwin 判断出现在 /private 剥离之前", () => {
+    // 三元结构：条件为 darwin 才剥。用「darwin 比较出现在剥离处之前」钉结构。
     const body = comparablePathSource();
     const darwinAt = body.indexOf('=== "darwin"');
-    const stripAt = body.indexOf("startsWith");
+    const stripAt = body.indexOf('"/private"');
     assert.ok(darwinAt !== -1 && stripAt !== -1 && darwinAt < stripAt, "门控结构漂移");
   });
 
-  it("darwin 剥前缀、其余平台原样返回（平台注入，行为不随测试机变）", () => {
+  it("darwin 剥前缀、win32 归一大小写与分隔符、其余平台原样返回", () => {
     const privateTmpWs = "/private/tmp/ws";
     const tmpWs = "/tmp/ws";
     assert.equal(comparablePath(privateTmpWs, "darwin"), tmpWs);
     assert.equal(comparablePath(tmpWs, "darwin"), tmpWs);
     assert.equal(comparablePath(privateTmpWs, "linux"), privateTmpWs);
-    assert.equal(comparablePath(privateTmpWs, "win32"), privateTmpWs);
+    assert.equal(comparablePath(privateTmpWs, "win32"), String.raw`\private\tmp\ws`);
+    assert.equal(comparablePath(String.raw`C:\Repo\Src`, "win32"), String.raw`c:\repo\src`);
+    assert.equal(
+      comparablePath(String.raw`\\?\C:\Repo`, "win32"),
+      String.raw`c:\repo`,
+      "扩展长度盘符前缀被剥除后再比较",
+    );
+    assert.equal(
+      comparablePath(String.raw`\\?\UNC\srv\share\Repo`, "win32"),
+      String.raw`\\srv\share\repo`,
+      "扩展长度 UNC 前缀被还原成普通 UNC",
+    );
+  });
+
+  it("runtimePlatform 只把 win32 单独分档，其余都按 posix", () => {
+    assert.equal(runtimePlatform("win32"), "win32");
+    assert.equal(runtimePlatform("darwin"), "posix");
+    assert.equal(runtimePlatform("linux"), "posix");
+    assert.equal(BACKSLASH.length, 1);
+    assert.equal(BACKSLASH.codePointAt(0), 92);
   });
 });
 
-describe("win32 形状的根在各平台一律拒绝（fail-fast 是设计决定）", () => {
+describe("默认 POSIX 判据拒绝 win32 形状（平台必须显式传入）", () => {
   it("盘符、盘符相对、反斜杠 UNC、反斜杠混合都不是合法根", () => {
     const rejected = [
       String.raw`C:\repo`,
@@ -121,7 +140,7 @@ describe("命令串带 CRLF 换行（Windows 侧传来）", () => {
 
 describe("shq 经真 POSIX shell 的往返（转义唯一性的现实验证）", () => {
   // 转义器打给 bash -c 走单引号语义，Windows 的 cmd.exe 不是引号语义同族；
-  // 真 shell oracle 只在 POSIX 上跑，Windows 格跳过（escaper 的契约面本来就是 POSIX）。
+  // 真 shell oracle 只在 POSIX 上跑，Windows 格跳过（escaper 的契约本来就是 POSIX）。
   describe.skipIf(process.platform === "win32")("bash -c printf 往返", () => {
     it("任意不含 NUL/孤立代理项的串，shq 后经 bash 原样还原", async () => {
       await fc.assert(
