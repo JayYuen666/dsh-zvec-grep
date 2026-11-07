@@ -1,24 +1,29 @@
 // lib/search-predicates.ts —— search-first 门禁的**判据层**：一次检索算不算「本工作区里的
-// grep/rg」，分三面回答——命令文本面（isGrepRgCommand）、目标路径面（normalizeRoot /
-// pathInsideRoot / hasExternalTarget）、解锁额度面（SearchUnlock / unlockActive）。
+// grep/rg」，分三处回答——命令文本这一层（isGrepRgCommand）、目标路径这一层（normalizeRoot /
+// pathInsideRoot / hasExternalTarget）、解锁额度这一层（SearchUnlock / unlockActive）。
 //
 // 为什么从 lib/routing.ts 拆出来：这里只有「是不是 / 在不在 / 还有效吗」，编排（向上找索引
 // 根、扣额度、拼拦截文案）全留在 routing.ts。拆开后编排侧成了这些判据唯一的非测试消费者；
 // 此前它们与编排同处一文件并 export，`fallow --production` 便把这层边界上的取用一律判成
-// 「只被测试养着的导出」（同 lib/argv-guard.ts 之于 lib/cli.ts 的口径）。
+// 「只被测试养着的导出」（同 lib/argv-guard.ts 之于 lib/cli.ts 的规则）。
 //
-// shell 切词层（tokenizeShell 与那几张字符集表）**不**导出：它是命令面的内部实现，引号/
+// shell 切词层（tokenizeShell 与那几张字符集表）**不**导出：它是命令解析的内部实现，引号/
 // 注释/命令位的规则改一处会同时影响 isGrepRgCommand 与 hasExternalTarget，故与这两条判据
 // 同处一文件。
 //
 // 纯函数三不动：不触盘、不看时钟、不读设置——索引探测与时钟由 routing.ts 的 SearchFirstDeps
-// 向宿主取；文案双语同一口径：消息表（lib/messages.ts 的一份）由调用点作入参注入。
+// 向宿主取；文案双语同一种做法：消息表（lib/messages.ts 的一份）由调用点作入参注入。
 
+import path from "node:path";
 import { normalizeAbsolutePath } from "./cli.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
+import { BACKSLASH } from "./platform.ts";
+import type { PathPlatform } from "./platform.ts";
 
-/** 根目录末尾斜杠。 */
+/** 根目录末尾斜杠（POSIX）。 */
 const TRAILING_SLASHES = /\/+$/u;
+/** win32 根目录末尾分隔符（盘符根 `C:\` 与 UNC 根自身保留）。 */
+const WIN32_TRAILING_SEPARATORS = /[\\/]+$/u;
 
 const GREP_COMMAND_NAMES = new Set(["grep", "egrep", "fgrep", "rg"]);
 /** 含这些旗标的命令会立即打印并退出（--help/--version/-V），不产生检索。 */
@@ -34,9 +39,31 @@ const PROBE_FLAGS = new Set(["--help", "--version", "-V"]);
  * 与 SEARCH_PREFIX_WORDS 分开列：那里的包装是「首个实参是被执行的命令」，
  * 这里要多走一步——先认 `-c` 这类旗标，再把它后面那枚参数当脚本递归判一次。
  */
-const SHELL_WRAPPER_NAMES = new Set(["sh", "bash", "zsh", "dash", "ksh", "csh", "fish"]);
+const SHELL_WRAPPER_NAMES = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "csh",
+  "fish",
+  "pwsh",
+  "powershell",
+]);
 /** 壳层旗标里「其后一枚参数是脚本」的那些：`-c`、`-lc`、`-xc`（只认以 c 收尾的短旗标）。 */
 const SHELL_SCRIPT_FLAG = /^-[^c]*c$/u;
+/** PowerShell 的脚本旗标（`-c` / `-Command`，大小写不敏感）。 */
+const PWSH_SCRIPT_FLAGS: ReadonlySet<string> = new Set(["-c", "-command"]);
+/** win32 的盘符绝对路径（`C:\` / `C:/`）。 */
+const WIN32_DRIVE_ABSOLUTE = /^[A-Za-z]:[\\/]/u;
+/** win32 根相对路径的前导分隔符（拼接用）。 */
+const WIN32_LEADING_SEPARATORS = /^[\\/]+/u;
+/** win32 的转义字符是反引号；反斜杠是路径分隔符，不能当转义符。 */
+const WIN32_ESCAPE = "`";
+/** win32 的命令分隔符：反引号在 pwsh 是转义，不是命令替换。 */
+const WIN32_COMMAND_BREAK_CHARS: ReadonlySet<string> = new Set(["|", ";", "&", "\n", "\r"]);
+/** 命令名的可执行扩展：`rg.exe` / `grep.cmd` 与裸名同判。 */
+const WIN32_COMMAND_EXTENSIONS = /\.(?:exe|cmd|bat|com|ps1)$/iu;
 /** 递归深度上限：一层脚本里的再一层脚本够了；更深的不判（也不该有）。 */
 const MAX_SHELL_DEPTH = 2;
 
@@ -202,7 +229,7 @@ const SEARCH_VALUE_FLAGS = new Set([
 ]);
 /** 命令前的壳层赋值（`VAR=1 grep x` 里的 `VAR=1`）：它自己不是命令，其后仍是命令位。 */
 const SHELL_ASSIGNMENT = /^[A-Za-z_]\w*=/u;
-/** 包装命令的裸数值参数（`timeout 5 rg` 的 `5`）：也不是被执行的命令。 */
+/** 包装命令的纯数字参数（`timeout 5 rg` 的 `5`）：也不是被执行的命令。 */
 const BARE_NUMBER = /^\d+$/u;
 /** 结束一个 token、但**不**开启新命令位的字符（空白）。 */
 const TOKEN_BREAK_CHARS = new Set([" ", "\t", "\v", "\f"]);
@@ -229,7 +256,7 @@ interface ShellToken {
   atCommand: boolean;
   /** 该 token 紧跟在管道 `|` 之后：它的 stdin 是上一段命令的 stdout。 */
   piped: boolean;
-  /** 该 token 紧跟在重定向符之后（`> /tmp/out`）：它是 I/O 落点，不是检索操作数。 */
+  /** 该 token 紧跟在重定向符之后（`> /tmp/out`）：它是 I/O 目标，不是检索操作数。 */
   redirect: boolean;
 }
 
@@ -237,7 +264,17 @@ interface ShellToken {
  * 当前引号状态下，这个字符是否只是要写进 buffer 的字面量（既不结束引号、也不参与分隔）。
  * 单引号内一切皆字面量，只有同种引号本身能收束；双引号还认 `\` 转义，故反斜杠也出列。
  */
-function isQuotedLiteral(char: string, quote: string): boolean {
+/**
+ * 当前引号状态下，这个字符是否只是要写进 buffer 的字面量（既不结束引号、也不参与分隔）。
+ * POSIX：单引号内一切皆字面量；双引号还认 `\` 转义。
+ * win32：单引号内一切皆字面量（反引号也 literal）；双引号认 pwsh 的反引号转义。
+ */
+function isQuotedLiteral(char: string, quote: string, platform: PathPlatform): boolean {
+  if (platform === "win32") {
+    return (
+      (quote === "'" && char !== "'") || (quote === '"' && char !== '"' && char !== WIN32_ESCAPE)
+    );
+  }
   return (quote === "'" && char !== "'") || (quote === '"' && char !== '"' && char !== "\\");
 }
 
@@ -312,7 +349,7 @@ function toggleQuote(char: string, quote: string): string {
   return quote === char ? "" : char;
 }
 
-/** 包装命令的旗标、裸数值、壳层赋值：都不是被执行的命令，也不结束命令位链。 */
+/** 包装命令的旗标、纯数字参数、壳层赋值：都不是被执行的命令，也不结束命令位链。 */
 function isWrapperNoiseText(isCommand: boolean, text: string): boolean {
   return (
     isCommand && (text.startsWith("-") || BARE_NUMBER.test(text) || SHELL_ASSIGNMENT.test(text))
@@ -320,20 +357,37 @@ function isWrapperNoiseText(isCommand: boolean, text: string): boolean {
 }
 
 /**
- * 明确的路径形状：绝对路径、含 `/` 的相对路径、裸 `.` 与 `..`（模式词与文件名不算）。
- * `.` 与 `..` 都算：`grep foo .` 检索的就是当前工作区。
+ * 明确的路径形状：绝对路径、含分隔符的相对路径、裸 `.` 与 `..`（模式词与文件名不算）。
+ * win32 额外认盘符绝对（`C:\` / `C:/`）、UNC（`\\server\share`）与任何含 `\` 的词。
  */
-function isPathShape(text: string): boolean {
+function isPathShape(text: string, platform: PathPlatform): boolean {
+  if (platform === "win32") {
+    return (
+      WIN32_DRIVE_ABSOLUTE.test(text) ||
+      text.startsWith(BACKSLASH + BACKSLASH) ||
+      text.startsWith(BACKSLASH) ||
+      text.startsWith("/") ||
+      text.includes(BACKSLASH) ||
+      text.includes("/") ||
+      text === "." ||
+      text === ".."
+    );
+  }
   return text.startsWith("/") || text.includes("/") || text === "." || text === "..";
 }
 
 /**
- * token 的命令名（basename，小写）。
- * 两个调用点都只喂命令位 token，而命令位判据已经把 `-` 开头的选项排除了
- * （见 `commandPositionIndexes`），所以这里不再重复判一次前缀：那会是一条
- * 永远走不到的分支。
+ * token 的命令名（basename，小写）。win32 按 `\` 与 `/` 都切，并剥掉 `.exe` / `.cmd`
+ * 这类可执行扩展——`C:\tools\rg.exe` 与 `rg` 是同一个检索命令。
  */
-function baseName(text: string): string {
+function baseName(text: string, platform: PathPlatform): string {
+  if (platform === "win32") {
+    const separated = text.replaceAll("\\", "/");
+    return separated
+      .slice(separated.lastIndexOf("/") + 1)
+      .toLowerCase()
+      .replace(WIN32_COMMAND_EXTENSIONS, "");
+  }
   return text.slice(text.lastIndexOf("/") + 1).toLowerCase();
 }
 
@@ -356,7 +410,11 @@ interface ChainStep {
  * 单独成函数不为复用，只为把这条含 3 层嵌套的判定链从循环里挪出来——循环里只剩
  * 「推进一步、命中就记下标」两件事。
  */
-function advanceCommandChain(token: ShellToken, state: ChainState): ChainStep {
+function advanceCommandChain(
+  token: ShellToken,
+  state: ChainState,
+  platform: PathPlatform,
+): ChainStep {
   const { text } = token;
   const consumingValue = state.pendingValue;
   const next: ChainState = { ...state, pendingValue: false };
@@ -385,7 +443,9 @@ function advanceCommandChain(token: ShellToken, state: ChainState): ChainStep {
     return { state: next, command: false };
   }
   if (isCommand) {
-    next.wrapper = SEARCH_PREFIX_WORDS.has(baseName(text)) ? baseName(text) : "";
+    next.wrapper = SEARCH_PREFIX_WORDS.has(baseName(text, platform))
+      ? baseName(text, platform)
+      : "";
   }
   next.afterPrefix = false;
   return { state: next, command: isCommand };
@@ -393,72 +453,115 @@ function advanceCommandChain(token: ShellToken, state: ChainState): ChainStep {
 
 /**
  * 手写 shell 切词（只为「找出命令位上的命令名」服务，不做完整求值）：
- *   - 单/双引号与反斜杠转义**内部**的字符不参与分隔 → `echo "grep x"`、
+ *   - 单/双引号与转义字符**内部**的字符不参与分隔 → `echo "grep x"`、
  *     `printf 'grep'`、`git commit -m "use rg"` 里的字面量不再被当成命令
  *     （旧实现把引号当分隔符，故这三种全被判为检索 → 过度拦截）；
+ *   - 转义字符随方言变：POSIX 是反斜杠，win32（pwsh）是反引号——win32 上反斜杠是
+ *     路径分隔符，`C:\repo` 不能被切成 `C:repo`；
  *   - 引号外、词首的 `#` 起为注释，整段跳到行尾；
- *   - 控制符（`|` `;` `&` 换行 反引号）与**独立成词**的 `(` / `{` 之后的 token 记为
- *     命令位；词中的组字符属参数展开 / 命令替换（`${DIR}/src`、`$(pwd)/src`），并进当前 token；
- *   - 重定向符（`<` `>`）之后的那一个 token 标记为 `redirect`：它是 I/O 落点，不是检索操作数。
+ *   - 控制符（POSIX：`|` `;` `&` 换行 反引号；win32：`|` `;` `&` 换行）与**独立成词**
+ *     的 `(` / `{` 之后的 token 记为命令位；词中的组字符属参数展开 / 命令替换
+ *     （`${DIR}/src`、`$(pwd)/src`），并进当前 token；
+ *   - 重定向符（`<` `>`）之后的那一个 token 标记为 `redirect`：它是 I/O 目标，不是检索操作数。
  * 双引号内保留字面内容（含空格），故 `"/usr/bin/rg foo"` 是一个非命令位 token。
  */
-function tokenizeShell(command: string): ShellToken[] {
+/** 切词器的滚动状态；escaped 表示上一字符是转义符，当前字符按字面量落 buffer。 */
+interface TokenizeState {
+  buffer: string;
+  atCommand: boolean;
+  pipedNext: boolean;
+  redirectNext: boolean;
+  quote: string;
+  escaped: boolean;
+}
+
+/** 真吐出 token 才消费命令位：空 flush 若清位，控制符后的第一个词就丢了命令位。 */
+function flushToken(tokens: ShellToken[], state: TokenizeState): void {
+  if (state.buffer.length === 0) {
+    return;
+  }
+  tokens.push({
+    text: state.buffer,
+    atCommand: state.atCommand,
+    piped: state.pipedNext,
+    redirect: state.redirectNext,
+  });
+  state.buffer = "";
+  state.atCommand = false;
+  state.pipedNext = false;
+  state.redirectNext = false;
+}
+
+/** pwsh 的引号内转义：`''` / `""` 是字面引号，不是闭合。返回续读下标。 */
+function consumeWin32Quote(command: string, index: number, state: TokenizeState): number {
+  const char = command.slice(index, index + 1);
+  if (command.slice(index + 1, index + 2) === char) {
+    state.buffer += char;
+    return index + 1;
+  }
+  state.quote = "";
+  return index;
+}
+
+/** 推进一个字符，返回该字符处理后应继续读的下标（注释会一次跳多格）。 */
+function advanceTokenState(
+  command: string,
+  index: number,
+  state: TokenizeState,
+  tokens: ShellToken[],
+  platform: PathPlatform,
+): number {
+  const char = command.slice(index, index + 1);
+  const breakChars = platform === "win32" ? WIN32_COMMAND_BREAK_CHARS : COMMAND_BREAK_CHARS;
+  if (state.escaped) {
+    state.buffer += char;
+    state.escaped = false;
+  } else if (isQuotedLiteral(char, state.quote, platform)) {
+    state.buffer += char;
+  } else if (isCommentStart(char, state)) {
+    return indexAfterComment(command, index);
+  } else if (char === (platform === "win32" ? WIN32_ESCAPE : "\\")) {
+    state.escaped = true;
+  } else if (platform === "win32" && state.quote !== "" && char === state.quote) {
+    return consumeWin32Quote(command, index, state);
+  } else if (QUOTE_CHARS.has(char)) {
+    state.quote = toggleQuote(char, state.quote);
+  } else if (breakChars.has(char)) {
+    flushToken(tokens, state);
+    markCommandBreak(command, index, char, state);
+  } else if (isCommandSubstitutionOpen(char, state)) {
+    // 丢掉那个孤零零的 `$`（flush 空 buffer 不动命令位），随后按控制符断开。
+    state.buffer = "";
+    flushToken(tokens, state);
+    markCommandBreak(command, index, char, state);
+  } else if (GROUP_CHARS.has(char)) {
+    consumeGroupChar(char, state);
+  } else if (REDIRECT_CHARS.has(char)) {
+    flushToken(tokens, state);
+    state.redirectNext = true;
+  } else if (TOKEN_BREAK_CHARS.has(char)) {
+    flushToken(tokens, state);
+  } else {
+    state.buffer += char;
+  }
+  return index;
+}
+
+function tokenizeShell(command: string, platform: PathPlatform): ShellToken[] {
   const tokens: ShellToken[] = [];
-  const state = { buffer: "", atCommand: true, pipedNext: false, redirectNext: false, quote: "" };
-  const flush = (): void => {
-    if (state.buffer.length > 0) {
-      tokens.push({
-        text: state.buffer,
-        atCommand: state.atCommand,
-        piped: state.pipedNext,
-        redirect: state.redirectNext,
-      });
-      state.buffer = "";
-      // 只有真吐出 token 才消费掉命令位：`cat a | grep x` 里 `|` 与 `grep` 之间的
-      // 那个空格也必须让位（空 flush 若清位，控制符后的第一个词就丢了命令位）。
-      state.atCommand = false;
-      state.pipedNext = false;
-      state.redirectNext = false;
-    }
+  const state: TokenizeState = {
+    buffer: "",
+    atCommand: true,
+    pipedNext: false,
+    redirectNext: false,
+    quote: "",
+    escaped: false,
   };
   let index = 0;
-  let escaped = false;
   while (index < command.length) {
-    // slice 而非 command[index]：越界给空串而不是 undefined（省掉一个不可能的分支）
-    const char = command.slice(index, index + 1);
-    if (escaped) {
-      state.buffer += char;
-      escaped = false;
-    } else if (isQuotedLiteral(char, state.quote)) {
-      state.buffer += char;
-    } else if (isCommentStart(char, state)) {
-      // 注释跳到行尾（见 indexAfterComment：必须停在换行前一步）
-      index = indexAfterComment(command, index);
-    } else if (char === "\\") {
-      escaped = true;
-    } else if (QUOTE_CHARS.has(char)) {
-      state.quote = toggleQuote(char, state.quote);
-    } else if (COMMAND_BREAK_CHARS.has(char)) {
-      flush();
-      markCommandBreak(command, index, char, state);
-    } else if (isCommandSubstitutionOpen(char, state)) {
-      // 丢掉那个孤零零的 `$`（flush 空 buffer 不动命令位），随后按控制符断开。
-      state.buffer = "";
-      flush();
-      markCommandBreak(command, index, char, state);
-    } else if (GROUP_CHARS.has(char)) {
-      consumeGroupChar(char, state);
-    } else if (REDIRECT_CHARS.has(char)) {
-      flush();
-      state.redirectNext = true;
-    } else if (TOKEN_BREAK_CHARS.has(char)) {
-      flush();
-    } else {
-      state.buffer += char;
-    }
-    index += 1;
+    index = advanceTokenState(command, index, state, tokens, platform) + 1;
   }
-  flush();
+  flushToken(tokens, state);
   return tokens;
 }
 
@@ -467,15 +570,15 @@ function tokenizeShell(command: string): ShellToken[] {
  * env…）之后那个真正的实参。
  *
  * 「包装命令之后」不是「紧邻的下一个 token」：包装命令自己的选项（`git --no-pager`、
- * `xargs -0`）、选项取值（`sudo -u root`）、裸数值（`timeout 5`）、壳层赋值（`VAR=1`）
+ * `xargs -0`）、选项取值（`sudo -u root`）、纯数字参数（`timeout 5`）、壳层赋值（`VAR=1`）
  * 都还站在命令位之前。只认「紧邻下一个」时命令位链在这些形态上直接断掉，检索调用
  * 漏判 —— 而漏判的方向是门禁放行。这几类一律「跳过但不断链」。
  */
-function commandPositionIndexes(tokens: ShellToken[]): number[] {
+function commandPositionIndexes(tokens: ShellToken[], platform: PathPlatform): number[] {
   const out: number[] = [];
   let chain: ChainState = { wrapper: "", pendingValue: false, afterPrefix: false };
   for (const [index, token] of tokens.entries()) {
-    const step = advanceCommandChain(token, chain);
+    const step = advanceCommandChain(token, chain, platform);
     chain = step.state;
     if (step.command) {
       out.push(index);
@@ -485,18 +588,22 @@ function commandPositionIndexes(tokens: ShellToken[]): number[] {
 }
 
 /** 取壳层包装那条 `-c` 脚本参数（`bash -c '…'` 里引号内那一整枚 token）。 */
-function shellScriptArguments(tokens: ShellToken[]): string[] {
+function shellScriptArguments(tokens: ShellToken[], platform: PathPlatform): string[] {
   const scripts: string[] = [];
   for (const [index, token] of tokens.entries()) {
     // 空脚本（`bash -c ''`）切不出 token，那一枚 script 直接是 undefined，无需再判长度。
     const flag = tokens[index + 1];
     const script = tokens[index + 2];
+    const scriptFlag =
+      platform === "win32"
+        ? flag !== undefined && PWSH_SCRIPT_FLAGS.has(flag.text.toLowerCase())
+        : flag !== undefined && SHELL_SCRIPT_FLAG.test(flag.text);
     if (
       token.atCommand &&
-      SHELL_WRAPPER_NAMES.has(baseName(token.text)) &&
+      SHELL_WRAPPER_NAMES.has(baseName(token.text, platform)) &&
       flag !== undefined &&
       script !== undefined &&
-      SHELL_SCRIPT_FLAG.test(flag.text) &&
+      scriptFlag &&
       !script.atCommand
     ) {
       scripts.push(script.text);
@@ -509,15 +616,15 @@ function shellScriptArguments(tokens: ShellToken[]): string[] {
  * 该命令位 token 之后的实参里是否出现路径形状的操作数（旗标不算）。
  * `.` 与 `..` 都算：`grep foo .` 检索的就是当前工作区。
  */
-function hasPathOperand(tokens: ShellToken[], from: number): boolean {
+function hasPathOperand(tokens: ShellToken[], from: number, platform: PathPlatform): boolean {
   // 切片而不是带下标循环：切片里不可能有 undefined，省掉一个永远走不到的兜底分支
   // （本仓覆盖率门禁是 100%，防御性分支要么有真触发路径、要么不写）。
   for (const token of tokens.slice(from + 1)) {
     if (token.atCommand) {
       break;
     }
-    // 重定向目标（`> /tmp/out`）是 I/O 落点、`-x` 是旗标：都不构成「检索文件系统」的操作数
-    if (!token.redirect && !token.text.startsWith("-") && isPathShape(token.text)) {
+    // 重定向目标（`> /tmp/out`）是 I/O 目标、`-x` 是旗标：都不构成「检索文件系统」的操作数
+    if (!token.redirect && !token.text.startsWith("-") && isPathShape(token.text, platform)) {
       return true;
     }
   }
@@ -548,17 +655,21 @@ function hasPathOperand(tokens: ShellToken[], from: number): boolean {
  *   - 嵌套只认壳层包装名单里 `-c` 后面那一段，且最多看进去两层；名单外的前缀
  *     （`watch -n 5 grep`）与 `awk 'BEGIN{system("grep x y")}'` 一类不递归。
  */
-export function isGrepRgCommand(command: string, depth = 0): boolean {
-  const tokens = tokenizeShell(command);
+export function isGrepRgCommand(
+  command: string,
+  depth = 0,
+  platform: PathPlatform = "posix",
+): boolean {
+  const tokens = tokenizeShell(command, platform);
   if (tokens.some((token) => PROBE_FLAGS.has(token.text))) {
     return false;
   }
-  const direct = commandPositionIndexes(tokens).some((index) => {
+  const direct = commandPositionIndexes(tokens, platform).some((index) => {
     const token = tokens[index];
-    if (token === undefined || !GREP_COMMAND_NAMES.has(baseName(token.text))) {
+    if (token === undefined || !GREP_COMMAND_NAMES.has(baseName(token.text, platform))) {
       return false;
     }
-    return !(token.piped && !hasPathOperand(tokens, index));
+    return !(token.piped && !hasPathOperand(tokens, index, platform));
   });
   if (direct) {
     return true;
@@ -566,20 +677,54 @@ export function isGrepRgCommand(command: string, depth = 0): boolean {
   if (depth >= MAX_SHELL_DEPTH) {
     return false;
   }
-  return shellScriptArguments(tokens).some((script) => isGrepRgCommand(script, depth + 1));
+  return shellScriptArguments(tokens, platform).some((script) =>
+    isGrepRgCommand(script, depth + 1, platform),
+  );
 }
 
 /**
- * 去掉尾部斜杠的 root 归一化（'/' 自身保持 '/'）。
- *
- * 只认 `/`：本包的根判据（`assertAbsoluteRoot` 只收 `/` 开头的串）、命令 tokenizer 与
- * `rootPaths` 覆盖判据都按 POSIX 形切分，root 归一化再多认一种分隔符只会让上游认得出、
- * 下游判不回——README 的 Support surface 一节写明 Windows 主机不在支持面内，
- * 失败形态是 fail-fast 而不是静默漂移。要真正支持 Windows，得连上面那三处判据一起改。
+ * 去掉尾部斜杠的 root 归一化。POSIX 只认 `/`；win32 认 `\` 与 `/`，盘符根 `C:\`
+ * 与 UNC 共享根 `\\server\share\` 保留原形（它们本身就是根）。
+ * @param root 待归一化的根
+ * @param platform 路径方言（缺省 posix；宿主按 runtimePlatform() 传入）
+ * @returns 归一后的根
  */
-export function normalizeRoot(root: string): string {
+export function normalizeRoot(root: string, platform: PathPlatform = "posix"): string {
+  if (platform === "win32") {
+    const converted = root.replaceAll("/", "\\");
+    const parsedRoot = path.win32.parse(converted).root;
+    if (converted === parsedRoot) {
+      return parsedRoot;
+    }
+    const trimmed = converted.replace(WIN32_TRAILING_SEPARATORS, "");
+    return trimmed.length > 0 ? trimmed : parsedRoot;
+  }
   const trimmed = root.replace(TRAILING_SLASHES, "");
   return trimmed.length > 0 ? trimmed : "/";
+}
+
+/** win32 的完整限定路径（盘符绝对或 UNC）；不是则 false。 */
+function isWin32Absolute(text: string): boolean {
+  const separated = text.replaceAll("/", "\\");
+  return WIN32_DRIVE_ABSOLUTE.test(separated) || separated.startsWith(BACKSLASH + BACKSLASH);
+}
+
+/** 相对路径离开根：`..`、`..\x`、`../x`（`..foo` 是正常子项，不算逃逸）。 */
+const ESCAPES_ROOT = /^\.\.(?:[\\/]|$)/u;
+
+/**
+ * win32 下的目标补全：完整限定路径原样用；`\foo` 或 `/foo` 按根的盘符/共享补全
+ * （pwsh 的根相对路径语义）；其余按相对 root 拼接。
+ */
+function qualifyWin32Target(target: string, base: string): string {
+  if (isWin32Absolute(target)) {
+    return target;
+  }
+  if (target.startsWith(BACKSLASH) || target.startsWith("/")) {
+    const { root } = path.win32.parse(base);
+    return `${root}${target.replace(WIN32_LEADING_SEPARATORS, "")}`;
+  }
+  return `${base}\\${target}`;
 }
 
 /**
@@ -590,17 +735,31 @@ export function normalizeRoot(root: string): string {
  * 归一化时 `..` 越出文件系统根，说明目标必然在 root 之外 → 直接 false
  * （这里是「判范围」，不是「判合法性」）。messages 只为把归一化异常喂给
  * normalizeAbsolutePath——那条文本在这里被丢弃，出界才是结论。
+ *
+ * win32 的「之内」按 `path.win32.relative` 判：盘符大小写与分隔符差异都被归一，
+ * 不同盘符/共享返回绝对路径 ⇒ 根外。
  */
 export function pathInsideRoot(
   target: string | undefined,
   root: string,
   messages: ZvecGrepMessages,
+  platform: PathPlatform = "posix",
 ): boolean {
   if (target === undefined || target.trim().length === 0) {
     return true;
   }
-  const base = normalizeRoot(root);
+  const base = normalizeRoot(root, platform);
   const targetText = target.trim();
+  if (platform === "win32") {
+    let absolute: string;
+    try {
+      absolute = normalizeAbsolutePath(qualifyWin32Target(targetText, base), messages, "win32");
+    } catch {
+      return false;
+    }
+    const relative = path.win32.relative(base, absolute);
+    return relative === "" || (!ESCAPES_ROOT.test(relative) && !path.win32.isAbsolute(relative));
+  }
   const joined = targetText.startsWith("/") ? targetText : `${base}/${targetText}`;
   let absolute: string;
   try {
@@ -631,10 +790,11 @@ export function hasExternalTarget(
   root: string,
   command: string,
   messages: ZvecGrepMessages,
+  platform: PathPlatform = "posix",
 ): boolean {
-  const base = normalizeRoot(root);
-  const tokens = tokenizeShell(command);
-  const commandIndexes = new Set(commandPositionIndexes(tokens));
+  const base = normalizeRoot(root, platform);
+  const tokens = tokenizeShell(command, platform);
+  const commandIndexes = new Set(commandPositionIndexes(tokens, platform));
   /** 上一枚是检索侧的取值旗标：这一枚是它的值（模式 / glob / 编码名…），不是目标。 */
   let pendingValue = false;
   for (const [index, token] of tokens.entries()) {
@@ -643,13 +803,13 @@ export function hasExternalTarget(
     pendingValue = false;
     // 三类都不是检索目标：命令位 token 是**程序本身**（`/usr/bin/grep`、`git`、`xargs`），
     // 否则任何绝对路径写法的 grep 都能凭自己那条路径判成「根外目标」而放行（实测绕过）；
-    // 取值旗标的取值是模式/glob；重定向目标（`> /tmp/out`）是 I/O 落点。
+    // 取值旗标的取值是模式/glob；重定向目标（`> /tmp/out`）是 I/O 目标。
     const notTarget = commandIndexes.has(index) || consumedValue || token.redirect;
     if (!notTarget) {
-      // flag 选项（-*）跳过；仅认明确的路径形状：绝对路径 / 含 / 的相对路径 / 裸 ..
+      // flag 选项（-*）跳过；仅认明确的路径形状：绝对路径 / 含分隔符的相对路径 / 裸 ..
       if (text.startsWith("-")) {
         pendingValue = SEARCH_VALUE_FLAGS.has(text);
-      } else if (isPathShape(text) && !pathInsideRoot(text, base, messages)) {
+      } else if (isPathShape(text, platform) && !pathInsideRoot(text, base, messages, platform)) {
         return true;
       }
     }
@@ -682,6 +842,14 @@ export function unlockActive(unlock: SearchUnlock | undefined, now: number): boo
  * @param messages 文案表（归一化异常时喂给它，异常文本在此被丢弃，出界才是结论）
  * @returns 是否互为祖先/后代
  */
-export function pathsRelated(left: string, right: string, messages: ZvecGrepMessages): boolean {
-  return pathInsideRoot(left, right, messages) || pathInsideRoot(right, left, messages);
+export function pathsRelated(
+  left: string,
+  right: string,
+  messages: ZvecGrepMessages,
+  platform: PathPlatform = "posix",
+): boolean {
+  return (
+    pathInsideRoot(left, right, messages, platform) ||
+    pathInsideRoot(right, left, messages, platform)
+  );
 }

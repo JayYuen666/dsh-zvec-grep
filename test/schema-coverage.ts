@@ -2,7 +2,7 @@
 //
 // 背景：host.ts 导出的 Config 里标了 `.volatile()` 的字段会被宿主投影成设置表单
 // （0.1.7 起隐式注册：命名空间 = profile 条目 id，旧的 `settings.register(ns, schema, base)`
-// 三面已删），于是可能出现 N 个可配字段里 client 卡片只渲染 M 个（M < N）——那 N-M 个
+// 三处已删），于是可能出现 N 个可配字段里 client 卡片只渲染 M 个（M < N）——那 N-M 个
 // 字段用户无法从 UI 触及，只能改 settings 底层或读源码。曾踩过的坑：quality-gate 的
 // `memoryFeedback`（功能性开关）在卡片漏项，反复审查后才被发现。
 //
@@ -17,15 +17,15 @@
 //     allowUnbound: [{ field: 'x', reason: '仅 CLI 侧使用，UI 无入口' }],
 //   })
 //
-// 解析口径：收**全部** `Schema.object(` 块的并集；实参是字面量就取顶层键，是标识符就回溯到
+// 解析规则：收**全部** `Schema.object(` 块的并集；实参是字面量就取顶层键，是标识符就回溯到
 // 同名 `const` 字面量；字符串、模板串与注释里的括号不参与配对；解析不了的块报成问题项
 // 而不是静默跳过——否则"解析器少认一种写法"和"这个包没有设置 schema"在结果上无法区分。
 //
-// 注意：绑定识别是"出现即算绑定"的宽松启发式（见 boundFieldsIn）。它会**漏拦**也会**假绿**：
+// 注意：绑定识别是"出现即算绑定"的宽松启发式（见 boundFieldsIn）。它会**漏拦**也会**误判通过**：
 //   · 多认（注释里的 set('x')、别的对象上的同名键）→ 门禁更宽松，那是已知代价；
 //   · 少认（组件是 .tsx、字段名拼在模板串里）→ 功能性缺失被放过，那是真漏拦。
 // 所以注释先剥一遍（字符串保留——字段名本身就写在字符串里）；扩展名白名单收 .tsx；
-// 测试文件与 __tests__ 目录不进绑定面（那里大量出现 set('x')，会把未绑定判成已绑定）。
+// 测试文件与 __tests__ 目录不进绑定检查的范围（那里大量出现 set('x')，会把未绑定判成已绑定）。
 
 import { it } from "vitest";
 import assert from "node:assert/strict";
@@ -310,7 +310,7 @@ function fieldsOfSchemaArgument(hostTs: string, argument: string, markerStart: n
  * 去掉注释（块注释整段抹掉、行注释抹到行尾），保留字符串原样。
  *
  * 块起点判定与绑定识别都要扫**这条之后**的文本：注释里写着的 `Schema.object({ legacy: 1 })`
- * 会被当成块起点、被注释掉的旧代码里的 `field: 'x'` 会算成"已绑定"，一个虚构漏项、一个假绿。
+ * 会被当成块起点、被注释掉的旧代码里的 `field: 'x'` 会算成"已绑定"，一个虚构漏项、一个误判通过。
  * 字符串不剥：字段名本身就写在字符串里（`set("importAllowRoots")`），抹了等于一个都认不出。
  */
 export function stripComments(src: string): string {
@@ -357,11 +357,11 @@ export function stringSpans(text: string): (readonly [number, number])[] {
 
 /**
  * 从 host.ts 抽取**全部** `Schema.object(...)` 块内的字段名（并集）。
- * 解析不了的块不静默跳过，由调用方把块首原文报成问题项。
+ * 解析不了的块不会静默跳过，由调用方把块首原文报成问题项。
  *
  * ⚠ marker 只在**字符串之外**算数：这里扫的是剥注释、保留字符串的文本，所以
  * `文案: "对 Schema.object( 的说明"` 里那一处会被当成块起点，随后取到的实参是一段无关文本，
- * 结果是一条指向 host.ts 的假红（合法代码硬失败）。反向一侧同样坏：把无关对象里的键当成
+ * 结果是一条指向 host.ts 的误报（合法代码硬失败）。反向一侧同样坏：把无关对象里的键当成
  * host 字段，门禁就要求一张并不存在的控件。
  */
 export function hostSchemaFields(source: string): { fields: string[]; unresolved: string[] } {
@@ -405,7 +405,7 @@ export function hostSchemaFields(source: string): { fields: string[]; unresolved
   return { fields: [...fields], unresolved };
 }
 
-/** 捕获组取值（严格模式下 matchAll 捕获为 `string | undefined`，这里收口为 string）。 */
+/** 捕获组取值（严格模式下 matchAll 捕获为 `string | undefined`，这里统一处理为 string）。 */
 function group(match: RegExpExecArray, index: number): string {
   return match[index] ?? "";
 }
@@ -446,7 +446,7 @@ const SKIP_DIR_NAMES = new Set(["node_modules", "test", "tests", "spec", "specs"
  *
  * 两处读失败的待遇不同，各自有理由：文件读不动跳过（枚举出来的文件偶发不可读不该让整个
  * 门禁炸掉，交回「交回绑定集」这个契约）；**目录列不出**只有 ENOENT（该树不存在）安静返回空，
- * 其它错误（权限、EMFILE）一律上抛 —— 静默缩小扫描面会把未绑定判成已绑定，正是本门禁
+ * 其它错误（权限、EMFILE）一律上抛 —— 静默缩小扫描范围会把未绑定判成已绑定，正是本门禁
  * 最忌讳的失效方向，宁可红在收集期。
  */
 export async function walk(dir: string): Promise<string[]> {

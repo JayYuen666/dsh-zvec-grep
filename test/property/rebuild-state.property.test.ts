@@ -1,12 +1,12 @@
-// rebuild-state 状态机的属性面：随机 claim/attach/release 交错下，同根互斥、代次校验、
+// rebuild-state 状态机的属性测试：随机 claim/attach/release 交错下，同根互斥、代次校验、
 // 幂等释放三条不变式必须对任意命令序列成立。期望值由测试内的模型表（root → 凭据 + 代数）
 // 独立维护，不从被测实现派生。等待出口与监听器清理的确定性场景在 test/rebuild-state.test.ts，
-// 这里只补「随机交错」那一面。
+// 这里只补「随机交错」这种情况。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import fc from "fast-check";
 import { getEventListeners } from "node:events";
-// 官方作业品牌串的**值**形式（JobId("x") 只是给同一个字符串贴牌，不做校验），同 test/rebuild-state.test.ts。
+// 带 brand 标记的官方作业 id，取其**值**形式（JobId("x") 只打 brand 标记，不做校验），同 test/rebuild-state.test.ts。
 import { JobId as jobIdOf } from "@deepseek-ai/dsh-jobs";
 
 import { MESSAGES } from "../../lib/messages.ts";
@@ -20,7 +20,7 @@ const ROOT_POOL = ["/repo", "/repo/pkg", "/other"] as const;
 type RootName = (typeof ROOT_POOL)[number];
 type CredentialKind = "current" | "stale" | "none";
 
-/** 模型里一个 root 的记账：当前凭据、已发作业号数、历代替身（供陈旧凭据用例）。 */
+/** 模型里一个 root 的记录下来：当前凭据、已发作业号数、历代替身（供陈旧凭据用例）。 */
 interface RootModel {
   credential: ActiveRebuild | undefined;
   jobsIssued: number;
@@ -171,7 +171,7 @@ describe("rebuild-state 注册表对模型表的随机交错", () => {
           }
         }
 
-        // 读面收口：active 是精确键；covering 是祖先关系读（登记根是查询根的祖先或同一处），
+        // 读取接口统一处理：active 是精确键；covering 是祖先关系读（登记根是查询根的祖先或同一处），
         // 按段前缀契约独立判定——池里的根有嵌套，/repo 的条目会覆盖 /repo/pkg 的查询。
         const coveredByModel = (query: string): boolean => {
           for (const [entryRoot, record] of model) {

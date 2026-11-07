@@ -1,15 +1,16 @@
 // 点对点（P2P）契约测试：**本包构造的命令 vs 真 zg CLI**。
 //
 // 这一层没有任何 mock，也没有插件参与——只有 lib/cli.ts 造出来的命令行与真 zg 的
-// argv 解析器/输出格式化/错误码面对话。它盯的是「上游事实有没有变」：
+// argv 解析器/输出格式化/错误码面对话。它盯的是「上游事实有没有变」（0.3.0 现量）：
 //
 //   - 每一条旗标真 zg 还认不认（`--preview` / `--symbol-type` / `--reset-paths` …）；
 //   - 穷举通道的冲突集合还是不是注释里写的那几条（含报错原文）；
 //   - `--check-ready` 的非零退出码语义（报告在 stdout、结论在退出码）；
-//   - 命中摘要的两个正则还匹配不匹配真输出的形状（`hits: N` / `#N matchedBy=…`）；
+//   - 命中摘要的正则还匹配不匹配真输出的形状（`#N 路径:行号`，组间 `-- query` 分隔行）；
 //   - stderr 进度噪声词表还覆不覆盖真进度行；
-//   - 并发建索引的错误码与明细键还是不是 lib/zg-errors.ts 认的那几个；
-//   - `--ignore-file` 指向不存在的文件时上游会把这棵树弄坏（这不是静默忽略）。
+//   - 并发建索引的错误码还是不是 lib/zg-errors.ts 认的那几个；
+//   - `--ignore-file` 指向不存在的文件时 0.3.0 **静默容忍**（0.2.2 会弄坏整棵树）；
+//   - MCP lane：daemon 的 HTTP 端点、token 鉴权与 lib/daemon-client.ts 的全流程。
 //
 // 需要本地 embedding 权重的那几例按缓存是否就绪跳过（否则 zg 要联网下载模型）。
 
@@ -19,8 +20,9 @@ import type { ChildProcess } from "node:child_process";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
 import type { Readable } from "node:stream";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { cp } from "node:fs/promises";
+import os, { tmpdir } from "node:os";
 import path from "node:path";
 import {
   buildIndexCommand,
@@ -40,7 +42,8 @@ import {
   versionAtLeast,
 } from "../../lib/zg-version.ts";
 import { hitSummary, signalStderr } from "../../host.ts";
-import { inOrder, canMakeUnreadableFile, zgAvailable } from "../integration/host-stack.ts";
+import { createDaemonClient } from "../../lib/daemon-client.ts";
+import { inOrder, zgAvailable } from "../integration/host-stack.ts";
 
 /**
  * 子进程退出码（close 事件的第一个参数）。
@@ -90,6 +93,7 @@ const RUN_TIMEOUT_MS = 20_000;
 async function run(
   command: string,
   cwd: string,
+  env?: Record<string, string>,
 ): Promise<{ stdout: string; stderr: string; status: number }> {
   const child = execFile(command, {
     cwd,
@@ -97,6 +101,7 @@ async function run(
     encoding: "utf8",
     timeout: RUN_TIMEOUT_MS,
     killSignal: "SIGKILL",
+    ...(env === undefined ? {} : { env: { ...process.env, ...env } }),
   });
   // spawn 失败走 'error'，必须接住并点名命令。maxBuffer 超限本机实测**不**走 'error'：
   // 而是把子进程打死、以 close(code=null, signal=SIGKILL) 收（`seq 1 400000` 实测），
@@ -147,7 +152,7 @@ const LOCAL_EMBEDDING = "local/potion-code-16m-v2";
 /** 本地权重是否在场（缺了它，真建索引的用例会转成联网下载）。 */
 const modelReady = embeddingCached(LOCAL_EMBEDDING);
 
-/** 索引命令的本包口径：embedding / 文案表 / clientMode 缺省那一路都收在这里，调用点只递 args。 */
+/** 索引命令的本包规则：embedding / 文案表 / clientMode 缺省那一路都收在这里，调用点只递 args。 */
 function indexCommand(args: IndexArgs, mode?: ClientMode): BuiltCommand {
   return buildIndexCommand(args, LOCAL_EMBEDDING, messages, clientModeOf(mode, messages));
 }
@@ -159,7 +164,7 @@ const AUTH_TS_NAME = "auth.ts";
 const NOTES_NAME = "notes.md";
 /** 这套用例统一检索的字面量（真索引与真 rg 两条通道都命中它）。 */
 const AUTH_QUERY = "authService";
-/** 重建面并：这组用例重复发它。 */
+/** 重建这一位：这组用例重复发它。 */
 const REBUILD_ARGS = { rebuild: true };
 /** 单行版样本（磁盘上只需要一行，命中表达就够）。 */
 const SINGLE_LINE_AUTH_BODY = "export function authService() { return 1; }\n";
@@ -170,6 +175,15 @@ const GITIGNORE_NAME = ".gitignore";
 const GITIGNORE_BODY = "dist/\n*.log\n";
 
 const cleanups: (() => void)[] = [];
+
+/**
+ * 默认 home 里 model2vec 权重的缓存目录（model2vec 后端的模型按仓库分目录落在这里）。
+ * 供隔离 home 的用例复制到同位路径：下载通道在本机网络下不可用（HF 超时 +
+ * ModelScope 403，实测），复用已缓存权重是唯一离线路径。
+ */
+function modelCacheSource(): string {
+  return path.join(os.homedir(), ".zvec-grep", "models", "model2vec");
+}
 
 /** 一个带源文件（与一份真实 .gitignore）的工作区。 */
 function workspace(files: Record<string, string> = {}): string {
@@ -202,30 +216,30 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
     }
   });
 
-  it("真 zg --version 的原文被解析，且不低于本包门槛", async () => {
+  it("真 zg --version 的原文被解析，且不低于本包阈值", async () => {
     const { stdout: raw } = await run("zg --version", ws);
     // 门口径：真输出必须被解析成版本号（读不懂 ⇒ 门槛失效），且不低于本包门槛。
-    // **不钉具体版本号**：上游发 0.2.3 时旗标面可能一字未改，钉死补丁号只会让它误红。
+    // **不钉具体版本号**：上游发 0.3.1 时命令行旗标可能一字未改，钉死补丁号只会让它误红。
     // 比较必须走逐段数值（versionAtLeast），不能用字符串字典序——"0.10.0" < "0.2.2"。
     const parsed = parseZgVersion(raw);
     assert.ok(parsed !== undefined, `读不懂 zg --version 原文：${raw}`);
     expect(tooOldZgVersion(raw)).toBeUndefined();
     const minimum = parseZgVersion(MINIMUM_ZG_VERSION);
     assert.ok(minimum !== undefined, MINIMUM_ZG_VERSION);
-    assert.ok(versionAtLeast(parsed, minimum), `装了 ${raw.trim()}，门槛 ${MINIMUM_ZG_VERSION}`);
+    assert.ok(versionAtLeast(parsed, minimum), `装了 ${raw.trim()}，阈值 ${MINIMUM_ZG_VERSION}`);
   }, 30_000);
 
   it("老版本字面量被判为太老（形状就是真 zg 的 <版本号> 行）", () => {
     // tooOldZgVersion 的「太老」是**交回实际版本**，「够新或读不懂」是 undefined：
-    // 它从不返回 null，所以 not.toBeNull() 恒真、一条回归都拦不住。断言具体版本号。
+    // 它从不返回 null，所以 not.toBeNull() 永远成立、一条回归都拦不住。断言具体版本号。
     expect(tooOldZgVersion("0.0.1\n")).toStrictEqual({ major: 0, minor: 0, patch: 1 });
-    expect(tooOldZgVersion("0.1.0\n")).toStrictEqual({ major: 0, minor: 1, patch: 0 });
+    expect(tooOldZgVersion("0.2.2\n")).toStrictEqual({ major: 0, minor: 2, patch: 2 });
     // 反向两臂：恰好等于门槛时放行；读不懂时也放行（门槛只拦「确知太老」）。
     expect(tooOldZgVersion(`${MINIMUM_ZG_VERSION}\n`)).toBeUndefined();
-    expect(tooOldZgVersion("0.2.2-rc.1\n")).toBeUndefined();
+    expect(tooOldZgVersion("0.3.0-rc.1\n")).toBeUndefined();
   });
 
-  it("穷举检索命令在真 zg 上跑通（--rg + 路径/时间过滤 + --mode）", async () => {
+  it("穷举检索命令在真 zg 上跑通（0.3.0 顶层 --rg + 路径/时间过滤 + --mode）", async () => {
     const { command } = buildSearchCommand(
       {
         root: ws,
@@ -238,7 +252,7 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
       },
       messages,
       clientModeOf(undefined, messages),
-      true,
+      "exhaustive",
     );
     const result = await run(command, ws);
     assert.ok(
@@ -249,18 +263,18 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
     expect(result.stdout).toContain("auth.ts");
   }, 30_000);
 
-  it("状态命令在真 zg 上跑通（root 位置参数 + --check-ready + --mode）", async () => {
+  it("状态命令在真 zg 上跑通（0.3.0 --status + --check-ready + --mode）", async () => {
     // 独立的一棵树：这几条判的是「这棵树建过 / 还没建索引」，共享的 ws 会被别条用例改掉状态。
     const own = workspace();
     const { command } = buildStatusCommand({ root: own, checkReady: true }, messages);
     const result = await run(command, own);
     // 未建索引 ⇒ --check-ready 以非零退出码表达「未就绪」，报告仍在 stdout。
     assert.notEqual(result.status, 0, `${command}\n${result.stderr}`);
-    expect(result.stdout).toContain("Workspace index is not configured");
+    expect(result.stdout).toContain("Unavailable (index not configured)");
   }, 30_000);
 
   it.skipIf(!modelReady)(
-    "索引命令的每一个旗标都被真 zg 的 index 接受",
+    "索引命令的每一个旗标都被真 zg 的 --index 接受",
     async () => {
       // 独立的一棵树：这几条判的是「这棵树建过 / 还没建索引」，共享的 ws 会被别条用例改掉状态。
       const own = workspace();
@@ -288,20 +302,31 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
     60_000,
   );
 
-  it("穷举通道的冲突集合与实测报错原文一致", async () => {
+  it("穷举通道的冲突集合与实测报错原文一致（0.3.0 的两条合并文案）", async () => {
     // lib/cli.ts 的 assertExhaustiveArgs 把这一整组拦在构造期，理由是这些实测原文；
-    // 上游一旦改口，本包给出的中文指引会与真报错对不上——这里逐条对。
+    // 上游一旦改口，本包给出的中文指引会与真报错对不上——这里逐条对。0.3.0 把
+    // preview/refresh/trace/symbol 合并成一句、hybrid/fts/vector/fuse 合并成另一句。
     const cases: [string, RegExp][] = [
-      ["--preview short", /--preview is not supported with --rg/u],
-      ["--refresh wait", /--rg cannot be combined with indexed refresh options/u],
-      ["--fuse", /--rg cannot be combined with --fuse/u],
-      ["--trace", /--rg cannot be combined with --trace/u],
+      [
+        "--preview short",
+        /--rg cannot be combined with indexed preview, trace, refresh, or symbol options/u,
+      ],
+      [
+        "--refresh wait",
+        /--rg cannot be combined with indexed preview, trace, refresh, or symbol options/u,
+      ],
+      [
+        "--trace",
+        /--rg cannot be combined with indexed preview, trace, refresh, or symbol options/u,
+      ],
+      ["--fuse", /--rg cannot be combined with --hybrid, --fts, --vector, or --fuse/u],
+      ["--fts authService", /--rg cannot be combined with --hybrid, --fts, --vector, or --fuse/u],
     ];
     const outcomes = await inOrder(
       cases.map(
         ([flag]) =>
           () =>
-            run(`zg query --rg ${flag} authService`, ws),
+            run(`zg --rg ${flag} ${AUTH_QUERY}`, ws),
       ),
     );
     for (const [index, entry] of cases.entries()) {
@@ -312,16 +337,63 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
     }
   }, 60_000);
 
-  it("--fts/--vector 与 --rg 同用也被真 zg 拒（多路查询组那一组）", async () => {
-    const result = await run("zg query --rg --fts authService", ws);
-    assert.notEqual(result.status, 0, result.stderr);
-    assert.match(result.stderr, /--rg cannot be combined with --hybrid, --fts, or --vector/u);
-  }, 30_000);
+  it("0.3.0 新旗标在真 zg 上实跑：fuse + preview detail + category；--rg --files；--nested-git", async () => {
+    // 索引通道：显式 --hybrid 路由 + --fuse + detail 档 + --category 组合（计划验收清单四项一次跑）。
+    // 索引通道需要真索引：独立建一棵（共享 ws 未建索引，别条用例会改它的状态）。
+    const fusedWs = workspace();
+    const seeded = await run(indexCommand({ root: fusedWs }).command, fusedWs);
+    assert.equal(seeded.status, 0, seeded.stderr);
+    const fused = buildSearchCommand(
+      {
+        root: fusedWs,
+        query: AUTH_QUERY,
+        fuse: true,
+        preview: "detail",
+        category: ["code"],
+        limit: 3,
+      },
+      messages,
+      clientModeOf(undefined, messages),
+    );
+    const fusedResult = await run(fused.command, fusedWs);
+    assert.equal(fusedResult.status, 0, `${fused.command}\n${fusedResult.stderr}`);
+    // detail 档的结构化字段（实测原文：Signature/Range/Status）
+    expect(fusedResult.stdout).toContain("Signature:");
+    expect(fusedResult.stdout).toContain("Range: 1");
+    // hitSummary 对 detail 头行（剥尾部 score=）仍能去重
+    const summary = hitSummary(fusedResult.stdout, 3, false, messages);
+    assert.ok(summary !== null, fusedResult.stdout);
+
+    // 文件发现通道：--rg --files + -g 过滤（gitignore 感知、排序、无 --limit）
+    const filesBuilt = buildSearchCommand(
+      { root: ws, files: true, globs: ["*.ts"] },
+      messages,
+      clientModeOf(undefined, messages),
+      "files",
+    );
+    const filesResult = await run(filesBuilt.command, ws);
+    assert.equal(filesResult.status, 0, `${filesBuilt.command}\n${filesResult.stderr}`);
+    expect(filesResult.stdout).toContain("auth.ts");
+    expect(filesResult.stdout, "-g '*.ts' 过滤生效").not.toContain("notes.md");
+    assert.ok(!filesBuilt.command.includes("--limit"), "文件清单不发 --limit");
+
+    // 索引命令带 --nested-git 被真 zg 接受（0.3.0 新扫描规则）
+    const own = workspace();
+    const nested = indexCommand({ root: own, nestedGit: true });
+    const nestedResult = await run(nested.command, own);
+    assert.equal(nestedResult.status, 0, `${nested.command}\n${nestedResult.stderr}`);
+    expect(nestedResult.stdout).toContain("Workspace index");
+  }, 90_000);
 
   it("符号类型只认小写闭集（大写由真 zg 拒，正是本包绑定闭集的原因）", async () => {
-    const result = await run("zg query --symbol-type Class authService --refresh off", ws);
+    const result = await run(`zg --symbol-type Class ${AUTH_QUERY} --refresh off`, ws);
     assert.notEqual(result.status, 0, result.stderr);
-    assert.match(result.stderr, /Unsupported symbol type: Class/u);
+    // 0.3.0 把取值域收到 clap 层：报错带七个合法值（enum 是 0.3.0 新增档）。
+    assert.match(result.stderr, /invalid value 'Class' for '--symbol-type/u);
+    assert.match(
+      result.stderr,
+      /possible values: alias, class, enum, function, interface, module, value/u,
+    );
   }, 30_000);
 
   it.skipIf(!modelReady)(
@@ -347,7 +419,7 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
   );
 
   it.skipIf(!modelReady)(
-    "drop 分支的 --yes 让真 zg 非交互删索引",
+    "drop 分支在真 zg 上非交互删索引（0.3.0 无 --yes，删除立即执行）",
     async () => {
       // 独立的一棵树：这几条判的是「这棵树建过 / 还没建索引」，共享的 ws 会被别条用例改掉状态。
       const own = workspace();
@@ -355,66 +427,34 @@ describe.skipIf(!zgAvailable())("点对点：本包构造的命令行 vs 真 zg 
       const seeded = await run(seed.command, own);
       assert.equal(seeded.status, 0, `${seed.command}\n${seeded.stderr}`);
       const built = indexCommand({ root: own, drop: true });
+      assert.ok(!built.command.includes("--yes"), "0.3.0 的 drop 没有 --yes（实测 exit 2）");
       const result = await run(built.command, own);
       assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
       const status = await run(buildStatusCommand({ root: own }, messages).command, own);
-      expect(status.stdout).toContain("not configured");
+      expect(status.stdout).toContain("index not configured");
     },
     60_000,
   );
 
   it.skipIf(!modelReady)(
-    "--ignore-file 指向不存在的文件会把这棵树的索引弄坏（不是静默忽略）",
+    "0.3.0 对读不成的 ignore 文件静默容忍：索引照建、坏路径记进 roots 行（预检拦在构造前的理由）",
     async () => {
-      // 上游实测：ENOENT ⇒ 整次索引失败，并且那个坏路径**写进工作区索引状态**——此后这条树上的
-      // zg index / zg status 都报同一个 ENOENT，--reset-paths 清不掉，只有 drop 能救。
-      // 本包因此在 host.ts 侧补了存在性预检（assertIgnoreFilesExist），这条钉住上游事实。
+      // 0.2.2 实测：ENOENT ⇒ 整次索引失败，坏路径写进工作区索引状态，只有 drop 能救。
+      // 0.3.0 实测：exit 0，索引照常建（`1 scanned, … 1 unchanged`），坏路径只记在回执的
+      // `roots` 行（`ignore-file=does-not-exist.ignore`）——排除规则**悄悄不生效**。
+      // lib/index-preflight.ts 拦它不再是因为「上游会弄坏树」，而是因为「静默错误答案」：
+      // 模型以为排除规则在挡东西，实际什么都没排除。这条钉住 0.3.0 的事实本身。
       const dir = workspace();
       const bad = indexCommand({ root: dir, ignoreFiles: ["does-not-exist.ignore"] });
       const badResult = await run(bad.command, dir);
-      assert.notEqual(badResult.status, 0, bad.command);
-      assert.match(badResult.stderr, /ZVEC_GREP\.ENGINE\.INDEXING\.WORKSPACE_FAILED/u);
-      assert.match(badResult.stderr, /ENOENT/u);
-      // 对照半边：换一棵没被弄坏的树，同一条旗标照常工作。
+      assert.equal(badResult.status, 0, `${bad.command}\n${badResult.stderr}`);
+      expect(badResult.stdout).toContain("ignore-file=does-not-exist.ignore");
+      // 对照半边：真实存在的忽略文件照常工作（roots 行不带坏路径）。
       const fresh = workspace();
       const good = indexCommand({ root: fresh, ignoreFiles: [GITIGNORE_NAME] });
       const goodResult = await run(good.command, fresh);
       assert.equal(goodResult.status, 0, `${good.command}\n${goodResult.stderr}`);
-      // 而同一棵树再来一次（哪怕这次给的路径是真的）也救不回来。
-      const retry = indexCommand({ root: dir, ignoreFiles: [GITIGNORE_NAME] });
-      const retryResult = await run(retry.command, dir);
-      assert.notEqual(retryResult.status, 0, `${retry.command}\n${retryResult.stderr}`);
-      assert.match(retryResult.stderr, /ENOENT/u);
-    },
-    120_000,
-  );
-
-  it.skipIf(!canMakeUnreadableFile() || !modelReady)(
-    "--ignore-file 指向读不了的文件同样把这棵树弄坏（不是静默忽略）",
-    async () => {
-      // 与"不存在"那一档同一种损坏，但更隐蔽：mode 000 的文件 statSync().isFile() 照样为真，
-      // 预检若只查"存在"就会放过它，而真 zg open 它会 EACCES ⇒ 整次索引失败、坏路径写进工作区
-      // 状态，此后这条树上的 zg index / zg status 都报同一个 EACCES。本包的预检因此以 accessSync(R_OK)
-      // 在前，把"当前进程读得了"与"是文件"合成一次判定。这一档只在造得出「属主也读不了」文件的
-      // 环境跑：root 绕过 DAC（mode 000 对 root 可读、zg 也读得了 ⇒ 无从损坏），windows 的 chmod
-      // 只翻只读位、不挡属主读取 ⇒ 两种都跳过（见 host-stack 的 canMakeUnreadableFile）。
-      const dir = workspace({ "unreadable.ignore": "*.log\n" });
-      const unreadable = path.join(dir, "unreadable.ignore");
-      chmodSync(unreadable, 0o000);
-      try {
-        const bad = indexCommand({ root: dir, ignoreFiles: ["unreadable.ignore"] });
-        const badResult = await run(bad.command, dir);
-        assert.notEqual(badResult.status, 0, bad.command);
-        assert.match(badResult.stderr, /ZVEC_GREP\.ENGINE\.INDEXING\.WORKSPACE_FAILED/u);
-        assert.match(badResult.stderr, /EACCES/u);
-        // 坏路径已写进工作区状态：换一条**可读**的忽略文件再来一次也救不回来（只有 drop 能救）。
-        const retry = indexCommand({ root: dir, ignoreFiles: [GITIGNORE_NAME] });
-        const retryResult = await run(retry.command, dir);
-        assert.notEqual(retryResult.status, 0, `${retry.command}\n${retryResult.stderr}`);
-        assert.match(retryResult.stderr, /EACCES/u);
-      } finally {
-        chmodSync(unreadable, 0o644);
-      }
+      assert.ok(!goodResult.stdout.includes("does-not-exist"), goodResult.stdout);
     },
     120_000,
   );
@@ -448,7 +488,7 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     return dir;
   }
 
-  it("hitSummary 按真输出解析分组计数与去重位置数", async () => {
+  it("hitSummary 按真输出解析去重位置数（0.3.0：#N 路径:行号 头行）", async () => {
     const dir = await indexedWorkspace();
     const built = buildSearchCommand(
       { root: dir, query: AUTH_QUERY, limit: 5 },
@@ -457,19 +497,19 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     );
     const result = await run(built.command, dir);
     assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
-    // 真输出形状（逐项对着 formatScore / agentRankedItemHeader 核过）。
-    expect(result.stdout).toContain("query groups (1):");
-    assert.match(result.stdout, /^hits: \d+$/mu);
-    // 单行命中只有 `:行号`，多行命中是 `:起-止`（实测两种都有）。
-    assert.match(result.stdout, /^#\d+ matchedBy=\S+ .+:\d+(?:-\d+)?$/mu);
+    // 0.3.0 形状：头行 `#N <路径>:<行号范围>`；0.2.2 的 `query groups` 头与 `hits: N`
+    // 计数行都不复存在（实测）。单行命中只有 `:行号`，多行命中是 `:起-止`。
+    assert.match(result.stdout, /^#\d+ .+:\d+(?:-\d+)?$/mu);
+    assert.ok(!result.stdout.includes("matchedBy="), "0.3.0 头行没有 matchedBy=");
+    assert.ok(!/^hits: /mu.test(result.stdout), "0.3.0 没有每组计数行");
 
     const summary = hitSummary(result.stdout, 5, false, messages);
     assert.ok(summary !== null, result.stdout);
-    expect(summary).toContain("1 个查询组");
+    expect(summary).toContain("去重后 1 个不同位置");
     expect(summary).toContain("命中摘要");
   }, 120_000);
 
-  it("--trace 的输出（score= 与 trace 行）也被同一个正则认出位置", async () => {
+  it("--trace 的输出（score:/trace: 独立行）不被误判成命中条目", async () => {
     const dir = await indexedWorkspace();
     const built = buildSearchCommand(
       { root: dir, query: "auth", trace: true, limit: 3 },
@@ -478,11 +518,30 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     );
     const result = await run(built.command, dir);
     assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
-    assert.match(result.stdout, /^#\d+ matchedBy=\S+ score=-?\d+(?:\.\d+)? .+:\d+(?:-\d+)?$/mu);
-    // 摘要的去重口径必须把 score 排除在键外（同一位置在两个组里分值不同）。
+    // 0.3.0 的分值/轨迹在命中体之后的独立行，头行仍是干净的 `#N 路径:行号`。
+    assert.match(result.stdout, /^score: -?\d+(?:\.\d+)?$/mu);
+    assert.match(result.stdout, /^trace: \{/mu);
     const summary = hitSummary(result.stdout, 3, false, messages);
     assert.ok(summary !== null, result.stdout);
     expect(summary).toContain("去重后");
+  }, 120_000);
+
+  it("多组查询（--hybrid + --fts）的分组分隔行与重复命中被正确去重", async () => {
+    const dir = await indexedWorkspace();
+    const built = buildSearchCommand(
+      { root: dir, query: AUTH_QUERY, fts: ["authService"], limit: 3 },
+      messages,
+      clientModeOf(undefined, messages),
+    );
+    const result = await run(built.command, dir);
+    assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
+    // 0.3.0 的组间分隔行（实测原文）。
+    assert.match(result.stdout, /^-- query 1\/2: /mu);
+    assert.match(result.stdout, /^-- query 2\/2: /mu);
+    // 同一处位置在两组各出现一次，摘要只算一处。
+    const summary = hitSummary(result.stdout, 3, false, messages);
+    assert.ok(summary !== null, result.stdout);
+    expect(summary).toContain("去重后 1 个不同位置");
   }, 120_000);
 
   it("stderr 进度噪声词表覆盖真索引进度行，且不漏掉告警", async () => {
@@ -490,7 +549,8 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     const built = indexCommand({ root: dir, rebuild: true });
     const result = await run(built.command, dir);
     assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
-    // 真进度行进噪声表：signalStderr 之后一句都不剩。
+    // 0.3.0 真进度行（Scanning — … / Indexing: N/M files / Saving index …）进噪声表：
+    // signalStderr 之后一句都不剩。
     expect(signalStderr(result.stderr)).toBe("");
     // 认不出的行一律保留（这条是判据的另外一半：只丢认得的）。
     expect(signalStderr("warning: embedding model fell back to lexical\n")).toBe(
@@ -498,10 +558,13 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     );
   }, 120_000);
 
-  it("密钥排除真的在挡东西（`.pem` 会被索引，默认那条规则不是死规则）", async () => {
-    // lib/cli.ts 的 pushIndexGlobs 有一句被改过的断言：`.pem`「不在可索引类型里」。真 zg 0.2.2 上是**假的**
-    // ——单独造一棵只放密钥文件的树，它照样 `added`，照样能被检索回来。这条用例同时钉两半：
-    // 关着排除时确实进了索引（规则是有对象的），开着排除时确实取不回来（规则是活的）。
+  it("0.3.0 默认跳过密钥文件（binary/unsupported），插件的排除规则是双保险", async () => {
+    // 0.2.2 实测：`.pem`/`.P12` 照样 `3 scanned, 3 added` 进索引，插件的 --iglob 排除是
+    // **唯一**防线。0.3.0 实测（--debug 的 Index diagnostics 原文）：`secret.pem`/`cert.pem`
+    // 记 `reason:"binary"`（格式目录把 Pem 归 Binary，text-only 索引直接跳过），
+    // `id_rsa`/`secret.P12` 记 `reason:"unsupported"`（无/未知扩展名不识别格式，同样跳过）
+    // ——上游默认就把本包排除清单的全部对象挡在索引外。规则保留为双保险：两种开关下
+    // 都取不回来，正常源码照常可检索。
     const secretName = "secret.pem";
     const secretMarker = "ZZSECRETP EMLINE";
     const mixedName = "secret.P12";
@@ -521,61 +584,61 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     }
 
     /** 按给定排除开关建一次索引。 */
-    async function indexSecrets(excludeSecrets: boolean): Promise<string> {
+    async function indexSecrets(
+      excludeSecrets: boolean,
+    ): Promise<{ dir: string; receipt: string }> {
       const dir = secretWorkspace();
       const built = indexCommand({ root: dir, excludeSecrets });
       const result = await run(built.command, dir);
       assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
-      return dir;
+      return { dir, receipt: result.stdout };
     }
 
     const bare = await indexSecrets(false);
-    // 排除关着：两类密钥文件都进得了索引 —— 这是「规则有对象」那一半，也是那句错注释的反证。
-    await expect(searchLiteral(bare, secretMarker)).resolves.toContain(secretName);
-    await expect(searchLiteral(bare, mixedMarker)).resolves.toContain(mixedName);
+    // 上游默认（排除关着）就不收密钥文件：回执只有正常源码那一枚（`1 scanned, 1 added`）。
+    expect(bare.receipt).toContain("1 scanned, 1 added");
 
     const guarded = await indexSecrets(true);
-    // 排除开着（本包默认）：同两条字面量都取不回来，而正常源码仍在 —— 规则不是装饰。
-    await expect(searchLiteral(guarded, secretMarker)).resolves.not.toContain(secretName);
-    await expect(searchLiteral(guarded, mixedMarker)).resolves.not.toContain(mixedName);
-    await expect(searchLiteral(guarded, AUTH_QUERY)).resolves.toContain(AUTH_TS_NAME);
+    // 排除开着（本包默认）：同样取不回来，正常源码仍在 —— 规则是双保险，不是死规则。
+    await expect(searchLiteral(guarded.dir, secretMarker)).resolves.not.toContain(secretName);
+    await expect(searchLiteral(guarded.dir, mixedMarker)).resolves.not.toContain(mixedName);
+    await expect(searchLiteral(guarded.dir, AUTH_QUERY)).resolves.toContain(AUTH_TS_NAME);
   }, 180_000);
 
   it("守护进程就绪探测的旗标在真 zg 上存在（非零码就是未就绪）", async () => {
     // host.ts 的 SERVER_READY_COMMAND 是 BackgroundSupport 的唯一证据源：上游改名或取消
     // `--check-ready` 时，本机所有 mock 用例照绿（它们比的是字符串），症状却是
-    // refresh=background 这一档永久被拒。这里问一次**真** zg。
+    // refresh=background 这一档永久被拒。这里问一次**真** zg（0.3.0 旗标形态）。
     const dir = mkdtempSync(path.join(tmpdir(), "zg-p2p-ready-"));
     cleanupsIndexed.push(() => {
       rmSync(dir, { recursive: true, force: true });
     });
-    const result = await run("zg server status --check-ready", dir);
+    const result = await run("zg --server status --check-ready", dir);
     // 就绪与否由这台机器的事实决定，两种都合法；不合法的是「旗标不认识」。
     const rejected = /unknown|unexpected|invalid|unrecognized/iu;
     assert.ok(!rejected.test(result.stderr + result.stdout), `${result.stderr}\n${result.stdout}`);
     if (result.status !== 0) {
-      // 未就绪那一臂必须用退出码 + 那句原文表达（判据读的是退出码，文本只是给人的）。
+      // 未就绪那一条分支必须用退出码 + 那句原文表达（判据读的是退出码，文本只是给人的）。
       assert.match(result.stderr, /server is not ready/u);
     }
   }, 60_000);
 
-  it("并发重建的真实报错被 classifyConcurrentFailure 认出（含占锁方字段）", async () => {
+  it("并发重建的真实报错被 classifyConcurrentFailure 认出（0.3.0：RESOURCE_BUSY）", async () => {
     // 真 zg 在另一条写路径持锁时会给出结构化失败；这里连起两条真索引来撞它。
-    // 传输模式显式取 direct：auto 那一支在该 root 的索引写权被守护进程持住时，两条显式重建会被
-    // **双双**挡下（本机空闲复跑两次读到的形状：两臂 `ENGINE.LOCK.BUSY`，或一臂
-    // `ENGINE.DAEMON_LEASE_ACTIVE` 且 `pid: 0`、另一臂才建成），于是「至少一臂真把索引建出来」
-    // 这条见证与守护进程状态耦合。direct 让两条命令自己抢锁，撞出来的仍是 lock-busy 那一族。
+    // 传输模式显式取 direct：auto 那一支在该 root 的索引写权被守护进程持住时会双双改道，
+    // 于是「至少一分支真把索引建出来」这条见证与守护进程状态耦合。direct 让两条命令
+    // 自己抢锁，撞出来的仍是 RESOURCE_BUSY 那一族。
     const root = await indexedWorkspace();
     const { rebuild } = REBUILD_ARGS;
     const args = { root, rebuild };
     const built = indexCommand(args, "direct");
     const { command } = built;
-    // 两条**同时**起：await 完第一条再起第二条等于串行，锁早已释放，本组会恒绿。
+    // 两条**同时**起：await 完第一条再起第二条等于串行，锁早已释放，本组会永远通过。
     const first = run(command, root);
     const concurrent = run(command, root);
     const [built0, second] = await Promise.all([first, concurrent]);
     // 并发之后**两条都可能**撞锁，不许再假定「第一条必然成功」；但至少要有一条真把索引建出来，
-    // 否则两臂都失败就什么都没证到。
+    // 否则两分支都失败就什么都没证到。
     const both = [built0, second];
     assert.ok(
       both.some((outcome) => outcome.status === 0),
@@ -584,7 +647,9 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     for (const failed of both.filter((outcome) => outcome.status !== 0)) {
       const classified = classifyConcurrentFailure(failed.stderr);
       assert.ok(classified !== null, failed.stderr);
-      expect(["lock-busy", "daemon-lease"]).toContain(classified.kind);
+      // 0.3.0 没有 DAEMON_LEASE 独立码：锁竞争落在 RESOURCE_BUSY（lock-busy），
+      // 远程授权被拒是 PERMISSION_DENIED。本组只可能撞出前者。
+      expect(["lock-busy", "permission-denied"]).toContain(classified.kind);
       if (classified.kind === "lock-busy") {
         // 占锁方自报的操作名决定「要不要排队等」：不是重建就一等不到头。
         assert.equal(typeof classified.ownerOperation, "string");
@@ -592,3 +657,142 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     }
   }, 180_000);
 });
+
+describe.skipIf(!zgAvailable())(
+  "点对点：MCP lane（daemon HTTP 端点 + lib/daemon-client.ts）",
+  () => {
+    const cleanupsDaemon: (() => void)[] = [];
+    /** 隔离的 daemon 状态目录（绝不碰用户真实的 ~/.zvec-grep）。 */
+    let home: string;
+    /** 该目录里的一棵小工作区（本组建索引用）。 */
+    let wsDir: string;
+    /** daemon 令牌夹具：上游要求 ≥32 字符且无控制字符（实测报错原文），插件自启的
+     *  randomBytes(24).toString("hex") 是 48 个 hex 字符，满足同一条约束。 */
+    const DAEMON_URL = "http://127.0.0.1:7999/mcp";
+    const TOKEN = "e2e-token-0123456789abcdef0123456789abcdef";
+
+    beforeAll(async () => {
+      home = mkdtempSync(path.join(tmpdir(), "zg-p2p-mcp-home-"));
+      wsDir = mkdtempSync(path.join(tmpdir(), "zg-p2p-mcp-ws-"));
+      writeFileSync(path.join(wsDir, AUTH_TS_NAME), SINGLE_LINE_AUTH_BODY);
+      cleanupsDaemon.push(() => {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(wsDir, { recursive: true, force: true });
+      });
+      // 先用 CLI 通道建索引（离线本地模型），再起 daemon——search 走 MCP 时索引已在。
+      // 隔离 home 没有模型缓存，而本机网络下载已被上游双源拒（HF 超时 + ModelScope 403，
+      // 实测）——把默认 home 里已缓存的 model2vec 权重**复制**进沙箱 home 的同位路径，
+      // 隔离与离线两头都保住；复制不依赖任何缓存路径变量的解析规则。
+      if (modelReady) {
+        await cp(modelCacheSource(), path.join(home, "models", "model2vec"), {
+          recursive: true,
+        });
+        const built = indexCommand({ root: wsDir });
+        const result = await run(built.command, wsDir, { ZVEC_GREP_HOME: home });
+        assert.equal(result.status, 0, `${built.command}\n${result.stderr}`);
+      }
+      // 带 token 起 daemon（本插件自启 daemon 的同一形态：env ZVEC_GREP_SERVER_TOKEN）。
+      // --mcp-toolset full：daemon 缺省是 agent 工具集（只有 zvec_grep_search），本组还要
+      // 实调 server_status（full 才有，实测缺它报 tool not found）。
+      await run("zg --server off", home, { ZVEC_GREP_HOME: home }).catch(() => "");
+      const started = await run("zg --server on --mcp-toolset full", home, {
+        ZVEC_GREP_HOME: home,
+        ZVEC_GREP_SERVER_TOKEN: TOKEN,
+      });
+      assert.equal(started.status, 0, `${started.stdout}\n${started.stderr}`);
+    }, 120_000);
+
+    afterAll(async () => {
+      // 收尾把 daemon 停掉。off 与 on 一样是管理操作：daemon 带 token 时必须带同一枚
+      // （实测不带会被 401 拒、daemon 泄漏到下一次运行）。
+      await run("zg --server off", home, {
+        ZVEC_GREP_HOME: home,
+        ZVEC_GREP_SERVER_TOKEN: TOKEN,
+      }).catch(() => "");
+      for (const cleanup of cleanupsDaemon.splice(0).toReversed()) {
+        cleanup();
+      }
+    });
+
+    it("initialize → tools/call 全流程（带 Bearer token；server_status 应答为 daemon JSON）", async () => {
+      const client = createDaemonClient({
+        url: DAEMON_URL,
+        tokenOf: () => TOKEN,
+      });
+      const result = await client.call({
+        tool: "zvec_grep_server_status",
+        args: {},
+        timeoutMs: 15_000,
+      });
+      assert.equal(result.isError, false, result.text);
+      // server_status 的应答是 daemon 自述 JSON（version/uptime/队列计数），无检索语义。
+      expect(result.text).toContain('"version"');
+      expect(result.text).toContain('"queued_jobs"');
+    }, 30_000);
+
+    it("无 token 调用被 401 拒（鉴权真实生效，回环端口不是裸的）", async () => {
+      const client = createDaemonClient({ url: DAEMON_URL, tokenOf: () => "" });
+      await assert.rejects(
+        () =>
+          client.call({
+            tool: "zvec_grep_server_status",
+            args: {},
+            timeoutMs: 15_000,
+          }),
+        /401|Unauthorized/iu,
+      );
+    }, 30_000);
+
+    it("管理命令与守护进程同源 token：带 token 的 zg --status 退 0，不带退 401", async () => {
+      // 这条钉的是上游契约本身：token 保护的 daemon 在场时，--mode auto 的管理命令也走
+      // 守护进程、也必须带同一枚 Bearer。插件侧「三条前台通道都带 token」由
+      // test/host.test.ts 的 mock 断言钉住；两半合起来才是完整的同源证据。
+      const built = buildStatusCommand({ root: wsDir }, MESSAGES.zh, "auto");
+      const withToken = await run(built.command, wsDir, {
+        ZVEC_GREP_HOME: home,
+        ZVEC_GREP_SERVER_TOKEN: TOKEN,
+      });
+      assert.equal(withToken.status, 0, `${built.command}\n${withToken.stderr}`);
+      const withoutToken = await run(built.command, wsDir, { ZVEC_GREP_HOME: home });
+      assert.notEqual(withoutToken.status, 0, "没有 token 的管理命令必须失败，不能静默降级");
+      assert.match(withoutToken.stderr, /401|Unauthorized/iu);
+    }, 60_000);
+
+    it.skipIf(!modelReady)(
+      "zvec_grep_search 实调：参数映射（root+query）被真 daemon 接受，应答是 #N 头行文本",
+      async () => {
+        const client = createDaemonClient({
+          url: DAEMON_URL,
+          tokenOf: () => TOKEN,
+        });
+        const result = await client.call({
+          tool: "zvec_grep_search",
+          args: { root: wsDir, query: AUTH_QUERY, limit: 3 },
+          timeoutMs: 30_000,
+        });
+        assert.equal(result.isError, false, result.text);
+        assert.match(result.text, /^#\d+ /mu, "应答文本与 CLI stdout 同构（#N 头行）");
+        const summary = hitSummary(result.text, 3, false, messages);
+        assert.ok(summary !== null, result.text);
+      },
+      60_000,
+    );
+
+    it("zvec_grep_search 对无索引 root 报错：isError=true 且错误文本带 ZG.ENGINE.NOT_FOUND 码", async () => {
+      const client = createDaemonClient({ url: DAEMON_URL, tokenOf: () => TOKEN });
+      const missing = mkdtempSync(path.join(tmpdir(), "zg-p2p-mcp-empty-"));
+      cleanupsDaemon.push(() => {
+        rmSync(missing, { recursive: true, force: true });
+      });
+      const result = await client.call({
+        tool: "zvec_grep_search",
+        args: { root: missing, query: AUTH_QUERY, limit: 3 },
+        timeoutMs: 30_000,
+      });
+      assert.equal(result.isError, true, result.text);
+      assert.match(result.text, /ZG\.ENGINE\.NOT_FOUND/u);
+      // classifyConcurrentFailure 对 MCP 错误文本（小写 error[）同样认路。
+      assert.equal(classifyConcurrentFailure(result.text), null, "NOT_FOUND 不归并发类");
+    }, 60_000);
+  },
+);

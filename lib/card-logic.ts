@@ -3,7 +3,7 @@
 // limit 输入校验 + 重建轮询应答解析 +
 // fetch 应答体检。可被 host 侧单测直接 import（不经过含 document 的
 // src/client-entry.ts，避免把 DOM 类型拖进 host typecheck）。client-entry
-// 只做 React 渲染与 scope 绑定，取值/判定一律下沉到这里，卡片侧不留副本。
+// 只做 React 渲染与 scope 绑定，取值/判定一律落到这里，卡片侧不留副本。
 //
 // 文案双语：本文件产出的提示文本走官方 locale 的 translator（ctx.locale.bind 的
 // 结果），由调用点注入——纯函数不读设置、也不 import src/（键在此收窄成
@@ -12,11 +12,11 @@
 import type { ConfigPageForm } from "@deepseek-ai/dsh-client-ui-plugin-manager/client";
 import type { ConfigForm, ConfigFormSnapshot } from "@deepseek-ai/dsh-client-ui-settings/client";
 import { z } from "zod";
-// 草稿优先的读判据（draftOf / numberText）住在 lib/card-draft.ts；本文件的 draftFields
-// 只管「六个字段各显示什么」。
+// 草稿优先的读判据（draftOf / numberText）定义在 lib/card-draft.ts；本文件的 draftFields
+// 只管「七个字段各显示什么」。
 import { draftOf, hasDraft, numberText } from "./card-draft.ts";
 import { DEFAULT_EMBEDDING } from "./embedding-catalog.ts";
-// 数值区间单源：显示文案与钳制区间引同一份常量（host schema 与输入区间同源，见该文件头）。
+// 数值区间唯一来源：显示文案与钳制区间引同一份常量（host schema 与输入区间同源，见该文件头）。
 import {
   BUDGET_MAX,
   DEFAULT_GREP_BUDGET,
@@ -43,7 +43,7 @@ export type CardTextKey =
 /**
  * 引导端点交回的守护进程就绪态该显示哪一行。
  *
- * `undefined` 是**必要**的一臂，不是兜底：旧版 host 的应答里没有 `serverReady` 这个字段，
+ * `undefined` 是**必需**的一种取值，不是兜底默认：旧版 host 的应答里没有 `serverReady` 这个字段，
  * 而「应答里没写」与「写了未就绪」是两件事——把前者显示成后者，卡片就在用户眼前谎称了一次
  * 「没有守护进程」。判据收在可单测的这一层，client 只负责渲染它选出来的那一行。
  *
@@ -59,7 +59,7 @@ export function daemonNoteKey(ready: unknown): "daemonReadyNote" | "daemonOfflin
   } else if (ready === false) {
     key = "daemonOfflineNote";
   }
-  // 单一出口：`ready` 既不是 true 也不是 false（= undefined，应答里没这一位）时留空，
+  // 只留一个返回点：`ready` 既不是 true 也不是 false（= undefined，应答里没这一位）时留空，
   // 调用方据此**不渲染**，而不是把「不知道」显示成「未就绪」。
   return key;
 }
@@ -75,33 +75,33 @@ export type CardText = (
 ) => string;
 
 /**
- * 卡片读写的配置面 = dsh 0.1.7 的客户端 **config form**，直接取官方声明
+ * 卡片读写的配置表 = dsh 0.1.7 的客户端 **config form**，直接取官方声明
  * `@deepseek-ai/dsh-client-ui-settings/client` 的 `ConfigForm<T>`（`getSnapshot` /
- * `subscribe` / `mutate` / `set` / `unset` 五成员全必选），不再手抄一份投影。
+ * `subscribe` / `mutate` / `set` / `unset` 五成员全必选），不再照抄一份投影。
  * 名字仍叫 SettingScope，只是历史沿革：client-entry 与 test/card-logic.ts 共用这一个
  * 类型源，改名不带来任何约束，只会多一处要同步的标识。
- * 原先这里抄的是 `getSnapshot: () => unknown` 外加缺 `mutate` 的四成员面——那份
+ * 原先这里抄的是 `getSnapshot: () => unknown` 外加缺 `mutate` 的四位成员——那份
  * `unknown` 才是 cardStore 里逐字段再解析（`isRecord(snap) ? snap["status"] : …`）
  * 存在的唯一理由；绑回官方后快照的 status/writable/value 由 provider 的 decode/derive
  * 把住，那个解析器就只剩把类型错误咽回去的作用，故一并删除。
- * 读面与旧的 `settingsScope` 同名，故卡片侧的降级逻辑原样可用。
+ * 读取接口与旧的 `settingsScope` 同名，故卡片侧的降级逻辑原样可用。
  * ⚠ 旧 `ctx.settingsScope.bind({ namespace })` 连同 `settingsScope` 服务已被宿主移除
  * （installed 全树零命中），入口是 `ctx.configForms.get(entryId)`（installed
  * `.../client/config-form.d.ts`），见 src/client-entry.ts。
- * ⚠ `set`/`unset`/`mutate` 的受理位（true = 宿主受理，false = 拒绝或被跳过，只有
+ * ⚠ `set`/`unset`/`mutate` 的受理结果（true = 宿主受理，false = 拒绝或被跳过，只有
  * 传输失败才 reject）本包刻意思不消费，见 src/client-entry.ts 的 `writeField`。
- * ⚠ 消费者面上没有 dispose：`configForms.get(entryId)` 交回的是 provider 自己持有的
+ * ⚠ 消费者这边没有 dispose：`configForms.get(entryId)` 交回的是 provider 自己持有的
  * 那张共享表单（installed `.../client/config-form.d.ts` "The entry's form,
  * owned by this provider"；provider 在自己的 teardown 里统一销毁全部表单，installed
  * `Promise.all([...this.forms.values()].map((form) => form.dispose()))`），`ConfigForm` 面上根本没有
- * dispose 可消费。slot「折叠 → 再声明」会重跑注册工厂并拿回同一张长活表单，所以
+ * dispose 可消费。槽位声明被收回、再次声明时会重跑注册工厂并拿回同一张长活表单，所以
  * disposer 只需注销那次声明（见 src/client-entry.ts 的 disposer 注释）；卡片若试图销毁
  * 共享表单，受害的是同一 provider 名下所有消费者（含本卡重挂后的新 store）。
  */
 export type SettingScope = ConfigForm<Record<string, unknown>>;
 
 /**
- * 官方快照的简写（本条目那张表单的值面是任意 JSON 形状，由 host 的 Config 把关）。
+ * 官方快照的简写（本条目那张表单的值是任意 JSON 形状，由 host 的 Config 把关）。
  * 不外露：它只是 cardStore 缓存位上的记号，测试要同一个形状就在自己这边按官方类型抄一份
  * （见 test/build-client.test.ts 的同形做法）——共用这个别名等于让别名自己给自己作证。
  */
@@ -166,9 +166,9 @@ export function cardStore(scope: SettingScope): {
 // 卡片是「先暂存、点保存才写入」的草稿模型：touched 是草稿层，快照 value 是
 // 已提交层。任何控件若直接绑已提交快照，用户敲的键会被受控组件立刻吞掉
 // （input 改不动、select 弹回旧值），而旁边几个字段却是草稿值——同一张卡两种
-// 行为，用户只能以为「这个设置改了没用」。故六个字段一律走 draftFields()。
+// 行为，用户只能以为「这个设置改了没用」。故七个字段一律走 draftFields()。
 
-/** 卡片六个字段的显示值（全部草稿优先）。 */
+/** 卡片七个字段的显示值（全部草稿优先）。 */
 export interface CardFields {
   embedding: string;
   limitDisplay: string;
@@ -176,6 +176,8 @@ export interface CardFields {
   enforceSearchFirst: boolean;
   grepBudget: string;
   unlockWindow: string;
+  /** 检索传输方式（auto|cli|mcp；域外/缺省回 auto，与 host 侧 readTransport 同一判据）。 */
+  transport: "auto" | "cli" | "mcp";
 }
 
 /**
@@ -222,13 +224,14 @@ function endpointFieldDisplay(
     : "";
 }
 
-/** 六个字段的草稿显示值（ZgCard 只渲染这里算出来的东西）。 */
+/** 七个字段的草稿显示值（ZgCard 只渲染这里算出来的东西）。 */
 export function draftFields(
   touched: Record<string, unknown>,
   value: Record<string, unknown>,
 ): CardFields {
   const embedding = draftOf(touched, value, "defaultEmbedding");
   const enforce = draftOf(touched, value, "enforceSearchFirst");
+  const transport = draftOf(touched, value, "transport");
   return {
     embedding:
       typeof embedding === "string" && embedding.length > 0 ? embedding : DEFAULT_EMBEDDING,
@@ -247,6 +250,10 @@ export function draftFields(
       "unlockWindowMin",
       String(DEFAULT_UNLOCK_WINDOW_MIN),
     ),
+    // 域外/缺省回 auto：与 host 侧 readTransport 的退化判据同源（schema 已约束域，
+    // 这里只兜宿主退化与旧快照）。
+    transport:
+      transport === "cli" || transport === "mcp" || transport === "auto" ? transport : "auto",
   };
 }
 

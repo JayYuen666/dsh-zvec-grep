@@ -1,105 +1,104 @@
-// lib/zg-errors.ts 的单元测试：从真实形状的 zg 失败输出里抽错误码与明细，
+// lib/zg-errors.ts 的单元测试：从真实形状的 zg 0.3.0 失败输出里抽错误码与成因，
 // 并区分「占锁方是一次重建」与「占锁方是别的进程」——等待策略只对前者排队。
+// 0.3.0 的形状（上游 zg-cli/src/diagnostics.rs 的 format_error_report）：
+//   Error[<码>]: <成因一句话>
+//   Help: <出路>            （可选）
+//   Error location: <file:line:col>
+// 占锁方信息在成因串里（`lock is busy: lock=<路径> operation=<op>`），不再有 Details: 块。
+// MCP 传输的同一文本首行小写（`error[...]`），码行定位大小写不敏感。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import {
   classifyConcurrentFailure,
   zgErrorCode,
-  zgErrorDetails,
-  DAEMON_LEASE_CODE,
+  zgErrorMessage,
   LOCK_BUSY_CODE,
+  PERMISSION_DENIED_CODE,
+  REBUILD_OPERATION,
 } from "../lib/zg-errors.ts";
-import type { ConcurrentZgFailure, DaemonLeaseFailure, LockBusyFailure } from "../lib/zg-errors.ts";
+import type { ConcurrentZgFailure, LockBusyFailure } from "../lib/zg-errors.ts";
 
-const CODE_LINE = "Code: ZVEC_GREP.ENGINE.LOCK.BUSY";
 /** 普通索引持锁那条实测形状里的锁路径（多组用例共用）。 */
 const INDEX_LOCK_PATH = "/ws/.zvec-grep/locks/home.write";
-const TITLE = "Error: Index unavailable";
-const DETAILS = "Details:";
 
-/** 实测形状：重建持锁时的检索失败。 */
-const LOCK_BUSY_REBUILD = [
-  TITLE,
-  CODE_LINE,
-  DETAILS,
-  "  lock: /private/tmp/zgconc/.zvec-grep/locks/home.write",
-  "  operation: info",
-  "  ownerOperation: index.rebuild",
-  "  ownerPid: 14962",
-  "  ownerHost: box.local",
-  "",
-].join("\n");
+/** 成因串与定位行：0.3.0 的完整错误块由这几段拼出来。 */
+function errorBlock(code: string, message: string, extra: string[] = []): string {
+  return [`Error[${code}]: ${message}`, ...extra, "Error location: crates/zg/src/main.rs:1:1"].join(
+    "\n",
+  );
+}
+
+/** 实测形状（0.3.0 的 workspace/lock.rs 锁等待错误）：重建持锁时的检索失败——立即失败那一支。 */
+const LOCK_BUSY_REBUILD = errorBlock(
+  LOCK_BUSY_CODE,
+  "lock is busy: lock=/private/tmp/zgconc/.zvec-grep/locks/home.write operation=index.rebuild",
+);
 
 /** 实测形状：占锁方是一次普通索引，不是重建。 */
-const LOCK_BUSY_INDEX = [
-  TITLE,
-  CODE_LINE,
-  DETAILS,
-  `  lock: ${INDEX_LOCK_PATH}`,
-  "  operation: info",
-  "  ownerOperation: index",
-  "  ownerPid: 4242",
-].join("\n");
+const LOCK_BUSY_INDEX = errorBlock(
+  LOCK_BUSY_CODE,
+  `lock is busy: lock=${INDEX_LOCK_PATH} operation=index`,
+);
 
-/** 实测形状：守护进程持有索引写租约。 */
-const DAEMON_LEASE = [
-  "Error: A zvec-grep daemon owns index writes for this root",
-  "Code: ZVEC_GREP.ENGINE.DAEMON_LEASE_ACTIVE",
-  DETAILS,
-  "  root: /tmp/zgsrv2",
-  "  pid: 17135",
-].join("\n");
+/** 实测形状（workspace/lock.rs 的等待超时分支）：锁路径写作 storage_dir=。 */
+const LOCK_BUSY_TIMEOUT = errorBlock(
+  LOCK_BUSY_CODE,
+  `timed out waiting for workspace lock: storage_dir=${INDEX_LOCK_PATH} operation=index.rebuild`,
+);
+
+/** 远程授权被拒：上游报错自带可照抄的 grant 命令。 */
+const PERMISSION_DENIED = errorBlock(
+  PERMISSION_DENIED_CODE,
+  'Remote embedding authorization required for qwen/text-embedding-v4 at https://example/v1/embeddings. Run zg --auth grant "/ws" --capability embedding --scope workspace --embedding qwen/text-embedding-v4 --endpoint "https://example/v1/embeddings", or pass --allow-remote for this command only.',
+);
 
 describe("错误码抽取", () => {
-  it("抽得出错误码", () => {
+  it("从 Error[码]: 行抽得出错误码（CLI 大写 Error 与 MCP 小写 error 两种形态）", () => {
     assert.equal(zgErrorCode(LOCK_BUSY_REBUILD), LOCK_BUSY_CODE);
-    assert.equal(zgErrorCode(DAEMON_LEASE), DAEMON_LEASE_CODE);
+    assert.equal(
+      zgErrorCode(LOCK_BUSY_REBUILD.replace("Error[", "error[")),
+      LOCK_BUSY_CODE,
+      "MCP 文本首行小写",
+    );
+    assert.equal(zgErrorCode(PERMISSION_DENIED), PERMISSION_DENIED_CODE);
   });
 
-  it("没有 Code 行就是非结构化失败", () => {
+  it("没有码行就是非结构化失败（普通 Error: 单行无码）", () => {
     assert.equal(zgErrorCode("bash: zg: command not found"), undefined);
+    assert.equal(zgErrorCode("Error: Index unavailable"), undefined);
     assert.equal(zgErrorCode(""), undefined);
   });
 
-  it("首处 Code: 行不是单一 token 时宁可不判：不顺延到后文捞别的码", () => {
-    // 第一块的 Code: 带尾巴说明输出形状已变；正则若跳过它继续找，捞回来的可能是
-    // 属于第二个错误块的码——归因到完全不相干的失败上。
+  it("首处码行之后的码不参与判读：一次失败只归因一个码", () => {
     const shifted = [
-      "Error: first failure",
-      "Code: SOMETHING.ELSE (with detail)",
+      "Error[SOMETHING.ELSE]: first failure",
       "",
-      "Error: second failure",
-      `Code: ${LOCK_BUSY_CODE}`,
+      `Error[${LOCK_BUSY_CODE}]: lock is busy: lock=/x operation=index.rebuild`,
     ].join("\n");
-    assert.equal(zgErrorCode(shifted), undefined);
+    assert.equal(zgErrorCode(shifted), "SOMETHING.ELSE");
+  });
+
+  it("成因串抽取：码行冒号之后的整段；无码行交回空串（契约变更：不再交 undefined）", () => {
+    const message = zgErrorMessage(LOCK_BUSY_REBUILD);
+    assert.equal(
+      message,
+      "lock is busy: lock=/private/tmp/zgconc/.zvec-grep/locks/home.write operation=index.rebuild",
+    );
+    assert.equal(zgErrorMessage("Error: 无码行"), "");
   });
 });
 
 /** 收窄助手：把结果确认成锁忙失败后再断言，避免每条用例都写一遍判别式。 */
-function isLockBusy(failure: ConcurrentZgFailure | null): failure is LockBusyFailure {
-  return failure?.kind === "lock-busy";
-}
-
-function isDaemonLease(failure: ConcurrentZgFailure | null): failure is DaemonLeaseFailure {
-  return failure?.kind === "daemon-lease";
-}
-
-function asDaemonLease(failure: ConcurrentZgFailure | null): DaemonLeaseFailure {
-  assert.ok(isDaemonLease(failure), "期望守护进程租约失败");
-  return failure;
-}
-
 function asLockBusy(failure: ConcurrentZgFailure | null): LockBusyFailure {
-  assert.ok(isLockBusy(failure), "期望锁忙失败");
+  assert.ok(failure?.kind === "lock-busy", "期望锁忙失败");
   return failure;
 }
 
 describe("并发类失败识别", () => {
-  it("锁忙且占锁方是重建：可排队等待", () => {
+  it(`锁忙且占锁方是重建（${REBUILD_OPERATION}）：可排队等待`, () => {
     const failure = asLockBusy(classifyConcurrentFailure(LOCK_BUSY_REBUILD));
-    assert.equal(failure.ownerOperation, "index.rebuild", "明细里确实读到了这一枚操作名");
+    assert.equal(failure.ownerOperation, "index.rebuild", "成因串里确实读到了这一枚操作名");
     assert.equal(failure.rebuild, true);
-    assert.equal(failure.ownerPid, "14962");
     assert.equal(failure.lockPath, "/private/tmp/zgconc/.zvec-grep/locks/home.write");
   });
 
@@ -109,47 +108,38 @@ describe("并发类失败识别", () => {
     assert.equal(asLockBusy(failure).ownerOperation, "index");
   });
 
-  it("明细缺 ownerOperation 时不当作重建（宁可少等也不无界挂起）", () => {
-    const noOwner = [TITLE, CODE_LINE, DETAILS, `  lock: ${INDEX_LOCK_PATH}`].join("\n");
+  it("等待超时形态：锁路径从 storage_dir= 读出，重建判定不变", () => {
+    const failure = asLockBusy(classifyConcurrentFailure(LOCK_BUSY_TIMEOUT));
+    assert.equal(failure.rebuild, true);
+    assert.equal(failure.lockPath, INDEX_LOCK_PATH);
+  });
+
+  it("成因缺失 operation= 时不当作重建（宁可少等也不无界挂起）", () => {
+    const noOwner = errorBlock(LOCK_BUSY_CODE, `lock is busy: lock=${INDEX_LOCK_PATH}`);
     const failure = classifyConcurrentFailure(noOwner);
     assert.equal(asLockBusy(failure).rebuild, false);
     assert.equal(asLockBusy(failure).ownerOperation, undefined);
   });
 
-  it("守护进程租约", () => {
-    const failure = asDaemonLease(classifyConcurrentFailure(DAEMON_LEASE));
-    assert.equal(failure.pid, "17135");
+  it("成因串整体缺失：仍判成锁忙，占锁方与锁路径交回 undefined", () => {
+    const codeOnly = `Error[${LOCK_BUSY_CODE}]:`;
+    const failure = classifyConcurrentFailure(codeOnly);
+    assert.equal(asLockBusy(failure).rebuild, false);
+    assert.equal(asLockBusy(failure).ownerOperation, undefined);
+    assert.equal(asLockBusy(failure).lockPath, undefined);
   });
 
-  it("租约缺明细块或明细里没有 pid 键：仍判成租约，pid 交回 undefined", () => {
-    // 上游省略明细不是「换个错误码」：判据把 kind 认对，等锁策略才不会跟着走偏。
-    const leaseCodeLine = `Code: ${DAEMON_LEASE_CODE}`;
-    const noDetails = [TITLE, leaseCodeLine].join("\n");
-    const emptyDetails = [TITLE, leaseCodeLine, DETAILS, "  root: /tmp/zgsrv2"].join("\n");
-    assert.equal(asDaemonLease(classifyConcurrentFailure(noDetails)).pid, undefined, noDetails);
-    assert.equal(
-      asDaemonLease(classifyConcurrentFailure(emptyDetails)).pid,
-      undefined,
-      emptyDetails,
+  it("远程授权被拒归类 permission-denied", () => {
+    const failure = classifyConcurrentFailure(PERMISSION_DENIED);
+    assert.equal(failure?.kind, "permission-denied");
+  });
+
+  it("其它错误码一律不归本插件策略类", () => {
+    const other = errorBlock(
+      "ZG.ENGINE.NOT_FOUND",
+      "No index found in /private/tmp/znoidx. Run `zg --index --embedding <model>` to build it, then retry the query.",
     );
-  });
-
-  it("其它错误码一律不归并发类", () => {
-    const other = [
-      "Error: No zvec-grep index found for this workspace",
-      "Code: ZVEC_GREP.ENGINE.SERVICE.WORKSPACE_INDEX_NOT_FOUND",
-      DETAILS,
-      "  root: /private/tmp/znoidx",
-    ].join("\n");
     assert.equal(classifyConcurrentFailure(other), null);
-  });
-
-  it("没有明细块时错误码仍抽得出，并发类识别不误判", () => {
-    const codeOnly = `Error: Index unavailable\n${CODE_LINE}`;
-    assert.equal(zgErrorCode(codeOnly), LOCK_BUSY_CODE);
-    const failure = asLockBusy(classifyConcurrentFailure(codeOnly));
-    assert.equal(failure.rebuild, false);
-    assert.equal(failure.lockPath, undefined);
   });
 
   it("无结构化失败返回 null", () => {
@@ -157,84 +147,16 @@ describe("并发类失败识别", () => {
     assert.equal(classifyConcurrentFailure(""), null);
   });
 
-  it("重复键取首次出现", () => {
-    const duplicated = [CODE_LINE, DETAILS, "  ownerPid: 1", "  ownerPid: 2"].join("\n");
-    const failure = classifyConcurrentFailure(duplicated);
-    assert.equal(asLockBusy(failure).ownerPid, "1");
-  });
-
-  it("明细块之后的非键值行终止收集", () => {
-    const truncated = [
-      CODE_LINE,
-      DETAILS,
-      "  ownerOperation: index.rebuild",
-      "这段是尾部截断的散文",
-      "  ownerPid: 999",
+  it("help 与 error location 行不干扰识别：码取第一处、成因取同一行", () => {
+    const withHelp = [
+      `Error[${LOCK_BUSY_CODE}]: lock is busy: lock=/x operation=context.refresh`,
+      "Help: wait for the operation to finish and retry",
+      "Error location: crates/zg-engine/src/workspace/lock.rs:50:11",
     ].join("\n");
-    const failure = asLockBusy(classifyConcurrentFailure(truncated));
-    assert.equal(failure.rebuild, true);
-    assert.equal(failure.ownerPid, undefined);
-  });
-
-  it("无缩进的冒号行不是明细：第二个错误块的 Error:/Code: 收不进键值表", () => {
-    // 缩进是明细行的实测形状；零缩进的行若被当成键值，第二个错误块的键会污染判断。
-    const twoBlocks = [
-      CODE_LINE,
-      DETAILS,
-      `  lock: ${INDEX_LOCK_PATH}`,
-      "",
-      // 空行不中断明细块：这一枚缩进键该收到（只把「遇空行即停」写成实现的两种坏形状之一）。
-      "  ownerPid: 777",
-      "Error: another failure",
-      "Code: SOMETHING.ELSE",
-      // 判定相关的两枚键：缩进一旦被放宽就会被收进明细表，而它们直接改变等待策略。
-      "ownerOperation: index",
-      "ownerPid: 999",
-    ].join("\n");
-    const failure = asLockBusy(classifyConcurrentFailure(twoBlocks));
-    assert.equal(failure.lockPath, INDEX_LOCK_PATH);
-    assert.equal(failure.ownerPid, "777", "空行之后的缩进键仍算明细");
-    assert.equal(failure.ownerOperation, undefined, "零缩进的第二个错误块不得进明细表");
-    assert.equal(zgErrorCode(twoBlocks), LOCK_BUSY_CODE, "错误码仍取第一处");
-  });
-
-  it("第一个错误块没有明细：不顺延捡第二个块的键值", () => {
-    const twoBlocks = [
-      CODE_LINE,
-      "Error: another failure",
-      CODE_LINE,
-      DETAILS,
-      "  ownerOperation: another.operation",
-      "  ownerPid: 777",
-    ].join("\n");
-    const failure = asLockBusy(classifyConcurrentFailure(twoBlocks));
-    assert.equal(failure.ownerOperation, undefined, "明细不属于第一个错误块");
-    assert.equal(failure.ownerPid, undefined);
+    const failure = asLockBusy(classifyConcurrentFailure(withHelp));
+    assert.equal(failure.ownerOperation, "context.refresh");
     assert.equal(failure.rebuild, false);
-  });
-
-  it("没有 Code 行时不捡任何明细块", () => {
-    assert.equal(zgErrorDetails([DETAILS, "  ownerPid: 1"].join("\n")).size, 0);
-  });
-
-  it("明细前允许出现空行：表头仍属于同一个错误块", () => {
-    const spaced = [CODE_LINE, "", DETAILS, "  ownerPid: 42"].join("\n");
-    const failure = asLockBusy(classifyConcurrentFailure(spaced));
-    assert.equal(failure.ownerPid, "42");
-  });
-
-  it("非驼峰拼写（owner_operation）的明细行不再中断整块收集", () => {
-    // 键字符集放宽到 [\w-]：上游若改拼写，行仍被认出、后续键照常收集（值是否被
-    // 消费由查表侧决定——这里 ownerOperation 查不到，宁可少等也不无界挂起）。
-    const underscore = [
-      CODE_LINE,
-      DETAILS,
-      `  lock: ${INDEX_LOCK_PATH}`,
-      "  owner_operation: index.rebuild",
-      "  ownerPid: 4321",
-    ].join("\n");
-    const failure = asLockBusy(classifyConcurrentFailure(underscore));
-    assert.equal(failure.ownerPid, "4321", "块没有在 owner_operation 行中断掉");
-    assert.equal(failure.rebuild, false);
+    // 成因串只在码行内找：Help 行里的 operation=（若有）不会被捞走。
+    assert.equal(zgErrorMessage(withHelp), "lock is busy: lock=/x operation=context.refresh");
   });
 });

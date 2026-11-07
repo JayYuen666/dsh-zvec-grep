@@ -35,6 +35,8 @@ import { MESSAGES } from "../lib/messages.ts";
  * 本测试直接喂字典——宿主在生产调用点传的是 messagesFor(MESSAGES, locale 偏好)。
  */
 const zhMessages = MESSAGES.zh;
+/** 时间过滤样例（穷举/索引/文件三通道共用，多处用例引同一份）。 */
+const AFTER_2024 = "2024-01-01";
 
 describe("shq（POSIX 单引号转义）", () => {
   it("普通字符串原样包单引号", () => {
@@ -99,7 +101,7 @@ describe("resolveRoot（0.1.5：root 缺省=会话工作区兜底）", () => {
 
   it("显式的非字符串值当场报类型错，不滑进 fallback 分支", () => {
     // `{root: 123}` 若静默回退到会话工作区，搜索就在模型没指定的目录上执行并交回
-    // 一份「合法」结果——与本文件「非法定类型即抛错」的口径一致。
+    // 一份「合法」结果——与本文件「非法定类型即抛错」的规则一致。
     assert.throws(() => resolveRoot(123, "/sess", zhMessages), /root 必须是字符串（收到 number）/u);
     assert.throws(() => resolveRoot({}, "/sess", zhMessages), /root 必须是字符串（收到 object）/u);
     // null / undefined 仍是「没给」，照旧回退。
@@ -125,7 +127,7 @@ describe("resolveLimit", () => {
     assert.throws(() => resolveLimit(Number.NaN, zhMessages), /非负整数/u);
   });
 
-  it("越界拒绝并点名区间（不静默钳制：钳过的少结果会被当成事实）", () => {
+  it("越界拒绝并点名区间（不会静默钳制：钳过的少结果会被当成事实）", () => {
     assert.throws(() => resolveLimit(0, zhMessages), /允许范围 1–50/u);
     assert.throws(() => resolveLimit(51, zhMessages), /允许范围 1–50/u);
     assert.throws(() => resolveLimit(999, zhMessages), /允许范围 1–50/u);
@@ -171,7 +173,7 @@ describe("singleOrList", () => {
     );
   });
 
-  it("单值里的 NUL 同样报错（单值不是绕过闸门的旁门）", () => {
+  it("单值里的 NUL 同样报错（单值也要过同一道检查）", () => {
     assert.throws(() => singleOrList(`a${String.fromCodePoint(0)}b`, "globs", zhMessages), /NUL/u);
   });
 
@@ -182,13 +184,13 @@ describe("singleOrList", () => {
   });
 });
 
-describe("buildSearchCommand", () => {
-  it("最小 query", () => {
+describe("buildSearchCommand（索引通道）", () => {
+  it("最小 query：0.3.0 无 zg query 子命令，主查询走显式 --hybrid= 路由", () => {
     const { command, workdir } = buildSearchCommand({ root: "/ws", query: "hello" }, zhMessages);
     assert.equal(workdir, "/ws");
     assert.equal(
       command,
-      "zg query 'hello' --limit 10 --preview short --refresh wait --device 'auto' --mode auto",
+      "zg --hybrid='hello' --limit 10 --preview short --refresh wait --device 'auto' --mode auto",
     );
   });
 
@@ -196,7 +198,7 @@ describe("buildSearchCommand", () => {
     const { command } = buildSearchCommand({ root: "/ws", query: "it's" }, zhMessages);
     assert.equal(
       command,
-      String.raw`zg query 'it'\''s' --limit 10 --preview short --refresh wait --device 'auto' --mode auto`,
+      String.raw`zg --hybrid='it'\''s' --limit 10 --preview short --refresh wait --device 'auto' --mode auto`,
     );
   });
 
@@ -224,7 +226,7 @@ describe("buildSearchCommand", () => {
     assert.equal(workdir, "/ws");
     assert.equal(
       command,
-      "zg query 'hi' --hybrid='q1' --hybrid='q2' --fts='Foo' --fts='Bar' --vector='sem' --fuse --limit 3 --preview short --refresh wait " +
+      "zg --hybrid='hi' --hybrid='q1' --hybrid='q2' --fts='Foo' --fts='Bar' --vector='sem' --fuse --limit 3 --preview short --refresh wait " +
         "--glob 'src/**' --iglob 'DOC/**' --type 'ts' --type-not 'md' --symbol-type 'class' --prefer-symbol " +
         "--modified-after '2026-01-01' --modified-before '2026-12-31' --device 'auto' --mode auto",
     );
@@ -234,7 +236,7 @@ describe("buildSearchCommand", () => {
     const { command } = buildSearchCommand({ root: "/ws", fts: ["needle"] }, zhMessages);
     assert.equal(
       command,
-      "zg query --fts='needle' --limit 10 --preview short --refresh wait --device 'auto' --mode auto",
+      "zg --fts='needle' --limit 10 --preview short --refresh wait --device 'auto' --mode auto",
     );
   });
 
@@ -247,6 +249,12 @@ describe("buildSearchCommand", () => {
     assert.match(command, /--vector='-bar'/u);
   });
 
+  it("以 '-' 开头的主查询同样走 --hybrid= 按值传（0.3.0 无位置 query，dashGuard 已随子命令消失）", () => {
+    const { command } = buildSearchCommand({ root: "/ws", query: "-foo" }, zhMessages);
+    assert.match(command, /--hybrid='-foo'/u);
+    assert.ok(!command.includes("-- '-foo'"), "索引通道不再有尾部 -- 分隔");
+  });
+
   it("显式 device 覆盖默认 auto", () => {
     const { command } = buildSearchCommand(
       { root: "/ws", query: "x", device: "metal" },
@@ -254,7 +262,7 @@ describe("buildSearchCommand", () => {
     );
     assert.equal(
       command,
-      "zg query 'x' --limit 10 --preview short --refresh wait --device 'metal' --mode auto",
+      "zg --hybrid='x' --limit 10 --preview short --refresh wait --device 'metal' --mode auto",
     );
   });
 
@@ -273,17 +281,6 @@ describe("buildSearchCommand", () => {
     assert.throws(() => buildSearchCommand({ root: "ws", query: "x" }, zhMessages), /绝对路径/u);
   });
 
-  it("query 以 '-' 开头 → 移到命令末尾用 -- 分隔（防 clap 当选项）；正常 query 结构不变", () => {
-    const dash = buildSearchCommand({ root: "/ws", query: "-foo" }, zhMessages);
-    assert.ok(
-      dash.command.endsWith("--mode auto -- '-foo'"),
-      `dash 开头 query 走尾部 -- 分隔：${dash.command}`,
-    );
-    assert.ok(!dash.command.startsWith("zg query '-foo'"), "不再置于头部");
-    const normal = buildSearchCommand({ root: "/ws", query: "hello" }, zhMessages);
-    assert.ok(normal.command.startsWith("zg query 'hello'"), "正常 query 仍在头部（零回归）");
-  });
-
   it("query 含 NUL 报错", () => {
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: `a${String.fromCodePoint(0)}b` }, zhMessages),
@@ -291,7 +288,7 @@ describe("buildSearchCommand", () => {
     );
   });
 
-  // 参数面扩展：preview / refresh / 符号类型闭集 / 路径过滤单值形态。
+  // 参数表扩展：preview / refresh / 符号类型闭集 / 路径过滤单值形态。
   it("preview 与 refresh 缺省透传各自缺省档（原先是硬编码 short + wait）", () => {
     const { command } = buildSearchCommand({ root: "/ws", query: "x" }, zhMessages);
     assert.ok(command.includes("--preview short --refresh wait"));
@@ -299,15 +296,15 @@ describe("buildSearchCommand", () => {
     assert.equal(DEFAULT_REFRESH, "wait");
   });
 
-  it("preview / refresh 显式取值原样透传（三档全收，background 要有守护进程）", () => {
-    for (const preview of ["none", "short", "full"]) {
+  it("preview / refresh 显式取值原样透传（0.3.0 四档 preview 全收，background 要有守护进程）", () => {
+    for (const preview of ["none", "short", "full", "detail"]) {
       for (const refresh of ["background", "wait", "off"]) {
         // backgroundSupport="available"：这一档只钉透传形态，能不能用另两条用例钉。
         const { command } = buildSearchCommand(
           { root: "/ws", query: "x", preview, refresh },
           zhMessages,
           undefined,
-          undefined,
+          "indexed",
           "available",
         );
         assert.ok(command.includes(`--preview ${preview} --refresh ${refresh}`));
@@ -317,18 +314,17 @@ describe("buildSearchCommand", () => {
 
   it("refresh=background 的两种「用不了」各有各的文案，第三种才把命令拼出来", () => {
     // 守护进程缺席：出路是起一个。判据显式传，而不是靠 `backgroundSupport` 的缺省值——
-    // lib/cli.ts 那个形参默认就是 "daemon-down"，「不传」与「传 daemon-down」是同一条分支，
-    // 原来这里各写一条断言，第二条没有覆盖任何新东西（#117）。
+    // lib/cli.ts 那个形参默认就是 "daemon-down"，「不传」与「传 daemon-down」是同一条分支。
     assert.throws(
       () =>
         buildSearchCommand(
           { root: "/ws", query: "x", refresh: "background" },
           zhMessages,
           "auto",
-          false,
+          "indexed",
           "daemon-down",
         ),
-      /zg server on/u,
+      /zg --server on/u,
     );
     // 部署钉死 direct：此时叫用户去起守护进程是指错方向，两句必须分得开。
     // 这里手工取消息而不是 assert.throws + 校验函数：本仓的 promise 规则不许回调式断言。
@@ -338,7 +334,7 @@ describe("buildSearchCommand", () => {
         { root: "/ws", query: "x", refresh: "background" },
         zhMessages,
         "direct",
-        false,
+        "indexed",
         "mode-direct",
       );
       assert.fail("钉死 direct 时 background 必须被拒");
@@ -346,15 +342,15 @@ describe("buildSearchCommand", () => {
       pinned = error instanceof Error ? error.message : String(error);
     }
     assert.match(pinned, /clientMode/u, "钉死 direct 的那句要点名是模式问题");
-    assert.ok(!pinned.includes("zg server on"), "钉死 direct 的那句不该给出「去起守护进程」的出路");
-    // 两个判据传岔时以 mode 为准：direct 部署的根因是模式钉死，不是守护进程没起。
+    assert.ok(!pinned.includes("server on"), "钉死 direct 的那句不该给出「去起守护进程」的出路");
+    // 两个判据传岔时以 mode 为准：direct 部署的真正的原因是模式钉死，不是守护进程没起。
     let inconsistent = "";
     try {
       buildSearchCommand(
         { root: "/ws", query: "x", refresh: "background" },
         zhMessages,
         "direct",
-        false,
+        "indexed",
         "daemon-down",
       );
       assert.fail("direct 模式下 background 必须被拒");
@@ -366,13 +362,13 @@ describe("buildSearchCommand", () => {
       /clientMode/u,
       "mode=direct 时即便 support 传成 daemon-down 也按模式问题报",
     );
-    assert.ok(!inconsistent.includes("zg server on"));
+    assert.ok(!inconsistent.includes("server on"));
     // 可用时才落到命令行上。
     const ok = buildSearchCommand(
       { root: "/ws", query: "x", refresh: "background" },
       zhMessages,
       "server",
-      false,
+      "indexed",
       "available",
     );
     assert.ok(ok.command.includes("--refresh background"));
@@ -390,10 +386,10 @@ describe("buildSearchCommand", () => {
     }
   });
 
-  it("preview / refresh 非法取值即报并列出合法档位（绝不静默回落缺省）", () => {
+  it("preview / refresh 非法取值即报并列出合法档位（绝不会静默回落缺省）", () => {
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: "x", preview: "huge" }, zhMessages),
-      /预览档位非法：huge（合法取值：none \| short \| full）/u,
+      /预览档位非法：huge（合法取值：none \| short \| full \| detail）/u,
     );
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: "x", refresh: "later" }, zhMessages),
@@ -410,31 +406,67 @@ describe("buildSearchCommand", () => {
     );
   });
 
-  it("符号类型绑定 zg 真实闭集：六值全收，闭集外与大小写错配一律即报", () => {
+  it("符号类型绑定 zg 0.3.0 真实闭集：七值全收，闭集外与大小写错配一律即报", () => {
     const all = buildSearchCommand(
       { root: "/ws", query: "x", symbolTypes: SYMBOL_TYPE_NAMES },
       zhMessages,
     ).command;
-    for (const name of ["module", "class", "interface", "function", "value", "alias"]) {
+    for (const name of ["alias", "class", "enum", "function", "interface", "module", "value"]) {
       assert.ok(all.includes(`--symbol-type '${name}'`), `缺 ${name}`);
     }
-    // zg 侧 `--symbol-type Class` 退出码非零（Unsupported symbol type: Class），
-    // 插件在构造阶段就拦，且不把大写折叠成小写——那是替模型改它没写的约束。
+    // zg 侧 `--symbol-type Class` 退出码非零，插件在构造阶段就拦，且不把大写自动转成
+    // 小写——那是替模型改它没写的约束。
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: "x", symbolTypes: ["Class"] }, zhMessages),
-      /符号类型非法：Class（合法取值：module \| class \| interface \| function \| value \| alias，只接受小写）/u,
+      /符号类型非法：Class（合法取值：alias \| class \| enum \| function \| interface \| module \| value，只接受小写）/u,
     );
+    // 条数上限取上游 MCP schema 的 maxItems=7，并与 CLI 通道共用同一道闸：7 个不同取值
+    // 全部放行（上面那条已覆盖），第 8 项必是重复值——MCP 面会以 schema 拒，插件在构造期
+    // 就用同一条上限报错，免得同一份入参在 CLI 与 MCP 两档下行为不同。
     assert.throws(
-      () => buildSearchCommand({ root: "/ws", query: "x", symbolTypes: ["enum"] }, zhMessages),
-      /符号类型非法：enum/u,
+      () =>
+        buildSearchCommand(
+          { root: "/ws", query: "x", symbolTypes: Array.from({ length: 8 }).fill("class") },
+          zhMessages,
+        ),
+      /symbolTypes 最多 7 项（实际 8）/u,
     );
-    // 闭集大小**不是**条数上限：7 个各自合法的重复值应当照常构造出一条完整命令，
-    // 而不是被「最多 6 项」这条指向错误方向的提示挡下。
-    const repeated = buildSearchCommand(
-      { root: "/ws", query: "x", symbolTypes: Array.from({ length: 7 }).fill("class") },
+  });
+
+  it("时间过滤串上限 128 字符（与上游 MCP TimeInput 的 string 上限一致），129 即报", () => {
+    const ok = buildSearchCommand(
+      { root: "/ws", query: "x", modifiedAfter: "2".repeat(128) },
+      zhMessages,
+    ).command;
+    assert.ok(ok.includes("--modified-after"), "128 字符仍应构造出完整命令");
+    assert.throws(
+      () =>
+        buildSearchCommand({ root: "/ws", query: "x", modifiedAfter: "2".repeat(129) }, zhMessages),
+      /modifiedAfter 超过 128 字符上限（实际 129）/u,
+    );
+  });
+
+  it("分类过滤透传 --category / --category-not（0.3.0 新增，可重复）", () => {
+    const { command } = buildSearchCommand(
+      { root: "/ws", query: "x", category: ["code", "document"], categoryNot: "config" },
       zhMessages,
     );
-    assert.ok(repeated.command.includes(`--symbol-type 'class'`), "重复的合法取值不该被当成超限");
+    assert.ok(command.includes("--category 'code' --category 'document'"));
+    assert.ok(command.includes("--category-not 'config'"));
+    // 单值与数组同形。
+    const single = buildSearchCommand(
+      { root: "/ws", query: "x", category: "code", categoryNot: ["config"] },
+      zhMessages,
+    ).command;
+    assert.ok(single.includes("--category 'code'"));
+    assert.ok(single.includes("--category-not 'config'"));
+  });
+
+  it("分类过滤坏类型照旧报错（与路径过滤同一套 singleOrList 纪律）", () => {
+    assert.throws(
+      () => buildSearchCommand({ root: "/ws", query: "x", category: 5 }, zhMessages),
+      /必须是字符串或字符串数组/u,
+    );
   });
 
   it("路径过滤兼容单值与数组两种形态（上游契约是二者的并集）", () => {
@@ -457,7 +489,7 @@ describe("buildSearchCommand", () => {
   });
 
   it("路径过滤收单值后，其它类型错误仍照旧报错（不因兼容单值而放宽类型）", () => {
-    // 5 与 {a:1} 都不是字符串/数组/缺席：报「两种合法形态」（与 singleOrList 同一口径）。
+    // 5 与 {a:1} 都不是字符串/数组/缺席：报「两种合法形态」（与 singleOrList 同一种做法）。
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: "x", globs: 5 }, zhMessages),
       /必须是字符串或字符串数组/u,
@@ -507,20 +539,20 @@ function built(args: Record<string, unknown>): BuiltCommand {
     { root: "/ws", query: "parseConfig", ...args },
     zhMessages,
     "auto",
-    true,
+    "exhaustive",
   );
 }
 
-describe("穷举词法通道（buildSearchCommand 的 exhaustive 臂）", () => {
-  it("缺省构造：--rg + pattern + limit + 设备 + 模式，绝不带索引侧旗标", () => {
+describe("穷举词法通道（buildSearchCommand 的 exhaustive 分支）", () => {
+  it("缺省构造：0.3.0 顶层 --rg + pattern + limit + 设备 + 模式，绝不带索引侧旗标", () => {
     const { command, workdir } = built({});
     assert.equal(workdir, "/ws");
-    assert.equal(command, "zg query --rg 'parseConfig' --limit 10 --device 'auto' --mode auto");
+    assert.equal(command, "zg --rg 'parseConfig' --limit 10 --device 'auto' --mode auto");
   });
 
-  it("pattern 以 '-' 开头走 -e（实测 --rg 自己的约定，不是索引通道那套尾部 --）", () => {
+  it("pattern 以 '-' 开头走 -e（实测 --rg 自己的约定，不是索引通道那套显式路由）", () => {
     const { command } = built({ query: "-foo" });
-    assert.equal(command, "zg query --rg -e '-foo' --limit 10 --device 'auto' --mode auto");
+    assert.equal(command, "zg --rg -e '-foo' --limit 10 --device 'auto' --mode auto");
   });
 
   it("路径过滤与时间过滤照常透传（实测这四类旗标在 --rg 下均被 zg 接受）", () => {
@@ -529,7 +561,7 @@ describe("穷举词法通道（buildSearchCommand 的 exhaustive 臂）", () => 
       insensitiveGlobs: "doc/**",
       fileTypes: "ts",
       excludedFileTypes: ["md"],
-      modifiedAfter: "2024-01-01",
+      modifiedAfter: AFTER_2024,
       modifiedBefore: "2025-01-01",
     });
     assert.ok(command.includes("--glob 'src/**' --iglob 'doc/**' --type 'ts' --type-not 'md'"));
@@ -538,17 +570,19 @@ describe("穷举词法通道（buildSearchCommand 的 exhaustive 臂）", () => 
 
   it("缺 pattern 即报（穷举模式下 query 就是 pattern，没有多路查询组可退）", () => {
     assert.throws(
-      () => buildSearchCommand({ root: "/ws" }, zhMessages, "auto", true),
+      () => buildSearchCommand({ root: "/ws" }, zhMessages, "auto", "exhaustive"),
       /穷举检索（rg=true）需要一个 query 作为匹配模式/u,
     );
   });
 
-  it("索引侧旗标逐个即报并点名（不静默丢弃用户给的那一项）", () => {
+  it("索引侧旗标逐个即报并点名（不会静默丢弃用户给的那一项）", () => {
     const cases: [Record<string, unknown>, string][] = [
       [{ fuse: true }, "fuse"],
       [{ queries: ["a"] }, "queries"],
       [{ fts: ["a"] }, "fts"],
       [{ vector: ["a"] }, "vector"],
+      [{ category: ["code"] }, "category"],
+      [{ categoryNot: ["config"] }, "categoryNot"],
       [{ preview: "full" }, "preview"],
       [{ refresh: "off" }, "refresh"],
       [{ symbolTypes: ["class"] }, "symbolTypes"],
@@ -568,13 +602,64 @@ describe("穷举词法通道（buildSearchCommand 的 exhaustive 臂）", () => 
 
   it("英文侧同源（冲突文案把出路也说清）", () => {
     assert.throws(
-      () => buildSearchCommand({ root: "/ws", query: "x", fuse: true }, MESSAGES.en, "auto", true),
+      () =>
+        buildSearchCommand(
+          { root: "/ws", query: "x", fuse: true },
+          MESSAGES.en,
+          "auto",
+          "exhaustive",
+        ),
       /conflicts with these indexed-search parameters: fuse[\s\S]*build an index/u,
     );
   });
 });
 
-/** 远程 provider 引用：allowlist 必须拒它，除非部署显式开放。 */
+/** 文件发现通道构造器：固定 root，只让用例改旗标。 */
+function builtFiles(args: Record<string, unknown>): BuiltCommand {
+  return buildSearchCommand({ root: "/ws", ...args }, zhMessages, "auto", "files");
+}
+
+describe("文件发现通道（buildSearchCommand 的 files 分支，0.3.0 新增）", () => {
+  it("缺省构造：zg --rg --files，不带 --limit（上游明拒）也不带设备旗标", () => {
+    const { command, workdir } = builtFiles({});
+    assert.equal(workdir, "/ws");
+    assert.equal(command, "zg --rg --files --mode auto");
+  });
+
+  it("路径过滤与时间过滤透传（上游 files_options 的映射面就是这两族）", () => {
+    const { command } = builtFiles({
+      globs: ["src/**"],
+      insensitiveGlobs: "doc/**",
+      fileTypes: "ts",
+      excludedFileTypes: ["md"],
+      modifiedAfter: AFTER_2024,
+      modifiedBefore: "2025-01-01",
+    });
+    assert.ok(command.includes("--glob 'src/**' --iglob 'doc/**' --type 'ts' --type-not 'md'"));
+    assert.ok(command.includes("--modified-after '2024-01-01' --modified-before '2025-01-01'"));
+    assert.ok(!command.includes("--device"), "文件发现不跑 embedding，不发设备旗标");
+    assert.ok(!command.includes("--limit"), "文件清单无上限，不发 --limit");
+  });
+
+  it("query/queries/limit/device 逐个点名拒绝（query 会被上游当成路径，limit 上游明拒）", () => {
+    assert.throws(
+      () => builtFiles({ query: "x" }),
+      /文件发现模式（files=true）与这些参数互斥：query/u,
+    );
+    assert.throws(() => builtFiles({ limit: 5 }), /files=true.*互斥：limit/u);
+    assert.throws(() => builtFiles({ device: "cpu" }), /files=true.*互斥：device/u);
+  });
+
+  it("files 通道继承穷举的索引侧冲突（fuse/preview 等同样点名）", () => {
+    assert.throws(
+      () => builtFiles({ fuse: true }),
+      /穷举检索（rg=true）与下列索引侧参数互斥：fuse/u,
+    );
+    assert.throws(() => builtFiles({ preview: "full" }), /preview/u);
+  });
+});
+
+/** 远程 provider 引用：0.3.0 起在候选闭集内，部署开放后放行并自动带 --allow-remote。 */
 const REMOTE_REFERENCE = "qwen/text-embedding-v4";
 
 describe("buildIndexCommand", () => {
@@ -582,12 +667,12 @@ describe("buildIndexCommand", () => {
   // 旗标是 --iglob 而非 --glob：大小写不敏感、且排在用户 iglob 之后，理由见 lib/cli.ts 的 pushIndexGlobs。
   const SECRET_ARGS = SECRET_EXCLUDE_GLOBS.map((globStr) => `--iglob '${globStr}'`).join(" ");
 
-  it("最小：root + 默认 embedding + 默认密钥排除", () => {
+  it("最小：0.3.0 --index 旗标 + root + 默认 embedding + 默认密钥排除", () => {
     const { command, workdir } = buildIndexCommand({ root: "/ws" }, DEFAULT_EMBEDDING, zhMessages);
     assert.equal(workdir, "/ws");
     assert.equal(
       command,
-      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
+      `zg --index '/ws' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --device 'auto' --mode auto`,
     );
   });
 
@@ -599,8 +684,19 @@ describe("buildIndexCommand", () => {
     );
     assert.equal(
       command,
-      `zg index '/ws' --embedding 'local/potion-code-16m-v2' ${SECRET_ARGS} --device 'auto' --mode auto`,
+      `zg --index '/ws' --embedding 'local/potion-code-16m-v2' ${SECRET_ARGS} --device 'auto' --mode auto`,
     );
+  });
+
+  it("nestedGit=true 透传 --nested-git，位置在 --no-ignore 之后（0.3.0 新增扫描规则）", () => {
+    const off = buildIndexCommand({ root: "/ws" }, DEFAULT_EMBEDDING, zhMessages);
+    assert.ok(!off.command.includes("--nested-git"), "缺省不得凭空带上这个旗标");
+    const on = buildIndexCommand(
+      { root: "/ws", hidden: true, noIgnore: true, nestedGit: true },
+      DEFAULT_EMBEDDING,
+      zhMessages,
+    );
+    assert.ok(on.command.includes("--hidden --no-ignore --nested-git"), on.command);
   });
 
   it("excludeSecrets=false 关闭密钥排除", () => {
@@ -611,7 +707,7 @@ describe("buildIndexCommand", () => {
     );
     assert.equal(
       command,
-      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' --device 'auto' --mode auto`,
+      `zg --index '/ws' --embedding '${DEFAULT_EMBEDDING}' --device 'auto' --mode auto`,
     );
     assert.ok(!command.includes(".pem"));
   });
@@ -667,22 +763,22 @@ describe("buildIndexCommand", () => {
     );
     assert.equal(
       command,
-      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' --rebuild --glob 'src/**' --iglob 'DOC/**' --type 'ts' --type-not 'md' ` +
+      `zg --index '/ws' --embedding '${DEFAULT_EMBEDDING}' --rebuild --glob 'src/**' --iglob 'DOC/**' --type 'ts' --type-not 'md' ` +
         `${SECRET_ARGS} --hidden --no-ignore --max-depth 2 --max-filesize 1048576 --follow --embedding-concurrency 4 --device 'metal' --mode auto`,
     );
   });
 
-  it("drop 干净时只发 --drop --yes --mode（多余参数一个都不进命令）", () => {
+  it("drop 干净时只发 --drop --mode（0.3.0 无 --yes，删除立即执行；多余参数一个都不进命令）", () => {
     const { command } = buildIndexCommand(
       { root: "/ws", drop: true },
       DEFAULT_EMBEDDING,
       zhMessages,
     );
-    assert.equal(command, "zg index '/ws' --drop --yes --mode auto");
+    assert.equal(command, "zg --index '/ws' --drop --mode auto");
   });
 
-  it("drop 携带索引侧参数：一次点名全部拒绝，绝不静默丢弃", () => {
-    // drop 那一臂只发 `--drop --yes`，任何别的旗标都进不了命令。静默收下会让模型以为
+  it("drop 携带索引侧参数：一次点名全部拒绝，绝不会静默丢弃", () => {
+    // drop 那一条分支只发 `--drop`，任何别的旗标都进不了命令。静默收下会让模型以为
     // 过滤/重建/embedding 生效了（embedding 还绕过 allowlist），其实那条 zg 只会把索引删掉。
     let message = "";
     try {
@@ -709,7 +805,7 @@ describe("buildIndexCommand", () => {
   });
 
   it("drop 与 resetPaths 互斥：构造期拒，而不是把 resetPaths 静默丢掉", () => {
-    // drop 那一臂只发 `--drop --yes`，任何别的旗标都会消失。resetPaths 若跟着消失，
+    // drop 那一条分支只发 `--drop --yes`，任何别的旗标都会消失。resetPaths 若跟着消失，
     // 用户以为清了继承设置，其实那条 zg 只是把索引删了——必须响亮地拒。
     assert.throws(
       () =>
@@ -729,7 +825,7 @@ describe("buildIndexCommand", () => {
     // 位置固定在 embedding-concurrency 之后、--device 之前（测试锁死旗标顺序）。
     assert.equal(
       on.command,
-      `zg index '/ws' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --reset-paths --device 'auto' --mode auto`,
+      `zg --index '/ws' --embedding '${DEFAULT_EMBEDDING}' ${SECRET_ARGS} --reset-paths --device 'auto' --mode auto`,
     );
   });
 
@@ -754,16 +850,17 @@ describe("buildIndexCommand", () => {
   });
 });
 
-describe("embedding 构造期 allowlist", () => {
+describe("embedding 构造期 allowlist（0.3.0：本地 ∪ 远程闭集）", () => {
   const LOCAL = "local/potion-code-16m-v2";
 
-  it("清单内的本地引用照旧透传", () => {
+  it("清单内的本地引用照旧透传，且不带 --allow-remote", () => {
     const { command } = buildIndexCommand(
       { root: "/ws", embedding: LOCAL },
       DEFAULT_EMBEDDING,
       zhMessages,
     );
     assert.ok(command.includes(`--embedding '${LOCAL}'`));
+    assert.ok(!command.includes("--allow-remote"), "本地模型不需要远程授权旗标");
   });
 
   it("缺省 embedding 走设置里的默认值，不受 allowlist 影响", () => {
@@ -771,9 +868,10 @@ describe("embedding 构造期 allowlist", () => {
     assert.ok(command.includes(`--embedding '${DEFAULT_EMBEDDING}'`));
   });
 
-  it("三类非法引用在构造期就被拒：远程 provider / 不存在的本地模型 / 任意前缀 URL", () => {
+  it("部署未开放远程时：远程闭集内的引用被拒并指向部署开关；未知引用一律拒", () => {
     for (const reference of [
       REMOTE_REFERENCE,
+      "qwen/qwen3.7-text-embedding",
       "local/does-not-exist",
       "evil/http://attacker/x",
       "not-a-provider/model",
@@ -792,24 +890,60 @@ describe("embedding 构造期 allowlist", () => {
     }
   });
 
-  it("部署显式开放远程后，同一批引用放行（闸门在部署，不在模型手里）", () => {
-    for (const reference of [REMOTE_REFERENCE, "evil/http://attacker/x"]) {
-      const { command } = buildIndexCommand(
-        { root: "/ws", embedding: reference },
-        DEFAULT_EMBEDDING,
-        zhMessages,
-        "auto",
-        true,
-      );
-      assert.ok(command.includes(`--embedding '${reference}'`));
-    }
+  it("部署显式开放远程后：远程闭集内的引用放行且自动带 --allow-remote（0.3.0 非交互远程索引的门槛）", () => {
+    const { command } = buildIndexCommand(
+      { root: "/ws", embedding: REMOTE_REFERENCE },
+      DEFAULT_EMBEDDING,
+      zhMessages,
+      "auto",
+      true,
+    );
+    assert.ok(command.includes(`--embedding '${REMOTE_REFERENCE}'`));
+    // 旗标紧跟 --embedding（0.3.0 的 Embedding options 组）。
+    assert.ok(
+      command.includes(`--embedding '${REMOTE_REFERENCE}' --allow-remote`),
+      `远程引用必须自动补 --allow-remote：${command}`,
+    );
+  });
+
+  it("部署开放远程也不放行未知引用：allowRemote 放行的是远程闭集，不是任意前缀", () => {
+    // 0.2.2 时代 `allowRemote` 放行一切非空串的旧语义已在 0.3.0 收紧——
+    // `evil/http://attacker/x` 这类值在任何开关下都不进命令。
+    assert.throws(
+      () =>
+        buildIndexCommand(
+          { root: "/ws", embedding: "evil/http://attacker/x" },
+          DEFAULT_EMBEDDING,
+          zhMessages,
+          "auto",
+          true,
+        ),
+      /候选清单内/u,
+    );
+  });
+
+  it("缺省引用是远程且部署开放时同样带 --allow-remote（设置卡允许默认模型选远程组）", () => {
+    const { command } = buildIndexCommand(
+      { root: "/ws" },
+      REMOTE_REFERENCE,
+      zhMessages,
+      "auto",
+      true,
+    );
+    assert.ok(command.includes(`--embedding '${REMOTE_REFERENCE}' --allow-remote`));
+    // 部署未开放时缺省远程引用同样被拒（构造期闭集 allowlist 对默认值同样生效）。
+    assert.throws(
+      () => buildIndexCommand({ root: "/ws" }, REMOTE_REFERENCE, zhMessages),
+      /allowRemoteEmbedding/u,
+    );
   });
 
   it("密钥与端点**绝不出现在命令行**：构造器没有这两个入参，多余的键被原样忽略", () => {
-    // 远程能力走 env（host.ts 的 zgEnv），argv 里出现任何 key/endpoint 都是泄露面。
-    // 这三个键刻意**不在** IndexArgs 声明面上：用展开形态传进去（宿主真实形态就是
+    // 远程能力走 env（host.ts 的 zgEnv），argv 里出现任何 key/endpoint 都会泄露。
+    // 这三个键刻意**不在** IndexArgs 的声明里：用展开形态传进去（宿主真实形态就是
     // `{ ...args, root }`），既过得了 tsc（多余属性在展开时被忽略），也测得到
-    // 「构造器认不出它们，于是原样丢弃」这一层。
+    // 「构造器认不出它们，于是原样丢弃」这一层。`--allow-remote` 是本包自己按
+    // 「远程闭集引用 + 部署开关」发的，模型侧伪造的 allowRemote 键不参与判定。
     const EXTRA_REMOTE_KEYS = {
       apiKey: "sk-x",
       endpoint: "http://attacker.example",
@@ -828,7 +962,6 @@ describe("embedding 构造期 allowlist", () => {
     assert.ok(!command.includes("attacker.example"), "命令行里不得出现端点");
     assert.ok(!command.includes("--api-key"), "本包不构造 --api-key");
     assert.ok(!command.includes("--endpoint"), "本包不构造 --endpoint");
-    assert.ok(!command.includes("--allow-remote"), "授权那一道由 zg 与用户负责，本包不代劳");
   });
 });
 
@@ -858,10 +991,10 @@ describe("buildIndexCommand 入参类型错拒（续 buildIndexCommand 组）", 
 });
 
 /** 缺省状态命令行：多处断言引用，抽成常量避免硬编码漂移。 */
-const STATUS_COMMAND = "zg status '/ws' --mode auto";
+const STATUS_COMMAND = "zg --status '/ws' --mode auto";
 
 describe("buildStatusCommand", () => {
-  it("root 位置参数转义", () => {
+  it("root 位置参数转义（0.3.0 --status 旗标形态）", () => {
     const { command, workdir } = buildStatusCommand({ root: "/ws" }, zhMessages);
     assert.equal(workdir, "/ws");
     assert.equal(command, STATUS_COMMAND);
@@ -869,12 +1002,12 @@ describe("buildStatusCommand", () => {
 
   it("root 含引号转义", () => {
     const { command } = buildStatusCommand({ root: "/a'b" }, zhMessages);
-    assert.equal(command, String.raw`zg status '/a'\''b' --mode auto`);
+    assert.equal(command, String.raw`zg --status '/a'\''b' --mode auto`);
   });
 
   it("checkReady=true 透传 --check-ready（位置在 root 之后、模式之前）", () => {
     const { command } = buildStatusCommand({ root: "/ws", checkReady: true }, zhMessages);
-    assert.equal(command, "zg status '/ws' --check-ready --mode auto");
+    assert.equal(command, "zg --status '/ws' --check-ready --mode auto");
   });
 
   it("checkReady 缺省 / 显式 false 都不带该旗标", () => {
@@ -903,7 +1036,7 @@ describe("检索追踪开关", () => {
 
   it("trace 排在 prefer-symbol 之后、时间过滤之前（位置固定）", () => {
     const { command } = buildSearchCommand(
-      { root: "/ws", query: "x", trace: true, preferSymbol: true, modifiedAfter: "2024-01-01" },
+      { root: "/ws", query: "x", trace: true, preferSymbol: true, modifiedAfter: AFTER_2024 },
       zhMessages,
     );
     assert.ok(command.includes("--prefer-symbol --trace --modified-after '2024-01-01'"), command);
@@ -911,7 +1044,13 @@ describe("检索追踪开关", () => {
 
   it("穷举模式与 trace 互斥（实测 zg 报 --rg cannot be combined with --trace）", () => {
     assert.throws(
-      () => buildSearchCommand({ root: "/ws", query: "x", trace: true }, zhMessages, "auto", true),
+      () =>
+        buildSearchCommand(
+          { root: "/ws", query: "x", trace: true },
+          zhMessages,
+          "auto",
+          "exhaustive",
+        ),
       /穷举检索（rg=true）与下列索引侧参数互斥：trace/u,
     );
   });
@@ -930,7 +1069,7 @@ describe("传输模式（缺省自动，三条命令同源）", () => {
     }
   });
 
-  it("域外取值与错类型都报错，绝不静默降级", () => {
+  it("域外取值与错类型都报错，绝不会静默降级", () => {
     assert.throws(() => clientModeOf("autoo", zhMessages), /传输模式非法/u);
     assert.throws(() => clientModeOf("AUTO", zhMessages), /传输模式非法/u);
     assert.throws(() => clientModeOf(1, zhMessages), /传输模式非法/u);
@@ -963,7 +1102,7 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
     assert.throws(() => assertAbsoluteRoot("//", zhMessages), /文件系统根目录/u);
   });
 
-  it("标量入参类型错即报，不静默回默认", () => {
+  it("标量入参类型错即报，不会静默回默认", () => {
     assert.throws(
       () => buildSearchCommand({ root: "/ws", query: 5 }, zhMessages),
       /query 必须是字符串（收到 number）/u,
@@ -1012,7 +1151,7 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
   });
 
   it("数组超条数即报", () => {
-    // 上限写数字而不是引常量：这条断言的价值就是把 128 这档闸门钉住。
+    // 上限写数字而不是引常量：这条断言的价值就是把 128 这个上限钉住。
     // 该数字与 zg 自己对外的路径过滤项上限一致，不是本包自定的数。
     const GREP_ITEM_LIMIT = 128;
     const many = Array.from(
@@ -1045,12 +1184,12 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
     );
   });
 
-  it("规模闸门按 UTF-8 字节比：码元数没超、字节数超的命令同样被拦", () => {
+  it("规模上限按 UTF-8 字节比：码元数没超、字节数超的命令同样被拦", () => {
     // 12 条全中文 query：.length（UTF-16 码元）= 12 × 3000 = 36000，远低于 64K；
     // UTF-8 字节 = 3 × 36000 ≈ 108KB，已越过 Linux MAX_ARG_STRLEN≈128KB 的方向。
-    // 闸门若按码元数比，这条命令会被静默放行并在 execve 上 E2BIG。
+    // 若按码元数比，这条命令会被静默放行并在 execve 上 E2BIG。
     const routes = Array.from({ length: 12 }, () => "中".repeat(3000));
-    assert.ok(routes.join("").length < MAX_COMMAND_BYTES, "前置条件：码元数确实在旧口径的闸门之下");
+    assert.ok(routes.join("").length < MAX_COMMAND_BYTES, "前置条件：码元数确实在旧版上限之下");
     assert.throws(
       () => buildSearchCommand({ root: "/ws", queries: routes }, zhMessages),
       /字节上限/u,
@@ -1058,7 +1197,7 @@ describe("入参类型与规模上限（harness 不校验工具入参，全部�
   });
 
   it("整数字段的类型只认 number：数字字符串不再是数字", () => {
-    // 旧断言（名字叫「接受数字字符串形态」）认可的其实是**类型强转**：参数面声明着
+    // 旧断言（名字叫「接受数字字符串形态」）认可的其实是**类型强转**：参数表声明着
     // type: "integer"，而 `Number("3")` 与 `Number(true)` / `Number([])` 一样能折成整数，
     // 于是模型给一个类型错的值得到的不是报错、而是一个它没指定过的数字。数字字符串这一档
     // 尤其误导：报错文案说「必须是整数」，可真正错的是**类型**（收到的是 string）。

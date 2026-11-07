@@ -6,7 +6,7 @@
 // 两侧同一个 id 即同源；
 // <select> 候选来自 lib/embedding-catalog.ts（单一数据源）。
 // 「工作区重建」：经官方 Typert Remote 读宿主侧重建服务（roots / rebuild / status），
-// 卡片轮询同一个读面直到后台进程结束（读取器见 src/rebuild-reader.ts）。
+// 卡片轮询同一个读取接口直到后台进程结束（读取器见 src/rebuild-reader.ts）。
 // 取值/判定逻辑全部在 lib/card-logic.ts（草稿、终态判据、应答体检），本文件只渲染。
 //
 // 界面文案双语：apply 里把 src/ui-messages.ts 的两语字典注册进官方
@@ -24,9 +24,9 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { BuiltInLocaleId } from "@deepseek-ai/dsh-client-locale/client";
 import type { LocaleDictOf } from "@deepseek-ai/dsh-client-ui-slots";
 import type { SlotRegistry } from "@deepseek-ai/dsh-client-ui-renderer/client";
-import { LOCAL_EMBEDDINGS } from "../lib/embedding-catalog.ts";
+import { LOCAL_EMBEDDINGS, REMOTE_EMBEDDING_CATALOG } from "../lib/embedding-catalog.ts";
 import type { LocalEmbeddingBackend } from "../lib/embedding-catalog.ts";
-// 数值区间单源：输入框区间与文案插值引同一份常量（host schema 与 lib/card-logic 同源）。
+
 import {
   BUDGET_MAX,
   DEFAULT_GREP_BUDGET,
@@ -66,6 +66,12 @@ import { EMBEDDING_MIRROR_URL, UI_MESSAGES } from "./ui-messages.ts";
 import type { LocaleNs, Translate, UiMessages } from "./ui-messages.ts";
 
 export { cardStore, draftFields, parseRebuildPoll } from "../lib/card-logic.ts";
+
+/** 一个反斜杠字符（客户端不引 lib/platform.ts：那份模块带 Node 的 process 类型）。 */
+const BACKSLASH = String.fromCodePoint(92);
+
+/** 卡片侧只做形状提示：win32 盘符绝对路径（`C:\…` / `C:/…`）。 */
+const WIN32_ABSOLUTE_ROOT = /^[A-Za-z]:[\\/]/u;
 
 const NS: LocaleNs = "zvec-grep";
 /**
@@ -121,18 +127,18 @@ interface CardSlotProps {
   t: Translate;
   useCard: <Type>(selector: (snap: CardSnapshot) => Type) => Type;
   /**
-   * 注入面由本文件自己构造（见 apply 的 writeField / unsetField）：0.1.7 的
-   * `ConfigForm.set/unset` 回 Promise<boolean> 受理位（installed
+   * 注入由本文件自己构造（见 apply 的 writeField / unsetField）：0.1.7 的
+   * `ConfigForm.set/unset` 回 Promise<boolean> 受理结果（installed
    * config-form-types.d.ts 的 `set(field: string, value: unknown): Promise<boolean>` 与
    * `unset(field: string): Promise<boolean>` 两位；true=宿主受理，false=拒绝或写入被跳过，传输失败
-   * 才 reject）——受理位**原样透传**给卡片，由 save() 消费（false → saveRejected 文案
-   * 且不清 touched，fail-closed 不静默丢修改；reject → saveFailed）。unset 必带
+   * 才 reject）——受理结果**原样透传**给卡片，由 save() 消费（false → saveRejected 文案
+   * 且不清 touched，fail-closed 不会静默丢掉修改；reject → saveFailed）。unset 必带
    *（清空即回组合层 / schema 的 .default(...)）。
    */
   set: (field: string, value: unknown) => Promise<boolean>;
   unset: (field: string) => Promise<boolean>;
   /**
-   * 宿主重建读面（官方 Remote 的消费侧，见 src/rebuild-reader.ts）。
+   * 宿主重建读取接口（官方 Remote 的消费侧，见 src/rebuild-reader.ts）。
    * `undefined` = 连读取器都无从构造（ctx 缺 get 面）：卡片照常渲染，点重建时给出错误。
    * remote 服务与命名空间的缺席不在这里——读取器在每次调用时现读并给出点名文案。
    */
@@ -185,7 +191,7 @@ function rebuildHintText(t: Translate, embedding: string, hasRoots: boolean): st
   });
 }
 
-/** embedding 候选的显示文本与分组（供共享 SelectField 的 options）。 */
+/** embedding 候选的显示文本与分组（供共享 SelectField 的 options）：本地按后端三组 + 远程一组。 */
 function embeddingOptions(t: Translate): SelectOption[] {
   const options: SelectOption[] = [];
   for (const backend of BACKENDS) {
@@ -199,7 +205,38 @@ function embeddingOptions(t: Translate): SelectOption[] {
       }
     }
   }
+  // 远程组（0.3.0 新增的 qwen 三枚）：与本地组并列渲染，组标题自带「内容出本机」的
+  // 前提说明——能不能真正选中由 host 侧部署配置（allowRemoteEmbedding）把守，卡片不复制
+  // 那道判据，只把后果讲清楚。
+  for (const entry of REMOTE_EMBEDDING_CATALOG) {
+    options.push({
+      value: entry.reference,
+      label: modelOptionText(t, entry.reference, entry.dimension),
+      group: t("backendRemote"),
+    });
+  }
   return options;
+}
+
+/** 传输三档的闭集（与 host 侧 readTransport 同域；label 取 UI 字典）。 */
+const TRANSPORT_OPTIONS: readonly { readonly value: "auto" | "cli" | "mcp" }[] = [
+  { value: "auto" },
+  { value: "cli" },
+  { value: "mcp" },
+];
+
+const TRANSPORT_LABEL_KEY: Record<"auto" | "cli" | "mcp", keyof UiMessages> = {
+  auto: "transportAuto",
+  cli: "transportCli",
+  mcp: "transportMcp",
+};
+
+/** 传输三档的 SelectField 候选。 */
+function transportOptions(t: Translate): SelectOption[] {
+  return TRANSPORT_OPTIONS.map((entry) => ({
+    value: entry.value,
+    label: t(TRANSPORT_LABEL_KEY[entry.value]),
+  }));
 }
 
 /** 数字草稿串 → 控件值：区间由 zod schema 判定；空串是「清空 = 恢复默认」，不是 0。 */
@@ -279,7 +316,7 @@ function buildRebuildField(deps: CardDeps): ReactNode {
 }
 
 /**
- * 守护进程（`zg server`）就绪态一行，取自 rebuild-roots 引导端点。
+ * 守护进程（`zg --server`）就绪态一行，取自 rebuild-roots 引导端点。
  *
  * 为什么值得单独占一行：daemon 缺席时检索按直连模式逐次冷加载 embedding 模型，而
  * `refresh=background`、索引增量刷新与常驻模型池都不存在——本包因此在命令构造期就拒
@@ -311,9 +348,20 @@ function buildRebuildStatusRow(deps: CardDeps): ReactNode | null {
   return createElement("div", { className: displayClass }, displayText);
 }
 
-/** 网络与索引小节：镜像地址、search-first 开关、配额与时效、工作区重建与守护进程状态。 */
+/** 网络与索引小节：传输三档、镜像地址、search-first 开关、配额与时效、工作区重建与守护进程状态。 */
 function buildIndexSection(deps: CardDeps): ReactNode {
   const { editable, fields, setField, t } = deps;
+  const transport = createElement(SelectField, {
+    label: t("transportLabel"),
+    ...splitHint(t("transportHint")),
+    field: "transport",
+    value: fields.transport,
+    options: transportOptions(t),
+    disabled: !editable,
+    onChange: (next: string): void => {
+      setField("transport", next);
+    },
+  });
   const endpoint = createElement(TextField, {
     label: t("endpointLabel"),
     ...splitHint(t("endpointHint")),
@@ -369,6 +417,7 @@ function buildIndexSection(deps: CardDeps): ReactNode {
   return createElement(
     Section,
     { title: t("indexSection") },
+    transport,
     endpoint,
     enforce,
     budget,
@@ -418,6 +467,8 @@ function pushFieldWrite(
     ops.push(set("grepBudgetPerSearch", draft));
   } else if (key === "unlockWindowMin") {
     ops.push(set("unlockWindowMin", draft));
+  } else if (key === "transport") {
+    ops.push(set("transport", draft));
   }
 }
 
@@ -432,7 +483,7 @@ function requireReader(reader: RebuildReader | undefined, t: Translate): Rebuild
 interface RebuildAccess {
   roots: string[];
   /**
-   * 守护进程就绪态。`undefined` = 引导读面读不出这一位，那一档在卡上**不显示**，
+   * 守护进程就绪态。`undefined` = 引导读取接口读不出这一位，那一档在卡上**不显示**，
    * 而不是说成「未就绪」——把「不知道」讲成「没有」正是本包一直在避免的那类谎称。
    */
   serverReady: boolean | undefined;
@@ -444,7 +495,7 @@ const NO_ACCESS: RebuildAccess = { roots: [], serverReady: undefined };
 interface RebuildView {
   root: string;
   roots: string[];
-  /** 守护进程就绪态（undefined = 读面没交出这一档，见 RebuildAccess.serverReady）。 */
+  /** 守护进程就绪态（undefined = 读取接口没交出这一档，见 RebuildAccess.serverReady）。 */
   serverReady: boolean | undefined;
   state: RebuildState;
   setRoot: (value: string) => void;
@@ -456,7 +507,7 @@ interface RebuildView {
  * 「工作区重建」状态机：取白名单 → 起一条重建 → 2s 轮询到终态。
  * 从 ZgCard 拆出，保持组件体在一屏内可读。
  * @param t - 取文案（官方 locale 的 translator，随卡片一起下发）。
- * @param reader - 宿主重建读面；`undefined` = 当前部署没有远程面（点重建时报错）。
+ * @param reader - 宿主重建读取接口；`undefined` = 当前部署没有远程通道（点重建时报错）。
  */
 function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildView {
   const [root, setRoot] = useState("");
@@ -467,7 +518,7 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
   // 会同时在飞、按完成先后乱序 setRebuild——后回来的旧结果把 phase 覆写回 running，
   // 已经到终态的面板于是永远不会停。卸载后也要拒绝再写 state。
   const pollingRef = useRef(false);
-  // 当前轮询的作业代次：只有这一代 jobId 的应答能写面板。原实现 stopPolling 只清 interval，
+  // 当前轮询的作业代次：只有这一代 jobId 的应答能写入板。原实现 stopPolling 只清 interval，
   // 既不取消在飞请求、也不认作业归属——上一轮的 status 迟到回来时：phase 仍是 running 就与
   // 新一轮竞写（旧输出覆掉新进度）；phase 到了终态就 stopPolling，把**新一轮**的 interval
   // 掐断，面板永久卡在 running。start() 先作废旧代次，pollStatus 回来再对一次。
@@ -535,7 +586,7 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
     try {
       const body = await requireReader(reader, t).status(jobId);
       // await 期间可能已经换了代（用户又点了一次重建）或卸载：这一发是旧作业的答案，
-      // 既不许写面板，也不许 stopPolling——那会掐断新一轮自己的 interval。
+      // 既不许写入板，也不许 stopPolling——那会掐断新一轮自己的 interval。
       if (!isMounted() || jobRef.current !== jobId) {
         return;
       }
@@ -572,7 +623,13 @@ function useRebuild(t: Translate, reader: RebuildReader | undefined): RebuildVie
 
   async function start(): Promise<void> {
     const trimmedRoot = root.trim();
-    if (!trimmedRoot.startsWith("/")) {
+    // 卡片只做「像不像绝对路径」的前置提示；真正的根判据在宿主（按平台）。POSIX `/…`、
+    // win32 盘符 `C:\…`/`C:/…` 与 UNC `\\server\share` 三种都放行到宿主再判。
+    const absolute =
+      trimmedRoot.startsWith("/") ||
+      WIN32_ABSOLUTE_ROOT.test(trimmedRoot) ||
+      trimmedRoot.startsWith(BACKSLASH + BACKSLASH);
+    if (!absolute) {
       setRebuild({ phase: "error", output: t("rebuildRootNotAbsolute") });
       return;
     }
@@ -612,7 +669,7 @@ function ZgCard(props: CardSlotProps): ReactNode {
   const [saveError, setSaveError] = useState<string | null>(null);
   const rebuildView = useRebuild(t, props.rebuildRemote);
 
-  // 六个字段一律走草稿层（lib/card-logic.draftFields）：任何字段绑回已提交快照，
+  // 七个字段一律走草稿层（lib/card-logic.draftFields）：任何字段绑回已提交快照，
   // 该字段的受控输入就会吞键击（select 弹回旧值、input 改不动），而旁边的字段却
   // 能改——同一张卡两种行为，用户只能理解为「这个设置改了没用」。
   const fields = draftFields(touched, value);
@@ -642,7 +699,7 @@ function ZgCard(props: CardSlotProps): ReactNode {
     }
     try {
       const results = await Promise.all(ops);
-      // 受理位消费：任一字段 false（宿主拒绝/写入被跳过）→ saveRejected 且**整批保留
+      // 受理结果消费：任一字段 false（宿主拒绝/写入被跳过）→ saveRejected 且**整批保留
       // touched**（fail-closed：不区分"哪些成了"，宁可让用户重按一次保存，也不静默丢
       // 修改）；传输失败 rejection → saveFailed（带原因）。
       if (results.some((accepted) => !accepted)) {
@@ -707,29 +764,29 @@ export interface ClientCtx {
    * `interface Context extends Pick<Fiber, 'effect'>`，同文件 :157/:159 两个重载）。
    * 原先这里抄的是 `(factory: () => (() => void) | undefined, label?: string) => void`：
    * 官方的工厂只收 `SyncEffect` / `Effect`（同文件 :49-51），两者都**不含** `undefined`
-   * （:152 还明写 `execute` 返回非法形状时抛 `TypeError`），返回面更是可 await 的
+   * （:152 还明写 `execute` 返回非法形状时抛 `TypeError`），返回类型更是可 await 的
    * disposer（`Disposable<Promise<void>>` / `AsyncDisposable<Promise<void>>`）而不是
    * `void`——那一份抄写把 cordis 的入参与返回都挡在了编译期之外。
    */
   effect: Context["effect"];
   /**
    * 显式读一个**可选**客户端服务（`ctx.get`，不受 cordis 的 inject 门禁约束）。本卡只用它
-   * 取远程面：没装远程面的部署里卡片仍要照常渲染，把 `remote` 写进 inject 会让整条入口
+   * 取远程通道：没装远程通道的部署里卡片仍要照常渲染，把 `remote` 写进 inject 会让整条入口
    * 不激活（见 src/rebuild-reader.ts 的文件头）。
    */
   get?: (name: string, strict?: boolean) => unknown;
   /**
    * 官方 `SlotRegistry`（renderer 把它增强进 cordis `Context`，installed
-   * `dsh-client-ui-renderer/lib/types/client/index.d.ts`）的**方法面投影**。取 `Pick`
+   * `dsh-client-ui-renderer/lib/types/client/index.d.ts`）的**方法子集投影**。取 `Pick`
    * 而不是 `Context["slots"]` 整类型：`SlotRegistry` 是带 private 字段的 cordis
    * `Service` 类（同目录 `registry.d.ts` 的 `private readonly _core` 等），TS 对它
-   * 做名义比较，测试桩件无法满足。`register` 逐字复用 `SlotCore['register']`（同文件 :85
+   * 做名义比较，测试替身无法满足。`register` 逐字复用 `SlotCore['register']`（同文件 :85
    * `readonly register: SlotCore['register']`，两个重载），`inject` 是「按槽位声明生命
    * 周期装 effect」那一位（disposer 随 collapse 重跑工厂的语义就写在它的 doc 里）。
    * 合并进 `SlotMap` 的槽位键在这里是**编译期受检**的：`inject` 的 key 参数域就是
    * `keyof SlotMap & string`，`KindOptions`（`@deepseek-ai/dsh-client-ui-slots` 的
    * index.d.ts）再按 `SlotMap[K]['kind']` 分发——`plugins.bundle.config` 是
-   * keyed 槽 → 注册项的 `key` **必填**（原来手抄的 `{ name: string; key?: string }`
+   * keyed 槽 → 注册项的 `key` **必填**（原来照抄的 `{ name: string; key?: string }`
    * 允许漏 key，而漏 key 的注册在宿主里根本匹配不上）。
    * ⚠ 本包不 merge 任何槽位：`plugins.bundle.config` 这条 key 由**属主包**
    * plugin-manager 交出（installed `dsh-client-ui-plugin-manager/lib/types/client/
@@ -754,8 +811,8 @@ export interface ClientCtx {
    * 「letting a shared form write through the caller's context would make every caller
    * declare `remote.settings`」，故此处不必声明）。
    *
-   * ⚠ 只用 `get` 这一位，故按方法面投影——官方 `ConfigForms` 是带 private 字段的
-   * Service 类，TS 对其做名义比较，测试桩件无法满足，**不得**写成 `ConfigForms`。
+   * ⚠ 只用 `get` 这一位，故按方法子集投影——官方 `ConfigForms` 是带 private 字段的
+   * Service 类，TS 对其做名义比较，测试替身无法满足，**不得**写成 `ConfigForms`。
    * 返回类型 `SettingScope` 现在是官方 `ConfigForm<Record<string, unknown>>` 的别名
    * （见 lib/card-logic.ts），快照字段一名一改这里就会编译失败。
    */
@@ -808,7 +865,7 @@ function apply(ctx: ClientCtx): void {
   }, "zvec-grep-card: styles");
   // 本条目的共享表单：条目 id == cordis.patch.yml 里的裸 id `zvec-grep`（0.1.7 起
   // settings 命名空间即条目 id，不再有独立的 register 命名空间），与 host 半隐式注册的
-  // 命名空间同源，故直接复用 NS。表单生命周期归 provider（消费者面上没有 dispose）。
+  // 命名空间同源，故直接复用 NS。表单生命周期归 provider（消费者这边没有 dispose）。
   const scope = ctx.configForms.get(NS);
   const store = cardStore(scope);
   // 卡片文案交给官方 locale：把本包两语字典**一次性**交给类型化那条 register 重载
@@ -817,12 +874,15 @@ function apply(ctx: ClientCtx): void {
   // 函数交给卡片。语言切换由宿主驱动 slot 重渲染，无需重载页面。
   ctx.effect(() => ctx.locale.register(NS, UI_MESSAGES), "zvec-grep-card: locale dictionaries");
   const t = ctx.locale.bind(NS);
-  // 远程读面的读取器在 apply 期造一次；remote 服务与 $mount 都由读取器在调用时现取
-  // （apply 期它们可能还没注册，见 src/rebuild-reader.ts）。
-  const rebuildRemote = createRebuildReader(ctx);
-  // 写通道受理位**原样透传**给卡片（消费在 save()：false → saveRejected 且整批保留
+  // 远程读取接口的读取器在 apply 期造一次；remote 服务与 $mount 都由读取器在调用时现取
+  // （apply 期它们可能还没注册，见 src/rebuild-reader.ts）。错误文案按当前 locale 现取。
+  const rebuildRemote = createRebuildReader(ctx, {
+    remoteMissing: () => t("rebuildRemoteMissing"),
+    namespaceMissing: (serviceKey: string) => t("rebuildNamespaceMissing", { serviceKey }),
+  });
+  // 写通道受理结果**原样透传**给卡片（消费在 save()：false → saveRejected 且整批保留
   // touched；这里只补字段级 console.error 供排查，rejection 照旧上抛给 save 的
-  // Promise.all 收口成 saveFailed 文案）。
+  // Promise.all 统一处理成 saveFailed 文案）。
   const writeField = async (field: string, valueDraft: unknown): Promise<boolean> => {
     try {
       return await scope.set(field, valueDraft);
@@ -866,7 +926,7 @@ function apply(ctx: ClientCtx): void {
       },
       ZgCard,
     );
-    // 只注销这一次声明：slots.inject 的回调在槽「折叠 → 再声明」时会再次运行（installed
+    // 只注销这一次声明：slots.inject 的回调在槽位声明被收回、再次声明时会再次运行（installed
     // dsh-client-ui-renderer/lib/types/client/registry.d.ts "Collapse disposes the
     // effect and a later declaration runs it again"），而 scope/store 是每次 apply 只建
     // 一次的共享物。0.1.7 里也无从 dispose：`configForms.get()` 交回的是 provider 持有
@@ -874,7 +934,7 @@ function apply(ctx: ClientCtx): void {
     // provider"），`ConfigForm` 接口（config-form-types.d.ts）没有 dispose，销毁
     // 由 provider 在自己的 teardown 统一做（installed dsh-client-ui-settings 里的
     // `Promise.all([...this.forms.values()].map((form) => form.dispose()))`）。表单共享且长活，所以工厂重跑后
-    // 写入依然落盘；旧 `settingsScope` 那种「离开插件页一次之后 scope 永久 disposed、
+    // 写入依然写到磁盘；旧 `settingsScope` 那种「离开插件页一次之后 scope 永久 disposed、
     // 保存看起来成功却一条都没写进去」的坑（0.1.6 的 fiber 级 dispose + enqueue 对
     // disposed 直接 resolve）随该服务一起消失。
     return unregister;

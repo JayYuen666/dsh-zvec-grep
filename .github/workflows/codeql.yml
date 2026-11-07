@@ -52,7 +52,7 @@ jobs:
           # 后续步骤会跑仓库自己的 install/构建/测试脚本，也就跑得到依赖里的脚本。
           persist-credentials: false
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
       - name: Perform CodeQL Analysis
@@ -62,6 +62,6 @@ jobs:
         # 所以只对 fork PR 容错，同仓 PR / push / schedule 的分析失败仍判红。
         # 反过来整条 job 跳过不可取：被跳过的必检在分支保护里记作通过，等于「未扫描即绿」。
         continue-on-error: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
-        uses: github/codeql-action/analyze@1fc58d04a4d4374f921bdac573c3811c240f9c26 # v4.39.2
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}

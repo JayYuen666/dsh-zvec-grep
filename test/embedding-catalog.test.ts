@@ -1,5 +1,5 @@
 // lib/embedding-catalog.ts 单元测试：清单完整性 + 默认值 + 引用查找判据。
-// 清单只有数据（引用/后端/维度）；候选的体积与语言口径是选型说明，留在
+// 清单只有数据（引用/后端/维度）；候选的体积与语言规则是选型说明，留在
 // lib/embedding-catalog.ts 的注释里——卡片 <select> 只渲染「引用（N维）」，
 // 没有第二处需要翻译的地方，故这里不再对一张文案表配对。
 import { describe, it } from "vitest";
@@ -85,7 +85,7 @@ describe("isLocalEmbedding", () => {
 
   it("匹配语义：输入先 trim 再精确比对（大小写敏感、不做前缀匹配）", () => {
     const base = POTION_CODE;
-    // 实现是 `reference.trim()` 后 ===：尾随空格命中是**设计内的宽容**（手抄引用常见），
+    // 实现是 `reference.trim()` 后 ===：尾随空格命中是**设计内的宽容**（照抄引用常见），
     // 这里钉住的是这个语义而不是想象中的严格 ===；大小写与前缀仍须不命中。
     assert.equal(isLocalEmbedding(`${base} `), true, "尾随空格被 trim 后命中");
     assert.equal(isLocalEmbedding(base.toUpperCase()), false, "大小写变形不命中");

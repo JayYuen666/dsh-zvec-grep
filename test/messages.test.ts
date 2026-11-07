@@ -9,7 +9,7 @@ import { MESSAGES, fill } from "../lib/messages.ts";
 import type { ZvecGrepMessages } from "../lib/messages.ts";
 import { CJK_RESIDUE } from "./cjk-residue.ts";
 
-/** 模板里的 {占位符} 名字集合：只认花括号包住的词（英文整条文案里的裸词不是占位符）。 */
+/** 模板里的 {占位符} 名字集合：只认花括号包住的词（英文整条文案里不带花括号的词不算占位符）。 */
 function placeholders(template: string): Set<string> {
   return new Set(Array.from(template.matchAll(/(?<=\{)\w+(?=\})/gu), (found) => found[0]));
 }
@@ -67,7 +67,7 @@ describe("两语字典同源", () => {
       assert.ok(MESSAGES.zh[key].length > 0, `zh.${key} 为空`);
       assert.ok(MESSAGES.en[key].length > 0, `en.${key} 为空`);
     }
-    // 全量遍历而不是抽查两条：en 侧现量 138 条，混进中文（多半是从 zh 复制后没翻完）的
+    // 全量遍历而不是抽查两条：en 侧当场实测 138 条，混进中文（多半是从 zh 复制后没翻完）的
     // 那一条只有在这里被点名才会被拦住；抽查写法等于让其余条目无人看守。
     for (const key of KEYS) {
       assert.doesNotMatch(MESSAGES.en[key], CJK_RESIDUE, `en.${key} 残留中文`);
@@ -77,7 +77,7 @@ describe("两语字典同源", () => {
   it("每条模板按自己的占位符名喂 fill：替换都落到位，不留花括号", () => {
     // 全字典遍历而不是只盯 gateReason。这里**不按「有没有认出占位符」过滤条目**：
     // 写坏的占位符（`{stat e}` 这种带空格的）正是 placeholders() 认不出来的那些，
-    // 一过滤就等于放过它 —— 所以对每条都断「填完之后文本里不该再有裸花括号」。
+    // 一过滤就等于放过它 —— 所以对每条都断「填完之后文本里不该再有没替换的花括号」。
     // 这一条证的是**字典侧**的替换；调用方传的键名对不对，字典自己看不见 ——
     // 那一条由下面用字面实参钉住的 gateReason 用例覆盖（它是真调用点的那一组名字）。
     for (const key of KEYS) {
@@ -97,7 +97,7 @@ describe("两语字典同源", () => {
   });
 
   it("带变量的模板都真用了 fill（占位符名与实参同名）", () => {
-    // 断言面：工具描述与门禁正文各自的关键片段在两份字典里都在位。
+    // 断言内容：工具描述与门禁正文各自的关键片段在两份字典里都在位。
     assert.match(MESSAGES.zh.gateReason, /grep\/rg/u);
     assert.match(MESSAGES.en.gateReason, /grep\/rg/u);
     assert.equal(
@@ -128,7 +128,7 @@ describe("root 参数描述与实际放行范围一致", () => {
 
   it("三条放行路径在两语文案里都点名了", () => {
     // 按语言各判各的短语：交替正则（/本会话已登记|already registered/）会让 en 文案里混进
-    // 中文短语也通过，与上面那条「en 不残留中文」的全量遍历口径不一致。
+    // 中文短语也通过，与上面那条「en 不残留中文」的全量遍历规则不一致。
     // 三条路径都点：少断一条，模型就会以为某条合法路径被拒而绕路（用例名承诺的是三条）。
     const zh = MESSAGES.zh.rootSearchDescription;
     assert.match(zh, /会话工作区本身/u, "zh 缺「会话工作区本身」这条");
@@ -141,25 +141,68 @@ describe("root 参数描述与实际放行范围一致", () => {
   });
 });
 
-describe("hitCapped 只陈述计数，不推断是否还有更多", () => {
-  // zg 的 indexed 通道不输出任何截断标记（agentContextLines 对命中列表不打标），
-  // 「某组 count === limit」只说明这一组取满了，不能据此宣称还有未显示的命中。
-  it("zh / en 都不出现「可能还有 / more may exist」这类推断措辞", () => {
+describe("zg 命令形态（0.3.0：管理动作一律 `--<命令>`）", () => {
+  it("守护进程提示两语都指向 `zg --server on`，不用已删除的裸子命令形态", () => {
+    for (const [lang, dict] of Object.entries(MESSAGES)) {
+      for (const key of ["refreshBackgroundNeedsServer", "serverUnavailableNote"] as const) {
+        assert.match(dict[key], /`zg --server on`/u, `${lang}.${key}`);
+        assert.doesNotMatch(dict[key], /`zg server /u, `${lang}.${key}`);
+      }
+    }
+  });
+
+  it("token 失忆的恢复指引两语都可执行：--server status 取 PID、终止进程、off 需同一 token", () => {
+    for (const [lang, dict] of Object.entries(MESSAGES)) {
+      const text = dict.daemonStartFailed;
+      assert.match(text, /`zg --server status`/u, lang);
+      assert.match(text, /kill <pid>/u, lang);
+      assert.match(text, /`zg --server off`/u, lang);
+      assert.match(text, /token|令牌/u, lang);
+      assert.doesNotMatch(text, /`zg server /u, lang);
+    }
+  });
+
+  it("所有文案都不再出现反引号包裹的旧管理子命令形态", () => {
+    // 0.3.0 把 index/status/query/server 全部改成 --<命令>；旧形态会被当成搜索文本执行。
+    const legacy = /`zg (?:server|query|index|status|auth)\b/u;
+    for (const [lang, dict] of Object.entries(MESSAGES)) {
+      for (const [key, value] of Object.entries(dict)) {
+        if (typeof value === "string") {
+          assert.doesNotMatch(value, legacy, `${lang}.${key}`);
+        }
+      }
+    }
+  });
+});
+
+describe("hitSummary（0.3.0：组计数维度已消失，只剩去重位置）", () => {
+  // 0.3.0 的输出没有每组的 hits: N 计数行，hitSummary 只剩「去重后位置数」一个维度；
+  // hitDedup / hitCapped 两个键随之消失——键集变化本身也要钉住，防止有人把旧键加回来。
+  it("hitDedup / hitCapped 键已删除（两语字典都不再有它们）", () => {
     for (const name of ["zh", "en"] as const) {
-      // 两个措辞对两种语言都查（zh 里混进英文推断句、en 里混进中文推断句都算回归），
-      // 提示里的语言名跟着循环变量走 —— 硬编码成「zh 仍含…」会在 en 命中时指错方向。
-      assert.doesNotMatch(MESSAGES[name].hitCapped, /可能还有/u, `${name} 仍含「可能还有」`);
+      const catalog = MESSAGES[name] as Record<string, unknown>;
+      assert.equal("hitDedup" in catalog, false, `${name} 不该再有 hitDedup`);
+      assert.equal("hitCapped" in catalog, false, `${name} 不该再有 hitCapped`);
+    }
+  });
+
+  it("hitSummary 两语都保留 --limit 引用，且不出现推断措辞", () => {
+    for (const name of ["zh", "en"] as const) {
+      assert.match(MESSAGES[name].hitSummary, /--limit/u, `${name} 没提 --limit`);
+      assert.doesNotMatch(MESSAGES[name].hitSummary, /可能还有/u, `${name} 仍含「可能还有」`);
       assert.doesNotMatch(
-        MESSAGES[name].hitCapped,
+        MESSAGES[name].hitSummary,
         /more may exist/iu,
         `${name} 仍含 "more may exist"`,
       );
     }
   });
 
-  it("两语都保留了「该组正好等于 --limit」这个纯观察", () => {
+  it("hitSummary 占位符与 host.ts 的 fill 调用一致（unique/limit/truncated）", () => {
     for (const name of ["zh", "en"] as const) {
-      assert.match(MESSAGES[name].hitCapped, /--limit/u, `${name} 没提 --limit`);
+      assert.match(MESSAGES[name].hitSummary, /\{unique\}/u, `${name} 缺 {unique}`);
+      assert.match(MESSAGES[name].hitSummary, /\{limit\}/u, `${name} 缺 {limit}`);
+      assert.match(MESSAGES[name].hitSummary, /\{truncated\}/u, `${name} 缺 {truncated}`);
     }
   });
 });

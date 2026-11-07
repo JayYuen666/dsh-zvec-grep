@@ -179,14 +179,14 @@ describe("isGrepRgCommand", () => {
     assert.equal(isGrepRgCommand('rg "foo|bar" && done'), true);
   });
 
-  it("管道下游带重定向：I/O 落点不是路径操作数，仍按流过滤判（hasPathOperand 的 redirect 分支）", () => {
-    // 回归用例：`grep foo > /tmp/out` 里那个绝对路径是输出落点，不是被检索的目录。
+  it("管道下游带重定向：I/O 位置不是路径操作数，仍按流过滤判（hasPathOperand 的 redirect 分支）", () => {
+    // 回归用例：`grep foo > /tmp/out` 里那个绝对路径是输出重定向的写入位置，不是被检索的目录。
     // 它若被当成路径操作数，纯流过滤就会被误判成「检索」而拦下。
     assert.equal(isGrepRgCommand("cat a | grep foo > /tmp/out"), false);
     assert.equal(isGrepRgCommand("cat a | grep foo src/ > /tmp/out"), true);
   });
 
-  it("包装命令自己的选项、取值、裸数值与壳层赋值都不断开命令位链", () => {
+  it("包装命令自己的选项、取值、纯数字参数与壳层赋值都不断开命令位链", () => {
     // 这一组是漏判方向的历史缺口：只认「包装命令紧邻的下一个 token」时，
     // 下面每一条里的 grep/rg 都不在命令位上，整条命令被读成「不是检索」而放行。
     assert.equal(isGrepRgCommand("git --no-pager grep foo"), true);
@@ -396,7 +396,7 @@ describe("hasExternalTarget", () => {
     assert.equal(hasExternalTarget(root, "grep -f /tmp/patterns /tmp/data", zhMessages), true);
   });
 
-  it("重定向目标是 I/O 落点，不是检索操作数", () => {
+  it("重定向目标是 I/O 位置，不是检索操作数", () => {
     assert.equal(hasExternalTarget(root, "grep foo src >/tmp/out", zhMessages), false);
     assert.equal(hasExternalTarget(root, "rg foo < /tmp/in", zhMessages), false);
     assert.equal(hasExternalTarget(root, "grep foo src 2>/tmp/err", zhMessages), false);
@@ -416,7 +416,7 @@ describe("hasExternalTarget", () => {
 const probeOf = (dirs: Set<string>) => (dir: string) => dirs.has(dir);
 
 describe("findIndexRoot", () => {
-  it("索引目录名与 manifest 文件名常量都与 zg 落盘一致", () => {
+  it("索引目录名与 manifest 文件名常量都与 zg 写到磁盘一致", () => {
     assert.equal(INDEX_DIR_NAME, EXPECTED_INDEX_DIR);
     assert.equal(WORKSPACE_MANIFEST_FILE, EXPECTED_MANIFEST_FILE);
   });
@@ -867,9 +867,9 @@ describe("searchFirstGuard", () => {
     );
   });
 
-  it("会话开在索引根子目录时，原生 grep 面的界内/界外也按索引根判（与 shell 面统一）", () => {
+  it("会话开在索引根子目录时，原生 grep 工具的界内/界外也按索引根判（与 shell 工具统一）", () => {
     // 旧实现按会话 cwd 判：/repo/packages/other 与 ../other 相对 cwd 出界被放行，
-    // 同样的目标走 shell 面却会被拦——工具面就成了绕过门禁的旁门。
+    // 同样的目标走 shell 工具却会被拦——工具这一层就成了绕过门禁的旁门。
     const { deps } = makeDeps();
     for (const path of ["/repo/packages/other", "../other"]) {
       const reason = searchFirstGuard(
@@ -957,7 +957,7 @@ function table(
   };
 }
 
-/** 造一个执行面：会话 id + 可选的父会话 id（子代理挂在谁下面）。 */
+/** 造一个执行上下文：会话 id + 可选的父会话 id（子代理挂在谁下面）。 */
 function at(id: string, parent?: string): GuardExecution {
   return {
     agent: { session: { id, header: parent === undefined ? {} : { parentSession: parent } } },
@@ -989,7 +989,7 @@ describe("rootSessionKeyOf（子代理与主代理共享一份配额）", () => 
     );
   });
 
-  it("缺席会话查询面：停在已知的最后一跳，不猜", () => {
+  it("缺席会话查询接口：停在已知的最后一跳，不猜", () => {
     assert.equal(rootSessionKeyOf(at("child", "mid"), undefined), "mid");
   });
 
@@ -1044,7 +1044,7 @@ describe("rootSessionKeyOf（子代理与主代理共享一份配额）", () => 
     );
   });
 
-  it("无会话身份：仍落共享桶（与旧口径同）", () => {
+  it("无会话身份：仍落共享桶（与旧规则同）", () => {
     assert.equal(rootSessionKeyOf(undefined, table({})), "__anonymous__");
     assert.equal(rootSessionKeyOf({ agent: { session: {} } }, table({})), "__anonymous__");
   });

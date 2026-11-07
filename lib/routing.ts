@@ -7,7 +7,7 @@
 // consumeGrep 由宿主注入（host.ts 用 existsSync + Date.now + 会话解锁表实现）。
 // 拒绝理由与规则段的文案双语：消息表（lib/messages.ts 的一份）由调用点注入，
 // 规则段本身即 messages.routingText（本文件不再有文案常量）。
-// 判据不住在本文件：命令文本面 / 目标路径面 / 解锁额度面三件纯判定住在
+// 判据不写在本文件里：命令文本这一层 / 目标路径这一层 / 解锁额度这一层三件纯判定定义在
 // lib/search-predicates.ts，本文件只做门禁的编排（向上找索引根、扣额度、拼拦截文案）。
 // 剩下的跨模块依赖只有 lib/cli.ts 的 assertAbsoluteRoot——guard 与 execute
 // 必须用同一套 root 判据，否则「guard 放行、execute 抛错」会把同一件事说两遍。
@@ -15,6 +15,7 @@
 import type { ToolExecution } from "@deepseek-ai/dsh-tools";
 import type { Context } from "@deepseek-ai/cordis";
 import { scopeOf } from "@deepseek-ai/dsh-scope";
+import path from "node:path";
 import { assertAbsoluteRoot, normalizeAbsolutePath } from "./cli.ts";
 import { fill } from "./messages.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
@@ -28,6 +29,8 @@ import {
 import type { SearchUnlock } from "./search-predicates.ts";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
+import { BACKSLASH } from "./platform.ts";
+import type { PathPlatform } from "./platform.ts";
 
 /** 紧跟 TOOL_GREP(1500) 之后、TOOL_JOBS(1600) 之前。 */
 export const ROUTING_ORDER = 1550;
@@ -64,7 +67,7 @@ export function isZgToolName(name: unknown): name is ZgToolName {
   return typeof name === "string" && ZG_TOOL_NAMES.has(name);
 }
 
-// ── 官方 ToolExecution 的本包读取面 ────────────────────────────────────────
+// ── 官方 ToolExecution 的本包读取的部分 ────────────────────────────────────────
 //
 // 键与值都经**索引访问**从官方声明链上取（agent → session → header → cwd，以及 name /
 // arguments）：链上任一环改名或换形状，这里立即编译失败，而不是运行时静默读到 undefined。
@@ -73,11 +76,11 @@ export function isZgToolName(name: unknown): name is ZgToolName {
 //      / `private surfaceManager` → TS 对带 private 成员的类按名义比较），结构替身造不出
 //      真 Session；本包单测与宿主注入都只能按成员读，故这一位必须是结构投影。
 //   2. 「必选 → 可选」这一层放宽是**运行时容错**，不是类型疏漏：`arguments` 官方本就是
-//      `unknown`（模型产出的 JSON），`session.id` 的品牌串只是编译期标记
+//      `unknown`（模型产出的 JSON），`session.id` 的类型品牌只是编译期标记
 //      （`string & { [BRAND] }`，宿主从磁盘 header 复原的值不经校验），而无 agent 的执行体
 //      （`agent?: Agent`）确实存在。放宽的部分由读点补偿：sessionHeaderCwd / sessionKeyOf
 //      先 `const x: unknown = …` 再 typeof 收窄（与 shared/lib/tool-events.ts 的 usableCallId
-//      同一口径），不用类型去说服运行时。
+//      同一种做法），不用类型去说服运行时。
 
 /** 官方 `ToolExecution.agent` 去掉可选后的 Agent（经 ToolExecution 取：本包未声明 dsh-agent 依赖）。 */
 export type OfficialAgent = NonNullable<ToolExecution["agent"]>;
@@ -85,12 +88,12 @@ export type OfficialAgent = NonNullable<ToolExecution["agent"]>;
 /** 官方 `Agent.session`（dsh-session 的 Session 类）——只取其成员类型，不做名义赋值。 */
 export type OfficialSession = OfficialAgent["session"];
 
-/** 会话面上本包真正读到的两位。值域比官方宽的地方都是**运行时容错**（见上），不是疏漏。 */
+/** 会话类型上本包真正读到的两位。值域比官方宽的地方都是**运行时容错**（见上），不是疏漏。 */
 export type SessionFace = {
-  /** 官方 `Session.id`（类型 `SessionId` = 编译期品牌串）。这里只借它的**键名**：品牌函数
-   *  `SessionId(x)` 不改值，宿主从磁盘 header 复原出来的 id 不经任何校验，而本包的会话分片
-   *  键对非字符串 id 有显式兜底（sessionKeyOf；test/routing.test.ts 钉着 `id: 42` 与 NaN）。
-   *  官方把它改名/删掉时，下面那行 `Pick` 就是编译错误。 */
+  /** 官方 `Session.id`（类型 `SessionId` = 编译期 `brand` 标记的 string）。这里只借它的**键名**：
+   *  把 string 变成 `SessionId` 的 `SessionId(x)` 不改值，宿主从磁盘 header 复原出来的 id
+   *  不经任何校验，而本包的会话分片键对非字符串 id 有显式兜底（sessionKeyOf；
+   *  test/routing.test.ts 钉着 `id: 42` 与 NaN）。官方把它改名/删掉时，下面那行 `Pick` 就是编译错误。 */
   readonly [Key in keyof Pick<OfficialSession, "id">]?: unknown;
 } & {
   /** 官方 `Session.header: SessionHeader`（必选；无 store 底座时宿主也合成一份），其
@@ -101,16 +104,16 @@ export type SessionFace = {
     /**
      * 官方 `SessionHeader.parentSession?`：「本会话从哪一个会话分叉而来」。子代理会话就是
      * 这样挂到主会话下面的，故它是「同一棵委派树」的权威依据。
-     * 与 `cwd` 同一口径按 `unknown` 读：宿主从磁盘 header 复原的值不经任何校验，形状未必
-     * 是那个品牌串；真要用时 `rootSessionKeyOf` 先 typeof 收窄，非字符串按「没有父」处理。
+     * 与 `cwd` 同一种做法按 `unknown` 读：宿主从磁盘 header 复原的值不经任何校验，未必真是
+     * 那个带 `brand` 标记的 string；真要用时 `rootSessionKeyOf` 先 typeof 收窄，非字符串按「没有父」处理。
      */
     readonly parentSession?: unknown;
   };
 };
 
 /**
- * tools.guard 谓词（以及工具体，见 host.ts 的 ToolExec）读到的一次执行面。
- * 加宽理由与出处见文件头的「读取面」注释。
+ * tools.guard 谓词（以及工具体，见 host.ts 的 ToolExec）读到的一次执行上下文。
+ * 加宽理由与出处见文件头讲读取范围的那段注释。
  */
 export interface GuardExecution {
   /** 官方 `ToolExecution.name`（必选 string）；可缺 = 替身/未构造完整的执行体。 */
@@ -155,10 +158,11 @@ function rootProblem(
   name: ZgToolName,
   root: unknown,
   messages: ZvecGrepMessages,
+  platform: PathPlatform,
 ): string | undefined {
   let problem: string | undefined;
   try {
-    assertAbsoluteRoot(root, messages);
+    assertAbsoluteRoot(root, messages, platform);
   } catch (error) {
     problem = fill(messages.guardRootRejected, { name, reason: errorText(error) });
   }
@@ -171,6 +175,7 @@ function zgToolProblem(
   args: Record<string, unknown>,
   execution: GuardExecution,
   messages: ZvecGrepMessages,
+  platform: PathPlatform,
 ): string | undefined {
   const { root } = args;
   let problem: string | undefined;
@@ -183,7 +188,7 @@ function zgToolProblem(
         ? fill(messages.guardAbsoluteRootRequired, { name })
         : undefined;
   } else {
-    problem = rootProblem(name, root, messages);
+    problem = rootProblem(name, root, messages, platform);
   }
   return problem;
 }
@@ -198,19 +203,23 @@ function zgToolProblem(
  * @param messages - 拒绝理由的文案表（宿主按语言注入）。
  * @returns 拒绝理由；undefined = 放行。
  */
-export function zgGuard(execution: GuardExecution, messages: ZvecGrepMessages): string | undefined {
+export function zgGuard(
+  execution: GuardExecution,
+  messages: ZvecGrepMessages,
+  platform: PathPlatform = "posix",
+): string | undefined {
   const { name } = execution;
   const args = isRecord(execution.arguments) ? execution.arguments : {};
   let reason: string | undefined;
   if (isZgToolName(name)) {
-    reason = zgToolProblem(name, args, execution, messages);
+    reason = zgToolProblem(name, args, execution, messages, platform);
   }
   return reason;
 }
 
 // ── search-first 门禁：工作区已建 zg 索引时，grep/rg 前必须先成功 zg_search ──
 
-/** zg 索引库目录名（zg index 的落盘位置：<root>/.zvec-grep/）。 */
+/** zg 索引库目录名（`zg --index` 的写到磁盘位置：<root>/.zvec-grep/）。 */
 export const INDEX_DIR_NAME = ".zvec-grep";
 
 /**
@@ -221,6 +230,29 @@ export const INDEX_DIR_NAME = ".zvec-grep";
  * 于是一个从没建过索引、只是祖先目录撞名的普通工作区也会被当成「已建索引」。
  */
 export const WORKSPACE_MANIFEST_FILE = "manifest.json";
+
+/** win32 的完整限定路径（盘符绝对或 UNC）。 */
+const WIN32_ABSOLUTE_PATH = /^[A-Za-z]:[\\/]/u;
+
+/** 起点是否是本平台的绝对路径（相对路径无从向上找索引根）。 */
+function isAbsoluteStart(dir: string, platform: PathPlatform): boolean {
+  if (platform === "win32") {
+    return WIN32_ABSOLUTE_PATH.test(dir) || dir.startsWith(BACKSLASH + BACKSLASH);
+  }
+  return dir.startsWith("/");
+}
+
+/** 上一级目录：POSIX 到 `/` 停，win32 交给 path.win32.dirname（盘符/UNC 根自返）。 */
+function parentDirectory(dir: string, platform: PathPlatform): string {
+  if (platform === "win32") {
+    return path.win32.dirname(dir);
+  }
+  if (dir === "/") {
+    return "/";
+  }
+  const cut = dir.lastIndexOf("/");
+  return cut <= 0 ? "/" : dir.slice(0, cut);
+}
 
 /**
  * 从 startDir 向上找含 zg 索引库的最近祖先（含自身），返回该索引根。
@@ -233,20 +265,21 @@ export function findIndexRoot(
   startDir: string,
   probe: (dir: string) => boolean,
   maxDepth = 8,
+  platform: PathPlatform = "posix",
 ): string | undefined {
-  let dir = normalizeRoot(startDir);
   let found: string | undefined;
-  if (startDir.startsWith("/")) {
+  if (isAbsoluteStart(startDir, platform)) {
+    let dir = normalizeRoot(startDir, platform);
     for (let depth = 0; depth <= maxDepth; depth += 1) {
       if (probe(dir)) {
         found = dir;
         break;
       }
-      if (dir === "/") {
+      const parent = parentDirectory(dir, platform);
+      if (parent === dir) {
         break;
       }
-      const cut = dir.lastIndexOf("/");
-      dir = cut <= 0 ? "/" : dir.slice(0, cut);
+      dir = parent;
     }
   }
   return found;
@@ -257,8 +290,8 @@ export const SHARED_SESSION_KEY = "__anonymous__";
 
 /** 会话状态分片键：session.id（字符串/数字）→ 稳定键；无 id 归入共享桶。 */
 export function sessionKeyOf(execution: GuardExecution | undefined): string {
-  // 官方是 `Session.id: SessionId`（品牌串），值域按 unknown 读：品牌只是编译期标记，
-  // 数字 / NaN 这些非品牌形状仍归共享桶而不是抛错（见 SessionFace 的容错说明）。
+  // 官方是 `Session.id: SessionId`（带 `brand` 标记的 string），值域按 unknown 读：`brand`
+  // 只是编译期标记，数字 / NaN 这些非字符串形状仍归共享桶而不是抛错（见 SessionFace 的容错说明）。
   const id: unknown = execution?.agent?.session?.id;
   if (typeof id === "string" && id.length > 0) {
     return id;
@@ -308,10 +341,10 @@ export function rootSessionKeyOf(
   let cursor = parent;
   for (let hop = 0; hop < MAX_PARENT_WALK; hop += 1) {
     if (lookup === undefined) {
-      // 宿主没有会话查询面：无从再往上，退回已知的最后一跳。
+      // 宿主没有会话查询接口：无从再往上，退回已知的最后一跳。
       return cursor;
     }
-    // lookup 是宿主注入的会话存储读面，可能抛（存储读失败）。本函数承诺降级不抛错：
+    // lookup 是宿主注入的会话存储读取接口，可能抛（存储读失败）。本函数承诺降级不抛错：
     // 读不出父就停在已知的最后一跳，绝不让一次存储故障把整条门禁变成「所有检索都报错」。
     let parentView: { parentSession?: unknown } | undefined;
     try {
@@ -330,11 +363,16 @@ export function rootSessionKeyOf(
 }
 
 /** 内置默认阈值（可在设置里覆盖：grepBudgetPerSearch / unlockWindowMin）。
- *  值源在 lib/limits.ts（与宿主 schema、设置卡同源），这里只转出既有消费面。 */
+ *  值源在 lib/limits.ts（与宿主 schema、设置卡同源），这里只转出既有的消费入口。 */
 export { DEFAULT_GREP_BUDGET, DEFAULT_UNLOCK_WINDOW_MIN } from "./limits.ts";
 
 export interface SearchFirstDeps {
   enabled: boolean;
+  /**
+   * 路径与命令方言：缺省 posix。宿主按 process.platform 传 win32 时，命令切词按 pwsh
+   * （反引号转义、反斜杠是路径分隔符），路径比较按盘符/UNC 与大小写不敏感。
+   */
+  platform?: PathPlatform;
   /**
    * 目录是否是一个**已建索引的索引根**（宿主注入 indexProbeOf）：判据是
    * `<dir>/.zvec-grep/manifest.json` 存在且 manifest 覆盖该 root。只判目录名会把
@@ -381,34 +419,45 @@ export interface SearchFirstDeps {
 // 只认明确的路径形状，`../` 形态的模式词可能被误判为外部目标而放行（漏拦，
 // 安全方向）；混合目标（如 `rg foo /repo/src /tmp/x`）整体放行。
 
-/** 门禁一次裁决的目标面：shell 面给命令串（文本面判），原生 grep 面给检索目标（路径面判）。 */
+/**门禁一次裁决的目标：shell 工具给命令串（按文本判），原生 grep 工具给检索目标（按路径判）。 */
 type SearchScope =
   | { readonly kind: "shell"; readonly command: string }
   | { readonly kind: "native"; readonly target: string | undefined };
 
 /**
- * 原生 grep 面的目标是否落在索引根之内。相对路径先按**会话工作区**解析成绝对路径，
+ * 原生 grep 工具的目标是否落在索引根之内。相对路径先按**会话工作区**解析成绝对路径，
  * 再按索引根判内外——按索引根直接拼相对段会把 `../other` 拼进索引根内部，方向判反。
  * `..` 越出文件系统根：目标必然不在索引根之内（判范围不判合法性，同 pathInsideRoot）。
  */
+/** 目标按 cwd 补成绝对路径：win32 的盘符/UNC 原样用，其余按 base 拼接。 */
+function absoluteTargetOf(cwd: string, target: string, platform: PathPlatform): string {
+  const base = normalizeRoot(cwd, platform);
+  if (platform === "win32") {
+    return WIN32_ABSOLUTE_PATH.test(target) || target.startsWith(BACKSLASH + BACKSLASH)
+      ? target
+      : `${base}\\${target}`;
+  }
+  return target.startsWith("/") ? target : `${base}/${target}`;
+}
+
 function nativeTargetInsideRoot(
   cwd: string,
   indexRoot: string,
   target: string | undefined,
   messages: ZvecGrepMessages,
+  platform: PathPlatform,
 ): boolean {
   if (target === undefined || target.trim().length === 0) {
     return true;
   }
   const text = target.trim();
-  const joined = text.startsWith("/") ? text : `${normalizeRoot(cwd)}/${text}`;
   let absolute: string;
   try {
-    absolute = normalizeAbsolutePath(joined, messages);
+    absolute = normalizeAbsolutePath(absoluteTargetOf(cwd, text, platform), messages, platform);
   } catch {
     return false;
   }
-  return pathInsideRoot(absolute, indexRoot, messages);
+  return pathInsideRoot(absolute, indexRoot, messages, platform);
 }
 
 /** 索引根已定且这棵树的范围判定要走门禁时的那句拒绝理由；交回 undefined 即放行。 */
@@ -419,10 +468,11 @@ function gateReasonAt(
   deps: SearchFirstDeps,
   messages: ZvecGrepMessages,
 ): string | undefined {
+  const platform = deps.platform ?? "posix";
   const inScope =
     scope.kind === "shell"
-      ? !hasExternalTarget(indexRoot, scope.command, messages)
-      : nativeTargetInsideRoot(cwd, indexRoot, scope.target, messages);
+      ? !hasExternalTarget(indexRoot, scope.command, messages, platform)
+      : nativeTargetInsideRoot(cwd, indexRoot, scope.target, messages, platform);
   let reason: string | undefined;
   if (inScope) {
     // 重建占着这棵树的写锁，此刻语义检索读不到索引，所以直接放行；放行不消耗既有配额——
@@ -459,10 +509,10 @@ function gateReasonAt(
 /**
  * 索引根已定后的门禁裁决：无索引根 / 检索索引根之外 / 有可扣额度 → 放行
  * （undefined）；否则返回拦截文案。放行会触发 consumeGrep 副作用。
- * 两个拦截面的「之内/之外」都以**索引根**为准（不是会话工作区）：会话开在索引根的
- * 子目录时，`../sibling` 或 `/repo/other` 相对 cwd 出界、相对索引根却在界内——shell 面
- * 的 hasExternalTarget 本来就按索引根判，原生 grep 面若按 cwd 判，同样的目标会从
- * 工具面绕过门禁，两个面各说各话。
+ * 两道拦截的「之内/之外」都以**索引根**为准（不是会话工作区）：会话开在索引根的
+ * 子目录时，`../sibling` 或 `/repo/other` 相对 cwd 出界、相对索引根却在界内——shell 工具
+ * 的 hasExternalTarget 本来就按索引根判，原生 grep 工具若按 cwd 判，同样的目标会从
+ * 工具这一层绕过门禁，两边各说各话。
  */
 function buildSearchFirstReason(
   cwd: string,
@@ -470,12 +520,17 @@ function buildSearchFirstReason(
   deps: SearchFirstDeps,
   messages: ZvecGrepMessages,
 ): string | undefined {
-  const indexRoot = findIndexRoot(cwd, deps.indexProbe, deps.findIndexDepth);
+  const indexRoot = findIndexRoot(
+    cwd,
+    deps.indexProbe,
+    deps.findIndexDepth,
+    deps.platform ?? "posix",
+  );
   return indexRoot === undefined ? undefined : gateReasonAt(indexRoot, cwd, scope, deps, messages);
 }
 
 /**
- * shell 面（bash/pwsh）的一次检索裁决：命令串里真出现 grep/rg 才交给门禁，
+ * shell 工具（bash/pwsh）的一次检索裁决：命令串里真出现 grep/rg 才交给门禁，
  * 否则放行。`command` 非字符串（模型产出的是 unknown）按空串处理，与旧实现同形。
  */
 function shellSearchProblem(
@@ -486,13 +541,13 @@ function shellSearchProblem(
 ): string | undefined {
   const commandRaw = args["command"];
   const command = typeof commandRaw === "string" ? commandRaw : "";
-  return isGrepRgCommand(command)
+  return isGrepRgCommand(command, 0, deps.platform ?? "posix")
     ? buildSearchFirstReason(cwd, { kind: "shell", command }, deps, messages)
     : undefined;
 }
 
 /**
- * 原生 grep 工具面的一次检索裁决：目标在索引根之外 = 不是本工作区的检索 → 放行
+ * 原生 grep 工具这一层的一次检索裁决：目标在索引根之外 = 不是本工作区的检索 → 放行
  * （与 pathInsideRoot 的「判范围不判合法性」同侧）。无 path 参数按搜整个工作区。
  */
 function nativeGrepProblem(
@@ -522,7 +577,7 @@ export function searchFirstGuard(
   const cwd = sessionHeaderCwd(execution);
   let reason: string | undefined;
   // 门禁关着、执行体没有会话工作区（无从判「索引根之内」）、或本步骤根本调不动
-  // `zg_search` → 两个拦截面都无从谈起（强迫先调一个不可执行的工具是死路）。
+  // `zg_search` → 两道拦截都无从谈起（强迫先调一个不可执行的工具是死路）。
   if (deps.enabled && cwd !== undefined && searchAdmitted(execution)) {
     if (name === "bash" || name === "pwsh") {
       reason = shellSearchProblem(args, cwd, deps, messages);

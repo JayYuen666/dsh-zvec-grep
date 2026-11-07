@@ -1,11 +1,12 @@
 // lib/index-preflight.ts —— `zg index` 入参里那些「命令还没起就得先看盘」的预检。
 //
-// 为什么先于命令构造（全部实测，见 test/e2e/zg-cli.test.ts）：真 zg 遇到读不成的
-// ignore 文件**不是**按「没有这条规则」继续，而是整次索引失败
-// （`ZVEC_GREP.ENGINE.INDEXING.WORKSPACE_FAILED`，原因是 ENOENT / EACCES / EISDIR），
-// 并且那个坏路径会**写进工作区索引的状态**——此后这条树上的 `zg index` 与 `zg status`
-// 都报同一个错，`--reset-paths` 清不掉，只有 `zg_index drop`（整棵索引删掉重来）能救。
-// 一个拼错的文件名、一个存在但读不了的文件、或一个目录，就把用户的工作区索引弄坏。
+// 0.3.0 起这道预检的上游依据变了（实测）：真 zg 对读不成的 ignore 文件**静默容忍**——
+// 0.2.2 会整次索引失败（ENGINE.INDEXING.WORKSPACE_FAILED，ENOENT / EACCES）并把坏路径
+// 写进工作区索引状态；0.3.0 照常建索引（exit 0），只在回执的 `roots` 行里记下
+// `ignore-file=<坏路径>`，那条排除规则悄悄不生效。0.2.2 时代「只有 drop 能救」的
+// 损坏形态不复存在，但**静默错误答案**还在：模型给的排除路径拼错了，索引照建、
+// 用户以为规则在挡东西，实际一个文件都没排除。预检据此保留——把「当场就能判定的
+// 坏路径」变成命令构造前的明确报错，而不是让一份看似带排除规则的索引悄悄失效。
 //
 // 这是**尽力而为**的前置拦截：预检与 zg 真正打开文件之间存在竞态（检查通过后文件仍可能
 // 被删、被改权限、或被目录顶替），预检通过不等于 zg 侧一定成功——它只把「当场就能判定的
@@ -20,7 +21,7 @@ import { fill } from "./messages.ts";
 import type { ZvecGrepMessages } from "./messages.ts";
 
 /**
- * 预检判「文件不合适」时接受的家庭错误码：其余（fd 耗尽、链接环、IO 错误等环境故障）
+ * 预检判「文件不合适」时接受的家庭错误码：其余（fd 耗尽、符号链接成环、IO 错误等环境故障）
  * 与用户给的路径无关，原样上抛——把 EMFILE 说成「请给一个真实存在的文件」会把排查
  * 引向错误的方向。
  */
@@ -33,7 +34,7 @@ const UNUSABLE_FILE_CODES: ReadonlySet<string> = new Set([
 ]);
 
 /** node:fs 的失败一律是带 string code 的 Error 实例；形状不合（非对象、无 code、码非串）
- *  一律按环境故障处理。导出只为把非 Error 形状的判别面钉进单测（真 fs 抛不出这些）。 */
+ *  一律按环境故障处理。导出只为把非 Error 形状的判别规则固定进单测（真 fs 抛不出这些）。 */
 export function isUnusableFileCode(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) {
     return false;
@@ -53,15 +54,15 @@ export function isUnusableFileCode(error: unknown): boolean {
  * 分支会让 CI 的 windows 那格在 100% 覆盖率门禁下无从而钉（本仓不用 coverage-ignore 逃生口）。
  * 合成一句「不是存在且可读的文件」文案，三种成因都准确覆盖，且 catch 由「不存在」这一档跨平台钉住。
  *
- * drop 那一臂整段跳过：drop 的命令不含 ignoreFiles，且构造器对「drop 携带索引侧参数」会
+ * drop 那一条分支整段跳过：drop 的命令不含 ignoreFiles，且构造器对「drop 携带索引侧参数」会
  * 点名拒绝（见 lib/cli.ts 的 buildIndexCommand）——预检既没有可查的对象，也没有机会跑到；
  * 若照跑，反而会拿"给一个真实存在的忽略文件"这句误导文案把一次合法的删索引拦下。
- * 判 drop 用与构造器**同一个** `boolOf`，两处口径不会漂。
+ * 判 drop 用与构造器**同一个** `boolOf`，两处规则不会漂。
  * @param args 索引入参（`ignoreFiles` 单值或数组；`drop` 为真时整段跳过）
  * @param root 已归一的工作区根（相对路径按它解析）
  * @param messages 文案表
  * @returns {void}
- * @throws Error 指向第一个不可用的条目（不静默丢弃用户给的那一项）；node:fs 的环境类
+ * @throws Error 指向第一个不可用的条目（不会静默丢掉用户给的那一项）；node:fs 的环境类
  *   故障（非文件形状问题）原样上抛
  */
 export function assertIgnoreFilesExist(

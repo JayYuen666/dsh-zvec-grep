@@ -1,15 +1,15 @@
-// 设置卡「工作区重建」读面的**真实宿主**测试：真官方作业注册表 + 真本地 bash 执行器 +
+// 设置卡「工作区重建」读取接口的**真实宿主**测试：真官方作业注册表 + 真本地 bash 执行器 +
 // 真进程。与 test/host.test.ts 里那套 mock ctx 的分工：那边验判据（白名单/绝对路径/同根互斥
 // 的每一格），这里验**跨件的那几条**：
 //
-//   - 引导读面在真实 cordis 上注册得到，交回的候选工作区就是这台 daemon 观测到的那些；
-//   - 启动读面起来的作业真的进了官方注册表（id/状态/环/泵都由官方件管）；
-//   - 轮询读面读得到环里的真输出（stdout+stderr 两路），落定后交回退出码；
+//   - 引导读取接口在真实 cordis 上注册得到，交回的候选工作区就是这台 daemon 观测到的那些；
+//   - 启动读取接口起来的作业真的进了官方注册表（id/状态/环/泵都由官方件管）；
+//   - 轮询读取接口读得到环形缓冲里的真输出（stdout+stderr 两路），落定后交回退出码；
 //   - 侧表与注册表的「同一枚实例」判据在真实 cordis 上成立（`ctx.get` 每读一次都是新代理，
 //     实例身份比较恒为假 ⇒ 这条只有真实宿主能抓到，见 host.ts 的 JobIdentity 注释）；
 //   - 卸载时进程与在册作业都被收干净（走官方 kill/remove，不是绕过它直接杀进程）。
 //
-// 三个读面都按**服务方法的原样**调用（不再包一层 `{status, body}` 的 HTTP 形状：那层壳把
+// 三个读取接口都按**服务方法的原样**调用（不再包一层 `{status, body}` 的 HTTP 形状：那层壳把
 // 成功恒写成 200，于是 `assert.equal(status, 200)` 检的是夹具自己，不是本包）。
 //
 // 生命周期用例（卸载收进程、超时杀进程）用 installFakeZg 的假 zg：真 zg 的时长受模型加载
@@ -118,23 +118,23 @@ function rebuildApi(host: Host): RebuildApi {
   return service as RebuildApi;
 }
 
-/** 引导读面：候选工作区 + 守护进程就绪态。 */
+/** 引导读取接口：候选工作区 + 守护进程就绪态。 */
 async function readRoots(host: Host): Promise<RebuildRoots> {
   return rebuildApi(host).roots();
 }
 
-/** 启动读面：白名单/绝对路径/同根互斥都在服务方法里判。 */
+/** 启动读取接口：白名单/绝对路径/同根互斥都在服务方法里判。 */
 async function startRebuild(host: Host, root: string): Promise<RebuildStartResult> {
   return rebuildApi(host).rebuild({ root });
 }
 
-/** 轮询读面。 */
+/** 轮询读取接口。 */
 function readStatus(host: Host, jobId: string): RebuildStatusResult {
   return rebuildApi(host).status({ jobId });
 }
 
 /**
- * 落定的那条读数。终态判据与生产同口径：**running 与 stopping 都算仍在跑**
+ * 落定的那条读数。终态判据与生产同一种做法：**running 与 stopping 都算仍在跑**
  * （`stopping` = 取消已发出、进程还没收完，此时退出码与尾部输出都还没定）。
  * 本文件另一处的 `waitTerminal` 早已排除这两枚；这里原先只排 `running`，
  * 于是同一次等待在两个helper 手里有两种「落定」——一轮落在 stopping 的读数会让
@@ -144,7 +144,7 @@ function settledSnapshot(body: RebuildStatusResult): RebuildSnapshot | undefined
   return body.ok && body.status !== "running" && body.status !== "stopping" ? body : undefined;
 }
 
-/** 启动读面的成功臂。`assert.fail` 返回 never，所以判完之后 TS 也认这条窄形。 */
+/** 启动读取接口的成功分支。`assert.fail` 返回 never，所以判完之后 TS 也认这条窄形。 */
 function startedOf(body: RebuildStartResult): RebuildStarted {
   if (!body.ok) {
     assert.fail(`rebuild 应成功，实际 ${body.status} ${body.error}`);
@@ -152,7 +152,7 @@ function startedOf(body: RebuildStartResult): RebuildStarted {
   return body;
 }
 
-/** 轮询读面的成功臂。 */
+/** 轮询读取接口的成功分支。 */
 function snapshotOf(body: RebuildStatusResult): RebuildSnapshot {
   if (!body.ok) {
     assert.fail(`status 应读数，实际 ${body.status} ${body.error}`);
@@ -160,7 +160,7 @@ function snapshotOf(body: RebuildStatusResult): RebuildSnapshot {
   return body;
 }
 
-/** 任一读面的拒绝臂（连同它保留下来的语义码——那是"哪条判据拦的"唯一可机判的形态）。 */
+/** 任一读取接口的拒绝分支（连同它保留下来的语义码——那是"哪条判据拦的"唯一可机判的形态）。 */
 function refusedOf(body: RebuildStartResult | RebuildStatusResult): RebuildRefused {
   if (body.ok) {
     assert.fail(`本应被拒，实际放行：${JSON.stringify(body)}`);
@@ -187,14 +187,17 @@ async function waitSettled(
   return waitSettled(host, jobId, deadlineAt);
 }
 
-describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", () => {
+/** 后台重建命令的前缀（作业 label 与命令断言共用同一份字面量）。 */
+const REBUILD_COMMAND_PREFIX = "zg --index";
+
+describe.skipIf(!zgAvailable())("真实宿主：重建读取接口的跨件契约", () => {
   const cleanups: Cleanups = [];
 
   afterAll(() => {
     drainCleanups(cleanups);
   });
 
-  it("引导读面交回候选工作区与就绪位，roots 就是这台 daemon 观测到的那些", async () => {
+  it("引导读取接口交回候选工作区与就绪位，roots 就是这台 daemon 观测到的那些", async () => {
     const host = await startHost();
     const ws = observedWorkspace(cleanups);
     try {
@@ -205,14 +208,14 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
       // 候选只来自本插件自己的数据（不是文件系统扫描）。
       expect(roots.roots.length).toBeLessThan(64);
       // 卡片那一行守护进程就绪态由真探测给出：应答里必须有这一位、且是布尔。
-      // 具体值由这台机器上 `zg server` 的真实状态决定（断言它可机判，不钉死某一臂）。
+      // 具体值由这台机器上 `zg server` 的真实状态决定（断言它可机判，不钉死某一分支）。
       expect(roots.serverReady).toBeTypeOf("boolean");
     } finally {
       await host.dispose();
     }
   }, 60_000);
 
-  it("启动读面：白名单与绝对路径判据都过 ⇒ 真起一条后台作业进官方注册表", async () => {
+  it("启动读取接口：白名单与绝对路径判据都过 ⇒ 真起一条后台作业进官方注册表", async () => {
     const host = await startHost();
     const ws = observedWorkspace(cleanups);
     try {
@@ -224,10 +227,12 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
       // 官方注册表里真的有这条（kind + label + 运行态都由官方件管）。
       const listed = host.ctx.jobs.list().find((row) => row.id === jobId);
       expect(listed?.kind).toBe("zvec-grep-rebuild");
-      expect(listed?.label).toContain("zg index");
+      expect(listed?.label).toContain(REBUILD_COMMAND_PREFIX);
       expect(listed?.label).toContain("--rebuild");
       // 后台 spawn 的请求形态：不带 timeoutMs、onExpiry=none（shell 契约：后台不应用超时）。
-      const spawn = host.shellCalls.find((row) => row.request.command.startsWith("zg index"));
+      const spawn = host.shellCalls.find((row) =>
+        row.request.command.startsWith(REBUILD_COMMAND_PREFIX),
+      );
       assert.ok(spawn !== undefined);
       assert.equal(spawn.request.timeoutMs, undefined);
       assert.equal(spawn.request.onExpiry, "none");
@@ -236,16 +241,16 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
       const settled = await waitSettled(host, jobId, Date.now() + 60_000);
       expect(settled.status).toBe("completed");
       assert.equal(settled.exitCode, 0);
-      // 环里两路输出都读得到：stderr 的进度行 + stdout 的统计行（合并投影不许丢任何一路）。
-      expect(settled.output).toContain("Scanning files...");
-      expect(settled.output).toContain("Indexing complete");
+      // 环形缓冲里两路输出都读得到：stderr 的进度行 + stdout 的统计行（合并投影不许丢任何一路）。
+      expect(settled.output).toContain("Scanning");
+      expect(settled.output).toContain("Finishing index");
       expect(settled.output).toContain("Workspace index");
     } finally {
       await host.dispose();
     }
   }, 120_000);
 
-  it("轮询读面：同 id 的第二次读仍是同一条（侧表与官方注册表认得出同一枚实例）", async () => {
+  it("轮询读取接口：同 id 的第二次读仍是同一条（侧表与官方注册表认得出同一枚实例）", async () => {
     // 回归用例：真实 cordis 的 `ctx.get("jobs")` 每读一次都是新代理，拿「注册表实例引用」做
     // 身份比较会恒为假 ⇒ 每条活着的重建都回 404。身份判据改用 JobView 上的值三段
     // （kind/label/startedAt）之后，同一条作业的连续轮询才读得到读数。
@@ -283,7 +288,7 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
       assert.equal(relative.status, 400);
       expect(host.shellCalls).toHaveLength(before);
       const indexSpawns = host.shellCalls.filter((row) =>
-        row.request.command.startsWith("zg index"),
+        row.request.command.startsWith(REBUILD_COMMAND_PREFIX),
       );
       expect(indexSpawns).toStrictEqual([]);
     } finally {
@@ -303,7 +308,7 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读面的跨件契约", ()
       expect(second.jobId).toBe(first.jobId);
       expect(second.reused).toBe(true);
       expect(
-        host.shellCalls.filter((row) => row.request.command.startsWith("zg index")),
+        host.shellCalls.filter((row) => row.request.command.startsWith(REBUILD_COMMAND_PREFIX)),
       ).toHaveLength(1);
       await waitSettled(host, first.jobId, Date.now() + 60_000);
     } finally {
@@ -352,7 +357,12 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
   /** 等假 zg 把 pid 落地（它一被 spawn 就会写）：递归而非循环。 */
   async function waitForPid(timeoutAt = Date.now() + 5000): Promise<number> {
     if (existsSync(pidFile)) {
-      return Number(readFileSync(pidFile, "utf8"));
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      // writeFileSync 先截断创建、内容后落盘：existsSync 为真不代表可读，空窗口里
+      // Number("") 是 NaN——把不合法的读数当「还没写好」继续等，超时才报错。
+      if (Number.isInteger(pid) && pid > 0) {
+        return pid;
+      }
     }
     if (Date.now() > timeoutAt) {
       throw new Error(`fake zg never wrote ${pidFile}`);
@@ -376,7 +386,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
       assert.ok(Number.isInteger(pid) && pid > 0, pidFile);
       expect(host.ctx.jobs.list().some((row) => row.id === jobId)).toBe(true);
 
-      // 旧 URL 在**装载态**就是 404：读面走的是官方网关，不是本包注册的 webServer 路由。
+      // 旧 URL 在**装载态**就是 404：读取接口走的是官方网关，不是本包注册的 webServer 路由。
       // 只在卸载之后测一次的话，将来谁把路由加回来也不会红。
       const legacyUrl = `http://127.0.0.1:${host.port}/_dsh/zvec-grep/rebuild-roots`;
       const during = await fetch(legacyUrl);
@@ -387,8 +397,8 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
       );
 
       await host.unload();
-      // 卸载效应收口：走**官方注册表** kill（不是绕过它直接杀进程）⇒ 名册里那条被推到终态，
-      // 模型侧 job_list 看得见结局；环也由官方件收。这里钉具体的终态词，而不是 `!= running`：
+      // 卸载效应统一处理：走**官方注册表** kill（不是绕过它直接杀进程）⇒ 名册里那条被推到终态，
+      // 模型侧 job_list 看得见结局；环形缓冲也由官方件收。这里钉具体的终态词，而不是 `!= running`：
       // 后者对「名册里查无此条」同样成立，而那正是本条要排除的绕过形态。
       const terminal = await waitTerminal(host, jobId, Date.now() + 5000);
       expect(terminal, "卸载后那条作业必须由官方 kill 推到 killed").toBe("killed");
@@ -400,7 +410,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
     }
   }, 120_000);
 
-  it("超过 indexTimeoutMs：kill 定时器收进程，轮询读面说明为什么没跑完", async () => {
+  it("超过 indexTimeoutMs：kill 定时器收进程，轮询读取接口说明为什么没跑完", async () => {
     const host = await startHost({ indexTimeoutMs: 700 });
     const ws = observedWorkspace(cleanups);
     try {
@@ -411,7 +421,7 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
         Date.now() + 30_000,
       );
       expect(settled.status).toBe("killed");
-      // 超时说明必须出现在投影里（它由本包合成，不进官方环）。
+      // 超时说明必须出现在投影里（它由本包合成，不进官方环形缓冲）。
       expect(settled.output).toContain("超时");
     } finally {
       await host.dispose();
@@ -458,15 +468,17 @@ describe.skipIf(!zgAvailable())("真实宿主：后台重建的生命周期", ()
       );
       assert.ok(!started.isError, host.textOf(started));
       // 等重建进程把 pid 写进名册再检索：抢在它之前，假件看到的是「同根没有重建在跑」，
-      // 这一轮递回去的就是普通读数而不是锁占用，等待臂依旧没被走到。
+      // 这一轮递回去的就是普通读数而不是锁占用，等待分支依旧没被走到。
       const owner = await waitForPid();
       assert.ok(isAlive(owner), `${pidFile} 记的进程 ${String(owner)} 应还活着`);
       const search = await host.call("zg_search", { query: "authService" }, host.agentOf(ws));
       assert.ok(!search.isError, host.textOf(search));
       // 判据落在**递进官方执行器的次数**上：第一次被同根重建的锁挡下、等落定后重试一次。
-      // 整段拿掉等待臂，第一次的失败就直接回到模型身上（上一条红）；把重试改成"再试一次
+      // 整段拿掉等待分支，第一次的失败就直接回到模型身上（上一条红）；把重试改成"再试一次
       // 也别等"，这一条红。只断言"结果不报错"则两种坏法都看不见。
-      const queries = host.shellCalls.filter((row) => row.request.command.startsWith("zg query"));
+      // observedWorkspace 不预建索引 ⇒ 这次检索自动改道穷举通道（0.3.0 顶层 --rg）；
+      // 重建等待重试在 runForeground 层，穷举与索引两通道同样被包装。
+      const queries = host.shellCalls.filter((row) => row.request.command.startsWith("zg --rg"));
       assert.equal(
         queries.length,
         2,

@@ -1,5 +1,5 @@
-// lib/zg-version.ts 的单元测试：版本解析、门槛比较、以及「读不懂 ≠ 太老」这条分界。
-// 纯逻辑，不触宿主面。
+// lib/zg-version.ts 的单元测试：版本解析、阈值比较、以及「读不懂 ≠ 太老」这条分界。
+// 纯逻辑，不碰宿主接口。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import {
@@ -18,12 +18,12 @@ const ver = (text: string): ZgVersion => {
   return parsed;
 };
 
-/** 门槛上下反复用到的几个版本字面量，集中成常量免得散落各处改一半。 */
-const BELOW = "0.2.1";
+/** 阈值上下反复用到的几个版本字面量，集中成常量免得散落各处改一半。 */
+const BELOW = "0.2.2";
 const OLD = "0.1.9";
-const AT = "0.2.2";
-const ABOVE = "0.2.3";
-/** 字符串比会判错的那一对（`0.10.0 < 0.9.0`）：门槛必须逐段比数值。 */
+const AT = "0.3.0";
+const ABOVE = "0.3.1";
+/** 字符串比会判错的那一对（`0.10.0 < 0.9.0`）：阈值判定必须逐段比数值。 */
 const TEN = "0.10.0";
 const NINE = "0.9.0";
 /** 高段优先的一对。 */
@@ -69,13 +69,13 @@ describe("parseZgVersion", () => {
       assert.equal(parseZgVersion(text), undefined, `不该认：${JSON.stringify(text)}`);
     }
     // 前导零（无尾随杂字）被正则接受并按十进制归一：01.2.3 解析成 1.2.3，不是八进制。
-    // 这一口径写死在这里——将来若改成正则拒前导零，这条会红着提醒同步。
+    // 这一规则写死在这里——将来若改成正则拒前导零，这条会红着提醒同步。
     assert.deepEqual(ver("01.2.3"), { major: 1, minor: 2, patch: 3 });
   });
 });
 
 describe("versionAtLeast", () => {
-  it("同版本算够（门槛是「低于才拒」）", () => {
+  it("同版本算够（阈值是「低于才拒」）", () => {
     assert.equal(versionAtLeast(ver(AT), ver(AT)), true);
   });
 
@@ -100,7 +100,7 @@ describe("versionAtLeast", () => {
 });
 
 describe("tooOldZgVersion", () => {
-  it("门槛值本身：放行（交回 undefined）", () => {
+  it("阈值本身：放行（交回 undefined）", () => {
     assert.equal(tooOldZgVersion(`${AT}\n`), undefined);
   });
 
@@ -111,7 +111,7 @@ describe("tooOldZgVersion", () => {
   });
 
   it("更低版本：交回实际版本供文案回显", () => {
-    assert.deepEqual(tooOldZgVersion(`${BELOW}\n`), { major: 0, minor: 2, patch: 1 });
+    assert.deepEqual(tooOldZgVersion(`${BELOW}\n`), { major: 0, minor: 2, patch: 2 });
     assert.deepEqual(tooOldZgVersion(`${OLD}\n`), { major: 0, minor: 1, patch: 9 });
   });
 
@@ -128,14 +128,14 @@ describe("tooOldZgVersion", () => {
     assert.deepEqual(tooOldZgVersion("v0.2.1"), { major: 0, minor: 2, patch: 1 });
   });
 
-  it("门槛常量与比较用的字面量同源（改一处必须改两处，这里钉住）", () => {
+  it("阈值常量与比较用的字面量同源（改一处必须改两处，这里钉住）", () => {
     // MINIMUM_ZG_VERSION 是给用户看的字符串，也是 tooOldZgVersion 内部比较的对象。
-    // 解析失败不能伪装成 0.0.0：那个兜底会让「lib 门槛或正则漂了」表现成
-    // 「0.0.0 !== 0.2.2」，根因不可见。先钉解析成功，再比同源。
+    // 解析失败不能伪装成 0.0.0：那个兜底会让「lib 侧阈值或正则漂了」表现成
+    // 「0.0.0 !== 0.2.2」，真正的原因不可见。先钉解析成功，再比同源。
     const parsedMinimum = parseZgVersion(MINIMUM_ZG_VERSION);
     assert.ok(
       parsedMinimum !== undefined,
-      `MINIMUM_ZG_VERSION（${MINIMUM_ZG_VERSION}）解析失败：lib 侧门槛或正则漂了`,
+      `MINIMUM_ZG_VERSION（${MINIMUM_ZG_VERSION}）解析失败：lib 侧阈值或正则漂了`,
     );
     assert.equal(formatZgVersion(parsedMinimum), MINIMUM_ZG_VERSION);
     assert.equal(tooOldZgVersion(MINIMUM_ZG_VERSION), undefined);

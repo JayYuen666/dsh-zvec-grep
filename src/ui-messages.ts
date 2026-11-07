@@ -28,7 +28,7 @@ export interface UiMessages {
   readonly revert: string;
   /** 保存失败（后接错误摘要）：`{reason}`。 */
   readonly saveFailed: string;
-  /** 保存被宿主拒绝（受理位 false：校验未通过或写入被跳过），修改未生效。 */
+  /** 保存被宿主拒绝（受理结果 false：校验未通过或写入被跳过），修改未生效。 */
   readonly saveRejected: string;
 
   /** 小节标题：「检索模型」「网络与索引」。 */
@@ -42,8 +42,18 @@ export interface UiMessages {
   readonly outOfRange: string;
   /** 「默认本地 embedding」行标题。 */
   readonly embeddingLabel: string;
-  /** 「默认本地 embedding」行说明。 */
+  /** 「默认 embedding」行说明。 */
   readonly embeddingHint: string;
+  /** 「传输方式」行标题（检索走 CLI 还是守护进程 MCP）。 */
+  readonly transportLabel: string;
+  /** 「传输方式」行说明。 */
+  readonly transportHint: string;
+  /** 传输三档的选项文本。 */
+  readonly transportAuto: string;
+  readonly transportCli: string;
+  readonly transportMcp: string;
+  /** 远程模型分组标题（<optgroup>）。 */
+  readonly backendRemote: string;
   /** 「默认每组结果数」行标题。 */
   readonly limitLabel: string;
   /** limit 输入非整数的提示：`{min}`、`{max}`。 */
@@ -100,9 +110,13 @@ export interface UiMessages {
   readonly rebuildMissingJobId: string;
   /** 卡片侧 root 预检（绝对路径）。 */
   readonly rebuildRootNotAbsolute: string;
-  /** 宿主没有提供重建远程面（连 ctx.get 都不在，读取器无从构造；网关侧的两种缺席
+  /** 宿主没有提供重建远程通道（连 ctx.get 都不在，读取器无从构造；网关侧的两种缺席
    *  ——remote 服务缺失 / 命名空间未挂——由读取器自己的错误文案点名）。 */
   readonly rebuildUnavailable: string;
+  /** 读取器在调用时现读 `remote` 服务失败（可选服务缺席）。 */
+  readonly rebuildRemoteMissing: string;
+  /** 读取器挂载后读不到命名空间服务键：`{serviceKey}`。 */
+  readonly rebuildNamespaceMissing: string;
 
   /** embedding 候选项文本模板：`{reference}`、`{dimension}`。 */
   readonly modelOption: string;
@@ -124,7 +138,7 @@ export interface UiMessages {
  * `ctx.locale.register(NS, UI_MESSAGES)` 能落到类型化重载上（两语必须一次交齐）。
  * ⚠ 表键必须是字面量（interface 键位不接受计算属性），故下面那条常量把它与
  * client-entry.ts 的 `NS` 钉在编译期：两边哪天分叉，`LocaleCatalog` 那条官方投影就先红。
- * 这个串的真源是本包 cordis.patch.yml 的裸 `- id: zvec-grep`（0.1.7 起 loader 条目 id
+ * 这个串的唯一来源是本包 cordis.patch.yml 的裸 `- id: zvec-grep`（0.1.7 起 loader 条目 id
  * = settings 命名空间 = locale 命名空间同一个串）：test/build-client.test.ts 解析该文件、
  * 钉住「只声明这一行裸 id」，并断言注册进官方 locale 的 ns 与 `configForms.get()` 的入参
  * 都是它，故表键、`NS`、patch 文件三者任一分叉都会在测试里红，不需要在此处再抄一份。
@@ -142,7 +156,7 @@ const LOCALE_NS_KEY = "zvec-grep" as const;
 
 /**
  * 本源只以**类型**形态对外流通：`client-entry.ts` 的 `const NS: LocaleNs = "zvec-grep"` 把条目
- * id 钉在本源上（分叉即编译期红），而产物漂移针仍要按字面量形状从 bundle 里抓 `NS`，所以那里
+ * id 钉在本源上（分叉即编译期红），而产物漂移检查仍要按字面量形状从 bundle 里抓 `NS`，所以那里
  * 保留字面量、只加类型标注——值导出不必存在（用例侧同理：要断言运行时那串就写字面量）。
  */
 export type LocaleNs = typeof LOCALE_NS_KEY;
@@ -152,7 +166,7 @@ export type LocaleNs = typeof LOCALE_NS_KEY;
  * index.d.ts` `= Translate<LocaleKeysOf<N>>`，而 `Translate<K> = (key: K, params?) =>
  * string`）——键集就是上面 merge 的 `keyof UiMessages`（并上官方 `common` 命名空间的共享
  * 词表：`LocaleKeysOf` 就是这么定义的，官方查找链在自有命名空间 miss 后确实会去问
- * common，故这不是本包「多出来的键」），函数面完全归官方，本地不再抄签名。
+ * common，故这不是本包「多出来的键」），函数类型完全归官方，本地不再抄签名。
  */
 export type Translate = OfficialTranslateNS<typeof LOCALE_NS_KEY>;
 
@@ -175,8 +189,16 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     unitTimes: "次",
     unitMinutes: "分钟",
     outOfRange: "超出允许范围，未保存",
-    embeddingLabel: "默认本地 embedding",
-    embeddingHint: "只影响「新建」索引；切换并保存后，已有索引需点下方「重建」重新 embedding",
+    embeddingLabel: "默认 embedding",
+    embeddingHint:
+      "本地模型直接可选；远程 qwen 模型需在插件部署配置里打开 allowRemoteEmbedding（内容会送往外部端点，首次索引需 zg --auth grant 授权）。只影响「新建」索引；切换并保存后，已有索引需点下方「重建」重新 embedding",
+    transportLabel: "检索传输方式",
+    transportHint:
+      "自动 = 守护进程在跑时检索走 MCP（常驻模型池、队列调度），否则走 CLI；仅 CLI = 永不碰守护进程；仅 MCP = 检索恒走守护进程，缺席时由插件自动拉起（会开 127.0.0.1:7999 回环端口；拉起失败会明确报错而不是回退 CLI）",
+    transportAuto: "自动（守护进程在跑走 MCP，否则 CLI）",
+    transportCli: "仅 CLI（每次 spawn zg 进程）",
+    transportMcp: "仅 MCP（走守护进程，缺席自动拉起）",
+    backendRemote: "qwen 远程（内容出本机，需部署开放并授权）",
     limitLabel: "默认每组结果数",
     limitInvalid: "请输入 {min}-{max} 的整数",
     limitClamped: "已钳到 {min}-{max} 范围：{value}",
@@ -191,10 +213,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     windowHint: "超过该时长未再次 zg_search，配额整体过期；清空恢复默认 {default}（单位：分钟）",
     rebuildLabel: "工作区重建（切换 embedding 并保存后执行）",
     rebuildInputPlaceholder: "/workspace 的绝对路径",
-    daemonReadyNote: "守护进程：就绪（zg server 在跑）。",
+    daemonReadyNote: "守护进程：就绪（zg --server 在跑）。",
     daemonOfflineNote:
-      "守护进程：未就绪。守护进程提供的索引增量刷新、refresh=background 与常驻模型池在缺席时都不可用；需要时在终端执行 `zg server on`。",
-    rebuildHint: "以当前默认模型重建：{embedding}；等价于 zg index --rebuild。{roots}",
+      "守护进程：未就绪。守护进程提供的索引增量刷新、refresh=background 与常驻模型池在缺席时都不可用；需要时在终端执行 `zg --server on`。",
+    rebuildHint: "以当前默认模型重建：{embedding}；等价于 zg --index --rebuild。{roots}",
     rootsNoteWith: "候选工作区来自本 daemon 已打开过的会话（服务端白名单）。",
     rootsNoteEmpty: "尚无可选工作区：先在该工作区里开一个会话（任一次工具调用即登记）。",
     rebuildButton: "重建索引（动作，点击即执行）",
@@ -208,6 +230,8 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildMissingJobId: "启动重建失败：应答缺 jobId",
     rebuildRootNotAbsolute: "root 必须是绝对路径（以 / 开头）",
     rebuildUnavailable: "宿主没有提供工作区重建读面（未装远程服务）",
+    rebuildRemoteMissing: "工作区重建读面不可用：宿主网关没有提供 remote 服务",
+    rebuildNamespaceMissing: "{serviceKey} 未提供：宿主网关没有挂上这枚命名空间",
     modelOption: "{reference}（{dimension}维）",
     backendLlamaCpp: "llama-cpp（原生，需 node-llama-cpp）",
     backendTransformersJs: "transformers-js（纯 JS ONNX）",
@@ -229,9 +253,22 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     unitTimes: "times",
     unitMinutes: "minutes",
     outOfRange: "Out of the allowed range — not saved",
-    embeddingLabel: "Default local embedding",
+    embeddingLabel: "Default embedding",
     embeddingHint:
-      "Affects newly built indexes only; after switching and saving, press Rebuild below to re-embed existing indexes",
+      "Local models are always selectable; the remote qwen models additionally require " +
+      "allowRemoteEmbedding in the deployment config (content leaves the machine, and the first " +
+      "index build needs a zg --auth grant). Affects newly built indexes only; after switching and " +
+      "saving, press Rebuild below to re-embed existing indexes",
+    transportLabel: "Search transport",
+    transportHint:
+      "auto = searches go through the daemon (MCP) when it is running, CLI otherwise; CLI-only = " +
+      "never touch the daemon; MCP-only = searches always go through the daemon, auto-starting it " +
+      "when absent (opens the 127.0.0.1:7999 loopback port; a failed start is reported explicitly, " +
+      "never silently downgraded to CLI)",
+    transportAuto: "auto (daemon → MCP, otherwise CLI)",
+    transportCli: "CLI only (spawn zg each call)",
+    transportMcp: "MCP only (via daemon, auto-started when absent)",
+    backendRemote: "qwen remote (content leaves the machine; needs the deployment switch + grant)",
     limitLabel: "Default hits per group",
     limitInvalid: "enter an integer between {min} and {max}",
     limitClamped: "clamped into the {min}-{max} range: {value}",
@@ -248,11 +285,11 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "Without another zg_search inside this window the whole quota expires; clear to restore the default {default} (minutes)",
     rebuildLabel: "Workspace rebuild (run after switching embedding and saving)",
     rebuildInputPlaceholder: "absolute path to a /workspace",
-    daemonReadyNote: "Daemon: ready (zg server is running).",
+    daemonReadyNote: "Daemon: ready (zg --server is running).",
     daemonOfflineNote:
-      "Daemon: not ready. What the daemon provides — incremental index refresh, refresh=background and the resident embedding model pool — is unavailable while it is absent; run `zg server on` in a terminal when you want it.",
+      "Daemon: not ready. What the daemon provides — incremental index refresh, refresh=background and the resident embedding model pool — is unavailable while it is absent; run `zg --server on` in a terminal when you want it.",
     rebuildHint:
-      "Rebuild with the current default model: {embedding}; same as zg index --rebuild. {roots}",
+      "Rebuild with the current default model: {embedding}; same as zg --index --rebuild. {roots}",
     rootsNoteWith:
       "Candidates come from sessions this daemon already opened (server-side whitelist).",
     rootsNoteEmpty:
@@ -271,6 +308,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildMissingJobId: "failed to start the rebuild: the response has no jobId",
     rebuildRootNotAbsolute: "root must be an absolute path (starting with /)",
     rebuildUnavailable: "the host does not expose the rebuild Remote API",
+    rebuildRemoteMissing:
+      "the rebuild Remote API is unavailable: the host gateway provides no remote service",
+    rebuildNamespaceMissing:
+      "{serviceKey} was not provided: the host gateway did not mount this namespace",
     modelOption: "{reference} ({dimension} dims)",
     backendLlamaCpp: "llama-cpp (native, requires node-llama-cpp)",
     backendTransformersJs: "transformers-js (pure JS ONNX)",
