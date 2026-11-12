@@ -2,6 +2,15 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.15
+
+宿主开发基线抬到 `0.2.2-rc.2`，支持窗口收到 `^0.2.2-rc.1`。zg 检索工具与路由行为不变。
+
+### Changed
+
+- **宿主开发基线抬到 `0.2.2-rc.2`**：`devDependencies` 整组 `@deepseek-ai/dsh-*` 抬到 `0.2.2-rc.2`，并补上 rc.2 新增的 `@deepseek-ai/dsh-error`（`dsh-llm` 的精确 peer，`autoInstallPeers: false` 下须显式声明）。
+- **支持窗口收到 `^0.2.2-rc.1`**：`engines.dsh` 与 `@deepseek-ai/dsh*` peer 由 `^0.2.1-rc.5 || ^0.2.2-alpha.3` 改为 `^0.2.2-rc.1`（单条 0.2.2 线）；`@deepseek-ai/schemastery` peer 由 `^3.18.5 || ^3.18.6-alpha.1` 收到 `^3.19.0`。devDependencies 仍精确钉版。
+
 ## 0.1.14
 
 修复 0.1.13 引入的 web 启动隐患：卡片组件收回 `client.js` 内联，移除对 `@jayyuen66/dsh-plugin-shared/client` 的模块表外置与 `cordis.patch.yml` 里的 shared 供应行。zg 命令面与 MCP 传输层不变。

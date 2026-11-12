@@ -1941,7 +1941,9 @@ const MAX_UNLOCK_SESSIONS = 256;
 
 /** 分片表里的额度条目自带 expiresAt，分片层面没有有效期可言。 */
 function noExpiry(): undefined {
-  return undefined;
+  // `void 0`：回调必须交回 undefined 表示「永不过期」，而 `return undefined` 与裸 `return`
+  // 分别撞基线的 unicorn(no-useless-undefined) 与 eslint(no-useless-return)。
+  return void 0;
 }
 
 /** search-first 门禁的会话解锁表（发放 / 查额度 / 消耗一次配额）。 */

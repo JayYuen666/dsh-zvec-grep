@@ -768,7 +768,10 @@ function releaseRebuildRecords(
  * 「启动/轮询」这一档不可用。
  */
 export class ZvecRebuildService extends TypertRemoteService {
-  private readonly deps: ZvecRebuildDeps;
+  // `declare`：字段声明不产生任何运行期代码（赋值只在构造里发生），因此装饰器降级产物里
+  // 不会出现 `deps = __runInitializers(this, _instanceExtraInitializers)` 这一行——那一行
+  // 的源映射会让覆盖率映射器把类体的闭合括号算成未执行（dsh-rtk 上实测过）。
+  declare private readonly deps: ZvecRebuildDeps;
 
   public constructor(ctx: Context, deps: ZvecRebuildDeps) {
     super(ctx, REBUILD_REMOTE_NAMESPACE);
@@ -776,6 +779,8 @@ export class ZvecRebuildService extends TypertRemoteService {
   }
 
   /** 引导读取接口：白名单里的工作区 + 守护进程就绪态（都是本插件自己的数据）。 */
+  // oxlint-disable-next-line eslint/new-cap -- `@Remote(…)` 是装饰器工厂，不是构造调用
+  @Remote("roots")
   public async roots(): Promise<RebuildRoots> {
     // 守护进程就绪态走 TTL 缓存（与三条工具同一份），卡片每开一次不至于多起一次 zg。
     // 探测失败只说明守护进程没就绪，不该让白名单一起拿不到：读取接口保留，标 false。
@@ -796,6 +801,8 @@ export class ZvecRebuildService extends TypertRemoteService {
    * 后一条被 zg 的写锁直接顶掉并报成「启动失败」。改成「先占位、抢不到就跟随」，
    * 这条竞态就没有窗口了。
    */
+  // oxlint-disable-next-line eslint/new-cap -- `@Remote(…)` 是装饰器工厂，不是构造调用
+  @Remote("rebuild")
   public async rebuild(request: RebuildStartRequest): Promise<RebuildStartResult> {
     const started = this.deps.messages();
     const accepted = acceptableRoot(
@@ -856,6 +863,8 @@ export class ZvecRebuildService extends TypertRemoteService {
    * 侧表就是这条投影的授权边界：官方 id 是可预测的 `<kind>-<hex>`（宿主 bash 工具的
    * `bash-1` 同样猜得到），而它不在本包表里 ⇒ 一律拒绝，绝不代读别人的作业。
    */
+  // oxlint-disable-next-line eslint/new-cap -- `@Remote(…)` 是装饰器工厂，不是构造调用
+  @Remote("status")
   public status(request: RebuildStatusRequest): RebuildStatusResult {
     const marks = this.deps.messages();
     const raw = isRecord(request) ? request.jobId : undefined;
@@ -932,34 +941,6 @@ export class ZvecRebuildService extends TypertRemoteService {
     };
   }
 }
-
-/**
- * 标准装饰器的**程序化调用**：`@Remote` 的全部作用就是往类原型写一枚描述符，而标准装饰器
- * 语法需要走一条 tsc 降级流水线（本仓的测试/构建解析器都不降级它）。这里直接按 TC39 的
- * `ClassMethodDecoratorContext` 形状调同一个 decorator 函数，把标记落到真正的原型上，
- * 于是源码里不再需要装饰器语法，构建与测试都不必再挂那枚预转换插件。
- */
-function markRemote(prototype: ZvecRebuildService, methodName: string): void {
-  // 官方 `Remote` 的运行时只读 name/private/static 与 addInitializer（TC39 的 access/metadata
-  // 它一概不读），故这里只给这四位；`Reflect.apply` 让装饰器工厂保持未类型化的调用签名。
-  const context = {
-    kind: "method",
-    name: methodName,
-    static: false,
-    private: false,
-    addInitializer: (initializer: (this: unknown) => void): void => {
-      // 初始器只做 `Object.getPrototypeOf(this)` 后落标记；用原型造一枚替身实例即可。
-      Reflect.apply(initializer, Object.create(prototype), []);
-    },
-  };
-  // oxlint-disable-next-line eslint/new-cap -- `Remote(…)` 是装饰器工厂，不是大写开头的构造调用
-  const decorate = Remote(methodName);
-  Reflect.apply(decorate, undefined, [Reflect.get(prototype, methodName), context]);
-}
-
-markRemote(ZvecRebuildService.prototype, "roots");
-markRemote(ZvecRebuildService.prototype, "rebuild");
-markRemote(ZvecRebuildService.prototype, "status");
 
 /**
  *

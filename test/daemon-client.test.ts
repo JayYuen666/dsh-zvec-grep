@@ -32,7 +32,8 @@ async function microTicks(remaining: number): Promise<void> {
 
 /** 「未配置 token」的现取器（AbortError 用例等共享；契约要求 undefined 而不是空串）。 */
 function noToken(): undefined {
-  return undefined;
+  // `void 0`：返回值必须是 undefined，而 `return undefined` 与裸 `return` 各自撞一条基线规则。
+  return void 0;
 }
 
 /** 一次被记录的 fetch 调用。 */

@@ -10,20 +10,32 @@
 // 同名切面的文件头。不产 .d.ts：插件包对外没有 TS API——dsh 按包名载入运行，没有人
 // import 它。
 import path from "node:path";
+import { createRequire } from "node:module";
 import { rolldown } from "rolldown";
 import { buildHostEntries } from "@jayyuen66/dsh-plugin-shared/lib/build-host";
 import { invokedDirectly, writeArtifact } from "@jayyuen66/dsh-plugin-shared/lib/build-artifacts";
+import { rolldownDecorators } from "@jayyuen66/dsh-plugin-shared/lib/decorator-lowering";
 
 // 测试按「脚本自己导出它用的工具」这一规则从本模块导入 singleEntryChunk。
 export { singleEntryChunk } from "@jayyuen66/dsh-plugin-shared/lib/build-artifacts";
 
 const root = import.meta.dirname;
 
+// 装饰器降级要一枚 tsc：接受标准装饰器语法的只有 tsc 自己（rolldown 原样保留 `@Remote(…)`
+// 写出非法 JS，见 shared 同名切面的文件头）。入口在本仓解析——shared 不能替消费方解析
+// 它自己没声明的依赖。
+const tscEntry = path.join(
+  path.dirname(createRequire(import.meta.url).resolve("typescript/package.json")),
+  "bin",
+  "tsc",
+);
+
 /** 生成 host.js 的完整文本。 */
 export async function buildHost() {
   const artifacts = await buildHostEntries({
     root,
     rolldown,
+    plugins: [rolldownDecorators({ tscEntry })],
     entries: [
       {
         source: "host.ts",
