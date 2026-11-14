@@ -98,6 +98,7 @@ interface Manifest {
   readonly dependencies?: Record<string, string>;
   readonly devDependencies?: Record<string, string>;
   readonly peerDependencies?: Record<string, string>;
+  readonly peerDependenciesMeta?: Record<string, { readonly optional?: boolean }>;
   readonly description?: string;
   readonly keywords?: readonly string[];
   readonly license?: string;
@@ -608,6 +609,42 @@ describe("注释与文档没有内部指涉", () => {
   });
 });
 
+describe("harnessError 是宿主那一份（错误码靠 instanceof 才到得了模型）", () => {
+  it("host.js 把 @deepseek-ai/dsh-error 留成外部引用", async () => {
+    // 判据本体：产物里必须按**包名**引用它。
+    //
+    // 为什么承重：`lib/zg-tool-error.ts` 的 `ZgToolError extends HarnessError`，而宿主
+    // `packages/core/tools/src/pipeline.ts#errorInfo` 用 `error instanceof HarnessError`
+    // 决定要不要把 `{ name, code }` 写进工具失败的 `ToolFailure.info`。类身份按模块实例算：
+    // 声明在 **peer**（构建期外部化）时本包与宿主共享同一份；一旦挪回 devDependencies，
+    // rolldown 会把整包内联，本包继承的是产物里另一个类，宿主的判据恒为 false ——
+    // 错误码整块静默消失，而源码、单测、类型检查一路绿。
+    const code = await readFile(path.join(pkgDir, "host.js"), "utf8");
+    const specifiers = new Set(
+      Array.from(code.matchAll(/\bfrom\s*"(?<spec>[^"]+)"/gu), (found) => found.groups?.["spec"]),
+    );
+    expect(specifiers.has("@deepseek-ai/dsh-error")).toBe(true);
+  });
+
+  it("zgToolError 继承 HarnessError，且码表取值互不相同", async () => {
+    // 这条判的是「源码这一端把关系接对了」：父类确实是 HarnessError、code 落在父类那一位上、
+    // 名字仍报自己的。**跨副本的 instanceof 在这里判不了**——单测与插件跑在同一个 node 进程里，
+    // 无论 `dsh-error` 解析到哪一份副本，`instanceof` 都是真，断言会退化成自证。
+    // 那一环靠两条真正有牙齿的判据：上面那条产物说明符断言（形态），
+    // 与宿主 `errorInfo()` 在真会话里的行为（结论）。别在这里补一条假的。
+    const { ZgToolError, ZG_TOOL_ERROR_CODES } = await import("../lib/zg-tool-error.ts");
+    const { HarnessError } = await import("@deepseek-ai/dsh-error");
+    const error = new ZgToolError(ZG_TOOL_ERROR_CODES.versionTooOld, "太旧了");
+    expect(error).toBeInstanceOf(HarnessError);
+    expect((error as { code?: string }).code).toBe("ZG_VERSION_TOO_OLD");
+    // name 报自己的类名：宿主把它写进 ToolFailure.info.name，取父类名会让「哪个插件错的」丢失。
+    expect(error.name).toBe("ZgToolError");
+    // 码表里两个键给同一个串，等于「按码判读」有两个来源：消费方分不出它们。
+    const values = Object.values(ZG_TOOL_ERROR_CODES);
+    expect(new Set(values).size).toBe(values.length);
+  });
+});
+
 /**
  * 说明符的包名段：`@scope/pkg/sub` → `@scope/pkg`，`pkg/sub` → `pkg`。
  *
@@ -753,6 +790,37 @@ describe("发布态运行期依赖（装出去之后才炸的那一类）", () =
     expect(
       missing,
       `这些宿主包是 shared 产物的运行期值导入，本包没提供：装出去即 ERR_MODULE_NOT_FOUND`,
+    ).toStrictEqual([]);
+  });
+});
+
+describe("产物值导入的宿主包必须是非 optional 的 peer", () => {
+  it("host.js 里值导入的宿主包，没有一枚被标成 optional", async () => {
+    // 判据本体：产物**静态入口** import 的每一枚宿主包，npm 装这个包时必须替我们装齐。
+    //
+    // 为什么承重：`peerDependenciesMeta` 里的 `optional: true` 在 npm 语义下是「这个 peer 可以
+    // 不装」——实测装一个声明了非 optional peer 的 tarball，npm 会把 peer 一起装进来
+    // （`added 5 packages`）；同一份声明改成 optional，干净目录里一条都不装。而 `host.js` 是
+    // 静态入口，加载期就要解析这些说明符，没有「运行时才用到」这回事。
+    //
+    // 症状：本仓 528 条用例、构建、类型检查全绿，故障只在 CI 的 install-probe 里出现，报
+    // `ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-error'`。本机也不复现——
+    // 伞根 node_modules 里有那份包，把问题盖住了。
+    const code = await readFile(path.join(pkgDir, "host.js"), "utf8");
+    const imported = valueImportedHostPackages(code);
+    expect(imported.size, "产物里一枚宿主包都没抓到：这道门在空转，判据本身要复核").toBeGreaterThan(
+      0,
+    );
+    const { manifest } = await readSurface();
+    const optional = new Set(
+      Object.entries(manifest.peerDependenciesMeta ?? {})
+        .filter(([, meta]) => meta.optional === true)
+        .map(([name]) => name),
+    );
+    const offenders = [...imported].filter((name) => optional.has(name)).toSorted();
+    expect(
+      offenders,
+      "这些包在产物里是值导入、却标了 optional peer：npm 不会替我们装，装出去就 ERR_MODULE_NOT_FOUND",
     ).toStrictEqual([]);
   });
 });

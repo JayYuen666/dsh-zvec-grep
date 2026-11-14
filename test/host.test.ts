@@ -300,6 +300,16 @@ interface CapturedTool {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+  /** 官方 `ToolDefinition.isConcurrencySafe?(args)`：调度阶段宿主按它决定串行还是并行。 */
+  isConcurrencySafe?: (args: unknown) => boolean;
+  /** 官方 `ToolDefinition.timeoutMs`：宿主 timeout 策略按它给每次调用套墙钟截止。 */
+  timeoutMs?: number;
+  /** 官方 `ToolDefinition.presentCall?(args)`：调用态卡片，宿主在 execute 之前画。 */
+  presentCall?: (args: unknown) => {
+    card?: string;
+    title?: string;
+    kind?: string;
+  };
   execute: (args: unknown, exec?: MockExec) => Promise<unknown>;
 }
 
@@ -1758,6 +1768,127 @@ describe("host.apply 注册面", () => {
     assert.ok(index.description.includes("confirm"));
   });
 
+  it("三个工具都声明调用态卡片：标题取参数、类别各自对路", () => {
+    // 判据来自「不声明会怎样」：宿主回落到默认卡片（标题=工具名、没有类别图标），
+    // 三个工具在时间线上长得一模一样。期望表独立写死，不从实现派生。
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const expectations = new Map<string, string>([
+      ["zg_search", "search"],
+      ["zg_index", "other"],
+      ["zg_status", "read"],
+    ]);
+    for (const [name, kind] of expectations) {
+      const presenter = toolOf(ctx, name).presentCall;
+      assert.ok(typeof presenter === "function", `${name} 没声明 presentCall`);
+      const view = presenter({ root: "/tmp/ws", query: "检索词" });
+      assert.equal(view.card, "generic", `${name} 的卡片类型`);
+      assert.equal(view.kind, kind, `${name} 的卡片类别`);
+      assert.ok(
+        typeof view.title === "string" && view.title.length > 0,
+        `${name} 的卡片标题不能是空串`,
+      );
+    }
+    // 标题真的取参数：检索用 query，建索引与状态用 root。
+    assert.equal(
+      toolOf(ctx, "zg_search").presentCall?.({ query: "身份验证" }).title,
+      "身份验证",
+      "zg_search 的标题应取 query",
+    );
+    assert.equal(
+      toolOf(ctx, "zg_index").presentCall?.({ root: "/tmp/other" }).title,
+      "/tmp/other",
+      "zg_index 的标题应取 root",
+    );
+    // 检索词还有两档写法：批量 queries 与词法 fts，标题都要取得到第一个词。
+    assert.equal(
+      toolOf(ctx, "zg_search").presentCall?.({ queries: ["第一个", "第二个"] }).title,
+      "第一个",
+      "zg_search 的标题应取 queries 的第一项",
+    );
+    assert.equal(
+      toolOf(ctx, "zg_search").presentCall?.({ fts: ["词法"] }).title,
+      "词法",
+      "zg_search 的标题应取 fts 的第一项",
+    );
+    // 没有检索词但有 root 时用 root；全都没有才回落到工具名。
+    assert.equal(toolOf(ctx, "zg_search").presentCall?.({ root: "/tmp/ws" }).title, "/tmp/ws");
+    // 参数缺失或类型不对时回落工具名，不能抛、也不能把 [object Object] 画到卡片上。
+    assert.equal(toolOf(ctx, "zg_search").presentCall?.({}).title, "zg_search");
+    assert.equal(toolOf(ctx, "zg_search").presentCall?.({ query: { a: 1 } }).title, "zg_search");
+    assert.equal(toolOf(ctx, "zg_status").presentCall?.({ root: 42 }).title, "zg_status");
+    // 宿主把模型交的 arguments 原样递进来：顶层可能不是对象（null / 数组 / 字符串），
+    // 那时也必须给出标题而不是抛 —— 卡片画不出来比画得朴素代价大得多。
+    for (const bogus of [null, [], "text", 42]) {
+      assert.equal(
+        toolOf(ctx, "zg_search").presentCall?.(bogus).title,
+        "zg_search",
+        `presentCall(${JSON.stringify(bogus)}) 应回落工具名`,
+      );
+    }
+  });
+
+  it("三个工具的并发分类器：检索/状态并行，建索引串行", () => {
+    // 期望表独立写死（不从实现派生）。rc.2 起宿主按 `isConcurrencySafe` 决定同批工具串行
+    // 还是并行，**只认恰好 true**，未声明一律 exclusive，所以「声明了没有」与「声明成什么」
+    // 是两件都要钉的事。
+    // 判据是「并行会不会改变可观察结果」：zg_search / zg_status 只读索引与文件；
+    // zg_index 真删真建 `.zvec-grep/`，而本包为它维护索引存在性探测缓存与 search-first
+    // 配额账本（RootLedger），并行时后落定的一次会把前一次的探测结论写成过期值。
+    const expected = new Map([
+      ["zg_search", true],
+      ["zg_status", true],
+      ["zg_index", false],
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    for (const [name, safe] of expected) {
+      const classifier = toolOf(ctx, name).isConcurrencySafe;
+      assert.equal(typeof classifier, "function", `${name} 没声明 isConcurrencySafe`);
+      // 宿主按调度阶段的入参调它：必须吃任意入参而不抛错，返回反布尔就退回串行。
+      assert.equal(classifier?.({}), safe, `${name} 的分类器结果`);
+    }
+    // 反向钉子：上面那张表就是全集，工具面多一个少一个这里就红。
+    assert.deepEqual(
+      ctx.toolsRegistered.map((tool) => tool.name).toSorted(),
+      [...expected.keys()].toSorted(),
+    );
+  });
+
+  it("三个工具都声明工具级墙钟预算，且预算覆盖各自的内部最坏路径", () => {
+    // 期望值独立写死（不从被测算的实现派生）：这些是**默认部署**下的内部超时与重建
+    // 等待上限，与 schema 的 .default() 同值，但这里不读 schema —— 读实现就等于自证。
+    // 余量一分钟：内层超时恰好等于宿主 shell 上限时（zg_index 就是这一格），
+    // 工具级与内层同刻到期会让宿主那句「tool call timed out」顶掉本包自己的归因。
+    const SEARCH_MS = 5 * 60_000;
+    const STATUS_MS = 60_000;
+    const INDEX_MS = 10 * 60_000;
+    const REBUILD_WAIT_MS = 2 * 60_000;
+    const MARGIN_MS = 60_000;
+    // 带 rebuildWait 的工具有两趟执行（第二趟是等重建落定后的重试），所以预算必须
+    // 装得下「两趟 + 那段等待」；不必相等 —— 只要不小于最坏路径，宿主就不会在一条
+    // 本来还能成功的重试途中断掉它。zg_index 自己就是那条重建，一趟。
+    const floors = new Map([
+      ["zg_search", SEARCH_MS * 2 + REBUILD_WAIT_MS + MARGIN_MS],
+      ["zg_status", STATUS_MS * 2 + REBUILD_WAIT_MS + MARGIN_MS],
+      ["zg_index", INDEX_MS + MARGIN_MS],
+    ]);
+    const ctx = makeCtx();
+    applyTo(ctx);
+    for (const [name, floor] of floors) {
+      const declared = toolOf(ctx, name).timeoutMs;
+      // 用 ok(typeof …) 而不是 equal(typeof …)：后者不参与类型收窄，tsc 会在下面拦住。
+      assert.ok(typeof declared === "number", `${name} 没声明 timeoutMs`);
+      assert.ok(Number.isFinite(declared) && declared > 0, `${name} 的 timeoutMs 必须是正有限数`);
+      assert.ok(declared >= floor, `${name} 的预算 ${declared}ms 装不下最坏路径 ${floor}ms`);
+    }
+    // 反向钉子：预算表就是全集（工具面多一个工具却没算预算，这里就红）。
+    assert.deepEqual(
+      ctx.toolsRegistered.map((tool) => tool.name).toSorted(),
+      [...floors.keys()].toSorted(),
+    );
+  });
+
   it("参数表：preview / refresh 带闭集 enum，符号类型逐项带 enum 且与取值器同源", () => {
     const ctx = makeCtx();
     applyTo(ctx);
@@ -1805,6 +1936,41 @@ describe("host.apply 注册面", () => {
     assert.equal(ctx.sections[0].order, 1550);
     assert.ok(ctx.sections[0].text.includes("zg_search"));
     assert.ok(ctx.sections[0].text.includes("root 可省略"));
+    // 常驻的只是摘要：机制细节（证据判读那条、embedding 那条）已经迁到 skill 正文，
+    // 不该再占提示词。挑「证据足够即停止搜索」是因为它只出现在全文里——
+    // 摘要刻意复述了「穷举检索不发放配额」这类会被门禁拒绝的规范，不能拿它当判据。
+    assert.ok(!ctx.sections[0].text.includes("证据足够即停止搜索"));
+  });
+
+  it("把规则全文注册成虚拟 skill `zvec-grep`（常驻段只留摘要）", () => {
+    const ctx = makeCtx();
+    const registered: { name: string; description: string; content: string }[] = [];
+    ctx.services["skills"] = {
+      register: (skill: { name: string; description: string; content: string }): (() => void) => {
+        registered.push(skill);
+        return () => {
+          void 0;
+        };
+      },
+    };
+    applyTo(ctx);
+    assert.equal(registered.length, 1, "每次装配注册一次");
+    const skill = registered.at(0);
+    assert.ok(skill !== undefined, "skill 必须注册出来");
+    assert.equal(skill.name, "zvec-grep");
+    // 正文必须是**全文**而不是摘要：摘要里没有配额算法那一段。
+    assert.ok(skill.content.includes("穷举检索**不发放** grep/rg 配额"));
+    assert.ok(skill.description.length > 0);
+    // 摘要段与 skill 正文是两份文本，别把同一个串喂给两边。
+    assert.notEqual(skill.content, ctx.sections[0]?.text);
+  });
+
+  it("宿主没装 skill 服务时照常装配（可选依赖，不进 inject）", () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    // services 里没有 skills ⇒ ctx.get("skills") 回 undefined，装配不许因此失败。
+    assert.equal(ctx.sections.length, 1);
+    assert.equal(ctx.toolsRegistered.length, 3);
   });
 
   it("注册 guard（透传 zgGuard）", () => {
@@ -4496,7 +4662,8 @@ describe("host 侧文案双语", () => {
     applyTo(ctx);
     const search = toolOf(ctx, "zg_search");
     assert.ok(search.description.includes("语义/混合检索"), "中文工具描述");
-    assert.match(ctx.sections[0]?.text ?? "", /zg 规则/u, "中文规则段");
+    // 常驻的是摘要段（全文已迁到 skill `zvec-grep`）：断言它确实是中文那一份。
+    assert.match(ctx.sections[0]?.text ?? "", /工作区检索规则/u, "中文摘要段");
     await assert.rejects(
       () => search.execute({ root: missingRoot, query: "x" }, execOf()),
       /root 目录不存在/u,

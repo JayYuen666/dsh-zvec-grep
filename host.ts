@@ -72,6 +72,7 @@ import type { Context, Fiber, Volatile } from "@deepseek-ai/cordis";
 import type {
   JsonSchemaNode,
   PreToolDecision,
+  ToolCallView,
   ToolDefinition,
   ToolExecution,
   ToolRunContext,
@@ -139,11 +140,13 @@ import { createRebuildRegistry } from "./lib/rebuild-state.ts";
 import type { ActiveRebuild, RebuildRegistry } from "./lib/rebuild-state.ts";
 // zg 结构化失败的识别层：错误文案与「要不要排队等锁」两条路径同源于此。
 import { classifyConcurrentFailure, DaemonCallFailureError } from "./lib/zg-errors.ts";
+import { ZG_TOOL_ERROR_CODES, ZgToolError } from "./lib/zg-tool-error.ts";
 // zg CLI 的版本下限：命令形态与旗标名是照某个版本写的，装了太老的 zg 会在命令构造前
 // 被拦下并给出指引。判据与取舍见 lib/zg-version.ts 的头注释。
 import { MINIMUM_ZG_VERSION, formatZgVersion, tooOldZgVersion } from "./lib/zg-version.ts";
 import type { ZgVersion } from "./lib/zg-version.ts";
 import { MESSAGES, fill } from "./lib/messages.ts";
+import { registerRoutingSkill } from "./lib/skill.ts";
 import type { ZvecGrepMessages } from "./lib/messages.ts";
 // host 侧文案语言跟官方 locale 插件的偏好同源：读它拥有的 settings 命名空间（未注册即中文）。
 import {
@@ -711,8 +714,11 @@ interface ZgVersionGate {
 }
 
 /** 版本过低的文案：回显实际版本与下限值，并给出唯一的出路（升级 zvec-grep）。 */
-function tooOldZgError(actual: ZgVersion, messages: ZvecGrepMessages): Error {
-  return new Error(
+function tooOldZgError(actual: ZgVersion, messages: ZvecGrepMessages): ZgToolError {
+  // 码而非仅人话：这条失败**不该重试**（升级才能解决），模型要靠码把「装的东西太旧」
+  // 与「这次调用运气不好」分开。人话里已经有可照做的出路。
+  return new ZgToolError(
+    ZG_TOOL_ERROR_CODES.versionTooOld,
     fill(messages.zgVersionTooOld, {
       actual: formatZgVersion(actual),
       minimum: MINIMUM_ZG_VERSION,
@@ -1012,7 +1018,8 @@ function createDaemonHandle(options: {
     // 文件保留，供下一次恢复继续认证。
     setToken(undefined);
     ownsTokenFile = false;
-    throw new Error(
+    throw new ZgToolError(
+      ZG_TOOL_ERROR_CODES.daemonUnavailable,
       fill(messages.daemonStartFailed, {
         detail:
           failure ??
@@ -1147,9 +1154,9 @@ export function hitSummary(
  * 只有占锁方自报重建才带这个类型——把「别的进程占锁」也当成可等的重建，
  * 会在一把永远不会由本插件放开的锁上无界挂起。
  */
-class RebuildLockBusyError extends Error {
+class RebuildLockBusyError extends ZgToolError {
   public constructor(message: string) {
-    super(message);
+    super(ZG_TOOL_ERROR_CODES.rebuildLockBusy, message);
     this.name = "RebuildLockBusyError";
   }
 }
@@ -1203,7 +1210,8 @@ async function runForegroundOnce(
     if (concurrent?.kind === "lock-busy") {
       // 重建占锁有等待重试；别的占锁方（常见是增量刷新）没有——这类操作可能跑很久，排队
       // 等于无界挂起。换成点名占锁方的可读错误，原始失败原文随行，不吞证据。
-      throw new Error(
+      throw new ZgToolError(
+        ZG_TOOL_ERROR_CODES.lockBusy,
         `${fill(opts.messages.lockBusyOtherOperation, {
           op: concurrent.ownerOperation ?? "unknown",
         })}\n${failure}`,
@@ -1212,9 +1220,12 @@ async function runForegroundOnce(
     if (concurrent?.kind === "permission-denied") {
       // 0.3.0 的远程授权门槛：上游报错原文自带可照抄的 grant 命令，这里补本部署侧的
       // 两条出路（部署开关或 grant）。归因必须点名——按普通失败回显，模型只会去重试。
-      throw new Error(`${failure}\n${opts.messages.remoteAuthDenied}`);
+      throw new ZgToolError(
+        ZG_TOOL_ERROR_CODES.permissionDenied,
+        `${failure}\n${opts.messages.remoteAuthDenied}`,
+      );
     }
-    throw new Error(failure);
+    throw new ZgToolError(ZG_TOOL_ERROR_CODES.commandFailed, failure);
   }
   const notes = successNotes(result, opts.messages, opts.stdoutMaxBytes).map((note) =>
     redactToken(note, secret),
@@ -1267,7 +1278,8 @@ async function attemptWithRebuildWait<Outcome>(
       return attempt();
     }
     // cause 串上原始失败：模型看到的不只是「等了没等到」，还有当初那条锁占用的原文。
-    throw new Error(
+    throw new ZgToolError(
+      ZG_TOOL_ERROR_CODES.lockBusy,
       outcome === "aborted"
         ? messagesAbortedWaiting(entry.root, messages)
         : messagesWaitExpired(entry.root, wait.maxWaitMs, messages),
@@ -1328,7 +1340,7 @@ async function runForeground(
  */
 function assertRootExists(root: string, messages: ZvecGrepMessages): string {
   if (!existsSync(root)) {
-    throw new Error(fill(messages.rootMissing, { root }));
+    throw new ZgToolError(ZG_TOOL_ERROR_CODES.rootRejected, fill(messages.rootMissing, { root }));
   }
   return root;
 }
@@ -1544,7 +1556,7 @@ function rootOf(
 ): string {
   const decision = judgeRoot(args["root"], sessionHeaderCwd(exec), messages, ledger, platform);
   if (!decision.allowed) {
-    throw new Error(decision.reason);
+    throw new ZgToolError(ZG_TOOL_ERROR_CODES.rootRejected, decision.reason);
   }
   // 登记必须在校验与授权都成功**之后**：否则一次被拒的调用会把自己写进白名单，
   // 下一轮就变成「已观测」，越权一步到位。
@@ -1559,11 +1571,121 @@ function rootOf(
 interface ToolSpec extends Pick<ToolDefinition, "name" | "description" | "parameters"> {
   /** 回显/校验文案的语言解析器：每次 execute 现取一份，切语言不必重载插件。 */
   messages: () => ZvecGrepMessages;
+  /**
+   * 并发分类器（rc.2 的 `ToolDefinition.isConcurrencySafe`）。
+   *
+   * 宿主只认**恰好 `true`**：未声明、返回非布尔、抛错一律按 `exclusive` 串行
+   * （`dsh-tools/lib/pipeline.js` 的 `executionMode`）。所以这里的取舍不是「能不能并行」
+   * 的偏好，而是「并行会不会改变可观察结果」的判据：
+   *  - `zg_search` 只读索引与工作区文件（`--refresh wait` 的增量刷新是 zg 自己的进程内
+   *    事务，两次调用各自排队，不是本插件的共享状态）⇒ 并行安全。
+   *  - `zg_status` 只读退出码与自述版本，无副作用 ⇒ 并行安全。
+   *  - `zg_index` 会**真删真建** `.zvec-grep/`（drop / rebuild），而本包还为它维护了
+   *    「索引存在性探测缓存」与 search-first 配额账本（`RootLedger`）；两次 zg_index
+   *    并行时，后落定的一次会把前一次的探测结论写成过期值 ⇒ 串行。
+   * 参数不参与判定：这三条按工具名固定，与入参无关，所以写成常量而不是按 args 分支。
+   */
+  concurrencySafe: boolean;
+  /**
+   * 工具级墙钟预算（rc.2 的 `ToolDefinition.timeoutMs`，由宿主
+   * `@deepseek-ai/dsh-tool-call-timeout-policy` 兑现）。
+   *
+   * **与工具内部的超时不是一回事**：内部那几枚（`searchTimeoutMs` 等）是交给
+   * `ctx.shell` 的，超时后本包自己归因成「zg 执行超时，请缩小范围」；这一枚是宿主
+   * 在工具外面套的截止，超时产出 `{ code: 'TOOL_TIMEOUT' }` 的失败结果——模型与上层
+   * 插件能据此区分「这条工具卡死了」和「zg 自己报错」。
+   *
+   * 取值必须是**一次算好交给注册表**的数字（宿主在 `tools.register` 里就校验它是
+   * 正有限数，之后每次 execute 只读那一份）。所以它只能由**非 volatile** 部署值算出来：
+   * 那几枚改值会触发插件重装、本文件重新 apply；若它来自 volatile 字段，用户在卡片上
+   * 改了超时而工具级上限不动，两个数就会各说一套。
+   *
+   * 预算要覆盖**最坏路径**而不是单次执行：带 `rebuildWait` 的工具最多跑两次执行
+   * （第二次是等重建落定后的重试），所以取 `2 × 内部超时 + 重建等待上限`。
+   */
+  timeoutMs: number;
+  /**
+   * 调用态卡片（rc.2 的 `ToolDefinition.presentCall`）。
+   *
+   * 不声明就落到宿主的默认卡片：标题是工具名、没有任何类别图标，三个工具在
+   * 时间线上长得一模一样。这里只填参数里**已经有的**信息（检索词、root、动作），
+   * 不做任何执行期投影——`presentResult` 那一步需要结构化值，而本包的工具结果
+   * 是纯文本（`{ text }`），从文本反推命中列表会造出与模型可见面不一致的卡片。
+   * @param args - 模型交进来的原始参数（未校验，字段可能缺或类型不对）
+   * @returns 宿主的调用态视图
+   */
+  presentCall: (args: Record<string, unknown>) => ToolCallView;
   run: (
     args: Record<string, unknown>,
     exec: ToolExec,
     messages: ZvecGrepMessages,
   ) => Promise<unknown>;
+}
+
+/**
+ * 工具级预算在内部最坏路径之外多给的一分钟。
+ *
+ * 必须是**严格大于**而不是等于：`zg_index` 的内部超时（10 分钟）恰好等于宿主
+ * `bash-local` 的 `maxTimeoutMs` 默认值，`ctx.shell.resolve` 会按
+ * `min(请求, 上限)` 收敛，于是内层实际生效的截止与工具级这一枚同刻到期。
+ * 两者同时触发时谁的结果落地是不确定的——宿主那一路会把结果换成
+ * `tool call timed out after Nms`，本包自己那句「zg 执行超时，请缩小范围」
+ * 就没机会说话。留一分钟，让内层永远先到期、先归因。
+ */
+const TOOL_TIMEOUT_MARGIN_MS = 60_000;
+
+/**
+ * 工具级墙钟预算：**最坏路径**而不是单次执行。
+ *
+ * 带 `rebuildWait` 的工具（检索与状态）在撞上同根重建时会等它落定后**重跑一次**，
+ * 所以最坏是两趟执行加上那段等待；`zg_index` 自己就是那条重建，不等待也不重试，
+ * 一趟就够。少算这一趟的话，宿主会在一趟本来还能成功的重试途中把调用掐掉，
+ * 而模型看到的是一句「tool call timed out」——它无法知道是内部哪一段慢。
+ * @param driven 该工具单趟执行的内部超时（部署值，非 volatile）
+ * @param waitsRebuild 该工具是否会在锁忙时等重建并重试一次
+ * @param rebuildWaitMs 等待重建落定的上限
+ * @returns 交给 `ToolDefinition.timeoutMs` 的毫秒数
+ */
+function budgetOf(driven: number, waitsRebuild: boolean, rebuildWaitMs: number): number {
+  const inner = waitsRebuild ? driven * 2 + rebuildWaitMs : driven;
+  return inner + TOOL_TIMEOUT_MARGIN_MS;
+}
+
+/**
+ * 以 root 为标题的调用态：模型给了 root 就用它，否则回落工具名。
+ *
+ * root 可以省略（缺省=当前会话工作区），而调用态发生在解析之前——这里不猜工作区，
+ * 猜错会让卡片写着一个模型没指定的目录。
+ * @param args - 模型交进来的原始参数
+ * @param toolName - 参数里没有 root 时的回落标题
+ * @returns 卡片标题（永不为空串）
+ */
+function rootTitleOf(args: Record<string, unknown>, toolName: string): string {
+  const { root } = args;
+  return typeof root === "string" && root.length > 0 ? root : toolName;
+}
+
+/**
+ * 检索类调用态的标题：优先用模型给的检索词，没有就给一句动作说明。
+ *
+ * 只读参数、不看结果：调用态卡片在 `execute` 之前就要画出来，那时还没有命中。
+ * 参数是未经校验的原样 unknown，所以每一格都要先判类型再取——直接把
+ * `args["query"]` 当字符串交给 UI，遇到数组或对象时卡片上会出现 `[object Object]`。
+ * @param args - 模型交进来的原始参数（已由调用点收窄成对象）
+ * @returns 卡片标题（永不为空串）
+ */
+function queryTitleOf(args: Record<string, unknown>): string {
+  const { query, queries, fts, root } = args;
+  if (typeof query === "string" && query.length > 0) {
+    return query;
+  }
+  if (Array.isArray(queries) && typeof queries[0] === "string" && queries[0].length > 0) {
+    return queries[0];
+  }
+  if (Array.isArray(fts) && typeof fts[0] === "string" && fts[0].length > 0) {
+    return fts[0];
+  }
+  return typeof root === "string" && root.length > 0 ? root : "zg_search";
 }
 
 function define(host: HostCtx, spec: ToolSpec): void {
@@ -1580,6 +1702,15 @@ function define(host: HostCtx, spec: ToolSpec): void {
     name: spec.name,
     description: spec.description,
     parameters,
+    timeoutMs: spec.timeoutMs,
+    // 调用态卡片：只读模型参数，不预判结果。宿主对抛错按「无视图」处理，
+    // 而下面这几个实现只做字符串读取与 fallback，不会抛。
+    presentCall: (rawArgs) => spec.presentCall(isRecord(rawArgs) ? rawArgs : {}),
+    // 把内部布尔翻成官方的分类器。写成一个**返回常量**的箭头而不是直接给 `() => spec.concurrencySafe`：
+    // 后者会闭包住整个 spec（含 messages 与 run），而宿主对 `isConcurrencySafe` 的调用发生在
+    // 工具执行前的调度阶段，把整份定义钉在注册表里没有意义；常量也让它天然无副作用、不抛错
+    // （宿主对抛错按 exclusive 处理，这里不该有那条路径）。
+    isConcurrencySafe: (): boolean => spec.concurrencySafe,
     output: {
       schema: TEXT_OUTPUT_SCHEMA,
       // 官方 render 的入参类型由 ToolOutputDefinition 交出（args: unknown / value: JsonValue），
@@ -1593,7 +1724,8 @@ function define(host: HostCtx, spec: ToolSpec): void {
     execute: async (rawArgs, exec) => {
       const messages = spec.messages();
       if (!isRecord(rawArgs)) {
-        throw new Error(
+        throw new ZgToolError(
+          ZG_TOOL_ERROR_CODES.badArguments,
           fill(messages.argsMustBeObject, {
             name: spec.name,
             received: rawArgs === null ? "null" : typeof rawArgs,
@@ -1602,7 +1734,8 @@ function define(host: HostCtx, spec: ToolSpec): void {
       }
       const missing = required.filter((fieldName) => rawArgs[fieldName] === undefined);
       if (missing.length > 0) {
-        throw new Error(
+        throw new ZgToolError(
+          ZG_TOOL_ERROR_CODES.badArguments,
           fill(messages.missingRequiredArgs, {
             name: spec.name,
             fields: missing.join(", "),
@@ -2252,16 +2385,20 @@ function daemonFailure(text: string, messages: ZvecGrepMessages): Error {
     return new RebuildLockBusyError(failure);
   }
   if (concurrent?.kind === "lock-busy") {
-    return new Error(
+    return new ZgToolError(
+      ZG_TOOL_ERROR_CODES.lockBusy,
       `${fill(messages.lockBusyOtherOperation, {
         op: concurrent.ownerOperation ?? "unknown",
       })}\n${failure}`,
     );
   }
   if (concurrent?.kind === "permission-denied") {
-    return new Error(`${failure}\n${messages.remoteAuthDenied}`);
+    return new ZgToolError(
+      ZG_TOOL_ERROR_CODES.permissionDenied,
+      `${failure}\n${messages.remoteAuthDenied}`,
+    );
   }
-  return new Error(failure);
+  return new ZgToolError(ZG_TOOL_ERROR_CODES.commandFailed, failure);
 }
 
 /** daemon 调用的传输层失败（fetch 层）：取消/超时与 CLI lane 同一套归因。 */
@@ -2275,9 +2412,16 @@ function daemonTransportFailure(
   const aborted = isRecord(error) && error["name"] === "AbortError";
   if (!aborted) {
     const detail = redactToken(errorText(error), token);
-    return new Error(fill(messages.mcpCallFailed, { detail }), { cause: error });
+    return new ZgToolError(
+      ZG_TOOL_ERROR_CODES.daemonUnavailable,
+      fill(messages.mcpCallFailed, { detail }),
+      { cause: error },
+    );
   }
-  return new Error(exec.signal.aborted ? messages.abortedFailure : messages.timeoutFailure);
+  return new ZgToolError(
+    ZG_TOOL_ERROR_CODES.daemonUnavailable,
+    exec.signal.aborted ? messages.abortedFailure : messages.timeoutFailure,
+  );
 }
 
 /** daemon 成功应答的后处理：截尾（保尾部）与命中摘要，与 CLI lane 同一套路。 */
@@ -2496,6 +2640,13 @@ function registerSearchTool(runtime: PluginRuntime, registered: ZvecGrepMessages
     description: registered.searchToolDescription,
     messages: runtime.messages,
     parameters: searchToolParameters(registered),
+    concurrencySafe: true,
+    timeoutMs: budgetOf(runtime.config.searchTimeoutMs, true, runtime.config.rebuildWaitMs),
+    presentCall: (args) => ({
+      card: "generic",
+      title: queryTitleOf(args),
+      kind: "search",
+    }),
     run: (args, exec, messages) => runSearchTool(runtime, args, exec, messages),
   });
 }
@@ -2577,18 +2728,18 @@ async function startBackgroundIndex(
   // 容量、也没人能收的 zg 比不起更糟——它会一直占着同根的写锁，把这棵树的后续索引全堵死。
   if (runtime.jobsOf() === undefined) {
     runtime.rebuilds.release(root, claimed);
-    throw new Error(messages.endpointJobsUnavailable);
+    throw new ZgToolError(ZG_TOOL_ERROR_CODES.daemonUnavailable, messages.endpointJobsUnavailable);
   }
   const embedding = readDefaultEmbedding(runtime.config);
   const spawned = await spawnIndexWrite(routes, messages, indexArgs, embedding);
   if ("error" in spawned) {
     runtime.rebuilds.release(root, claimed);
-    throw new Error(spawned.error);
+    throw new ZgToolError(ZG_TOOL_ERROR_CODES.commandFailed, spawned.error);
   }
   const attached = attachIndexWrite(routes, root, messages, spawned, claimed);
   if ("error" in attached) {
     runtime.rebuilds.release(root, claimed);
-    throw new Error(attached.error);
+    throw new ZgToolError(ZG_TOOL_ERROR_CODES.commandFailed, attached.error);
   }
   // 带凭据 attach：注册表只在占位仍是这一代时写入作业号（代次校验定义在 lib/rebuild-state.ts，
   // 由它自己的用例钉住）。这里不再写「attach 失败就收作业再报在飞」的兜底——从 claim 到这一行
@@ -2691,6 +2842,15 @@ function registerIndexTool(runtime: PluginRuntime, registered: ZvecGrepMessages)
     description: registered.indexToolDescription,
     messages: runtime.messages,
     parameters: indexToolParameters(registered),
+    concurrencySafe: false,
+    timeoutMs: budgetOf(runtime.config.indexTimeoutMs, false, runtime.config.rebuildWaitMs),
+    // 建索引在时间线上是一次「动作」，不是检索：类别给 other（编辑器里不画放大镜）。
+    // 标题用 root（模型给的路径），没给就落一句动作说明——卡片必须说清「在哪个目录上动土」。
+    presentCall: (args) => ({
+      card: "generic",
+      title: rootTitleOf(args, "zg_index"),
+      kind: "other",
+    }),
     run: (args, exec, messages) => runIndexTool(runtime, args, exec, messages),
   });
 }
@@ -2797,6 +2957,14 @@ function registerStatusTool(runtime: PluginRuntime, registered: ZvecGrepMessages
         checkReady: { type: "boolean", description: registered.checkReadyDescription },
       },
     },
+    concurrencySafe: true,
+    timeoutMs: budgetOf(runtime.config.statusTimeoutMs, true, runtime.config.rebuildWaitMs),
+    // 状态查询是「读」：kind read 让卡片有对应的图标。
+    presentCall: (args) => ({
+      card: "generic",
+      title: rootTitleOf(args, "zg_status"),
+      kind: "read",
+    }),
     run: (args, exec, messages) => runStatusTool(runtime, args, exec, messages),
   });
 }
@@ -2808,13 +2976,16 @@ function registerZvecTools(runtime: PluginRuntime, registered: ZvecGrepMessages)
   registerStatusTool(runtime, registered);
 }
 
-/** 硬规则段（systemPrompt）：文本取注册期文案，随注册一次性交给宿主。 */
+/** 硬规则段（systemPrompt）+ 规则全文的虚拟 skill。
+ *  常驻的只有摘要（逐条对应「不照做会被门禁拒绝」）；全文注册成 skill `zvec-grep`，
+ *  模型按需用 skill 工具加载。拆开的理由与两边各放什么见 lib/skill.ts 的头注释。 */
 function registerRoutingSection(host: HostCtx, registered: ZvecGrepMessages): void {
   host.systemPrompt.section({
     name: ROUTING_NAME,
     order: ROUTING_ORDER,
-    text: registered.routingText,
+    text: registered.routingSummary,
   });
+  registerRoutingSkill(host, registered.routingText, registered.skillDescription);
 }
 
 /**

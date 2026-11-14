@@ -77,9 +77,17 @@ export interface ZvecGrepMessages {
   readonly followDescription: string;
   readonly embeddingConcurrencyDescription: string;
 
-  // ── systemPrompt 注入段 ────────────────────────────────────────────────────
-  /** 工作区检索硬规则段全文。 */
+  // ── systemPrompt 注入段 + skill 正文 ───────────────────────────────────────
+  /** 工作区检索规则**全文**：注册成虚拟 skill 的正文，模型按需加载。
+   *  它不再常驻提示词——常驻的是下面那份摘要。 */
   readonly routingText: string;
+  /** 工作区检索硬规则**摘要**：常驻 systemPrompt 的那一段。
+   *  只保留「不照做就会被门禁拒绝」的规范；机制细节（配额算法、重建流程、embedding
+   *  选择、root 授权的完整口径）留在 routingText 里由 skill 按需加载。 */
+  readonly routingSummary: string;
+  /** skill 目录里那行说明（模型据此决定要不要加载 `routingText`）。
+   *  与 systemPrompt 摘要分开写：摘要是「你不照做就会被拦」，这行是「什么时候值得读全文」。 */
+  readonly skillDescription: string;
 
   // ── 工具入参形状错误 ───────────────────────────────────────────────────────
   /** 入参不是 JSON 对象：`{name}` 工具名、`{received}` 收到的类型。 */
@@ -421,6 +429,28 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "6. zg_* 的 root 可省略：缺省为当前会话工作区（绝对路径）。显式传入时必须落在本会话可操作范围内——" +
         "会话工作区本身、它的上级或下级目录，或本会话已登记过的工作区；其余绝对路径会被拒绝。",
     ].join("\n"),
+    routingSummary: [
+      "# zvec-grep（zg）工作区检索规则",
+      "",
+      "- 工作区**已建 zg 索引**（存在 .zvec-grep/manifest.json）时：所有检索必须先调用 zg_search；" +
+        "grep/rg 只作为它之后的精确字面/正则补充。门禁会拦下未经 zg_search 的 grep/rg（bash 里的" +
+        "命令与原生 grep 工具都算），被拦时按拒绝理由办：换一个更准确的 query/fts 重新 zg_search。",
+      "- 语义/关系/跨文件/多跳证据（架构、调用链、依赖、生命周期、数据流或控制流、设计意图、" +
+        "对比、跨文件综合）→ 必须先调用 zg_search。",
+      "- **无索引工作区**：zg_search 自动改走穷举词法检索，精确查找用它就够，不必先 zg_index" +
+        "（那要先下载 embedding 权重）。穷举检索不发放 grep/rg 配额。",
+      "- zg_index 仅在用户明确要求建/重建/删索引时调用，且 confirm 必须为 true；绝不静默建索引。",
+      "- zg_status 只在诊断索引缺失/失败/取消或显式监控进度时调用，普通搜索前不要调。",
+      "- zg_* 的 root 可省略：缺省为当前会话工作区（绝对路径）。显式传入时必须落在本会话" +
+        "可操作范围内——工作区本身、它的上级或下级目录，或本会话已登记过的工作区；其余绝对路径被拒绝。",
+      "",
+      "配额算法、重建流程、embedding 选择、检索结果的证据判读等完整规则见 skill `zvec-grep`" +
+        "（用 skill 工具按名加载）。",
+    ].join("\n"),
+    skillDescription:
+      "zvec-grep 工作区检索的完整规则：索引/免索引两条路由、grep/rg 门禁与配额算法、" +
+      "重建与 embedding 选择、检索结果的证据判读。开始在本工作区做检索前先加载它，" +
+      "尤其当你准备用 grep/rg/glob 或语义检索、或要建/重建索引时。",
     argsMustBeObject: "zg {name}: 参数必须是一个 JSON 对象（收到 {received}）",
     missingRequiredArgs: "zg {name}: 缺少必填参数 {fields}（缺失即拒绝，不产生副作用）",
     sandboxFacts: "（沙箱 mode={mode}{enforcement}）",
@@ -742,6 +772,37 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
         "workspace itself, its parents or children, or a workspace this session already registered; " +
         "any other absolute path is rejected.",
     ].join("\n"),
+    routingSummary: [
+      "# zvec-grep (zg) workspace search rules",
+      "",
+      "- When the workspace **has a zg index** (a .zvec-grep/manifest.json exists): every search " +
+        "must call zg_search first; grep/rg only as the exact literal/regex follow-up. The gate " +
+        "refuses grep/rg that did not follow a zg_search (both the bash command and the native " +
+        "grep tool); when it refuses, take the way out it names: re-run zg_search with a more " +
+        "precise query/fts.",
+      "- Semantic / relational / cross-file / multi-hop evidence (architecture, call chains, " +
+        "dependencies, lifecycles, data or control flow, design intent, comparisons, cross-file " +
+        "synthesis) → always call zg_search first.",
+      "- Workspaces **without an index**: zg_search falls back to exhaustive lexical search, " +
+        "which is enough for exact lookups — no need to zg_index first (that would download " +
+        "embedding weights). Exhaustive search grants no grep/rg quota.",
+      "- Call zg_index only when the user explicitly asks to build/rebuild/drop the index, and " +
+        "confirm must be true; never index silently.",
+      "- Call zg_status only to diagnose a missing/failed/cancelled index or to watch progress " +
+        "explicitly; not before a normal search.",
+      "- root may be omitted for zg_* tools: it defaults to the current session workspace " +
+        "(absolute path). When passed explicitly it must stay inside this session's operable " +
+        "scope — the workspace itself, its parents or children, or a workspace this session " +
+        "already registered; any other absolute path is rejected.",
+      "",
+      "The full rules (quota arithmetic, rebuild flow, embedding choice, how to read result " +
+        "evidence) live in the skill `zvec-grep`: load it by name with the skill tool.",
+    ].join("\n"),
+    skillDescription:
+      "The full zvec-grep workspace search rules: both routes (indexed and index-free), the " +
+      "grep/rg gate and its quota arithmetic, rebuild and embedding choice, and how to read " +
+      "result evidence. Load it before searching in this workspace, especially before reaching " +
+      "for grep/rg/glob or semantic search, or before building/rebuilding an index.",
     argsMustBeObject: "zg {name}: arguments must be a JSON object (received {received})",
     missingRequiredArgs:
       "zg {name}: missing required arguments {fields} (refused outright, no side effects)",

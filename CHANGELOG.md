@@ -2,6 +2,32 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.17
+
+检索规则从常驻提示词搬进了按需加载的虚拟 skill；工具结果带上可判的错误码与调用态卡片；三个工具各声明自己的墙钟。工具面与 grep/rg 门禁的行为一字未变。
+
+### Added
+
+- **工具错误码**：新增 `lib/zg-tool-error.ts` 的 `ZgToolError extends HarnessError` 与八枚码（`ZG_VERSION_TOO_OLD` / `ZG_REBUILD_LOCK_BUSY` / `ZG_LOCK_BUSY` / `ZG_PERMISSION_DENIED` / `ZG_DAEMON_UNAVAILABLE` / `ZG_ROOT_REJECTED` / `ZG_BAD_ARGUMENTS` / `ZG_COMMAND_FAILED`），`host.ts` 的抛错点逐处换成它（`RebuildLockBusyError` 保留自己的类与名字——下游 `instanceof` 读的就是它；唯一保留 `new Error` 的是装配期守卫，那不是工具失败）。理由：宿主 `errorInfo()` 判的是 `error instanceof HarnessError`，判不中时 `ToolFailure.info` 整块消失且静默；类身份按模块实例算，所以 `@deepseek-ai/dsh-error` 必须走 `peerDependencies`——写进 `devDependencies` 会被 rolldown 内联成第二个类，`instanceof` 恒 false。
+- **调用态卡片**：三个工具都声明 `presentCall`（`zg_search` → `search`、`zg_index` → `other`、`zg_status` → `read`），标题依次取 `query` / `queries[0]` / `fts[0]` / `root`，取不到回落工具名。此前三者在时间线上是同一种默认卡片、分不出哪一步在做什么。三个工具的类别分别对齐各自的语义：建索引是动作不是检索，状态查询是读。
+- **虚拟 skill `zvec-grep`**：路由规则**全文**经 `ctx.skills.register()` 注册，按需加载；常驻 system prompt 只留摘要。`routingText` 中文 2411 B / 英文 2731 B，常驻的 `routingSummary` 1411 B / 1591 B ⇒ 常驻提示词少 1000 B / 1140 B。`ctx.skills` 是可选服务且**不进 `inject`**：精简 profile 没装 `dsh-skill` 时照常装配，只是全文按需加载不了；为此常驻段与 skill 之间有一处口头指路，skill 没注册上时那半句不会出现（指向一个不存在的 skill 比不说更糟）。
+- **工具级墙钟**：三个注册项各自声明 `timeoutMs`，由 `budgetOf(driven, waitsRebuild, rebuildWaitMs)` 加 60 秒余量算出：`zg_search` = 2×`searchTimeoutMs` + `rebuildWaitMs`（780 000 ms）、`zg_index` = `indexTimeoutMs`（660 000 ms）、`zg_status` = 2×`statusTimeoutMs` + `rebuildWaitMs`（300 000 ms）。翻倍覆盖的是「等一轮重建再执行一次」那条最坏路径，不是常规耗时。三个入参都取非 volatile 的部署值：宿主在 `tools.register` 时读一次 `timeoutMs`，取值若挂在只经 `updateVolatile` 更新的字段上，上限会永远停在装配那一刻的值。
+
+### Changed
+
+- **宿主开发基线抬到 `0.2.2-rc.2`**：`devDependencies` 整组 `@deepseek-ai/dsh-*` 抬到 `0.2.2-rc.2` 并补 `@deepseek-ai/dsh-skill`；`peerDependencies` 与 `engines.dsh` 的支持窗口由 `^0.2.2-rc.1` 收到 `^0.2.2-rc.2`，同时新增 `@deepseek-ai/dsh-error` 为 optional peer（配 `peerDependenciesMeta`，与既有的 optional `@deepseek-ai/dsh` 同一档）。`@jayyuen66/dsh-plugin-shared` 仍是 `^0.2.8`；`pnpm-lock.yaml` 随两条新依赖重解（+18 行）。
+- **两份 README 的宿主窗口叙述同步**：徽章、支持窗口句与 peer 范围说明里的 `rc.1` 一律改到 `rc.2`；「新线预发布不满足旧 caret」这一层的措辞不变——窗口是怎样就写怎样。
+
+### Not changed, deliberately
+
+- **不用 `finalizeContent`**：它的价值落点已被宿主 spill 策略覆盖（除 `read` 外的每个工具结果都封顶在 `maxInlineTokens: 12500`，错误结果同样封），而本包的失败详情本来就按「首 400 + 中间标记 + 尾 400」字节截断。宿主唯一没封顶的是 `run_code` 里发起的工具调用，但 `finalizeContent` 在那条路径上同样不生效（它挂在 `ToolDefinition` 上，只在模型直调路径跑），所以这个钩子救不了那条缝。
+- **grep/rg 门禁与配额算法一字未动**：`routingSummary` 只复述「不照做就会被门禁拒绝」的那几条规范，配额公式、重建流程、embedding 选择与结果判读仍留在 `routingText` 里由 skill 加载。
+
+### Verification
+
+- `pnpm run check dsh-zvec-grep` 全绿：`tsc --noEmit`（两个 project）、`oxlint` 0 warning / 0 error、`oxfmt --check`、产物重建、`vitest run --coverage` 四项 100（`lib/skill.ts` 与 `lib/zg-tool-error.ts` 逐文件 100）。
+- 变异测试逐条命中：`budgetOf` 改成常量 → 墙钟期望红；`host.js` 里的 `@deepseek-ai/dsh-error` 说明符改成不存在的包名 → 外部化断言红；`presentCall` 的标题改成工具名 → 卡片标题断言红。
+
 ## 0.1.16
 
 设置卡的下拉候选与说明浮层不再漂到浏览器最左边；shared 抬到 `^0.2.8`（含运行时几何自检）。zg 检索工具与路由行为不变。
