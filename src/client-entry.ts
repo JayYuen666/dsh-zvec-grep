@@ -36,7 +36,6 @@ import {
   WINDOW_MAX,
 } from "../lib/limits.ts";
 import {
-  CARD_UI_CSS,
   CardForm,
   Field,
   NumberField,
@@ -46,8 +45,10 @@ import {
   TextField,
   ToggleField,
   diffTouched,
+  ensureCardUiCss,
   errorText,
   splitHint,
+  useInvalidFields,
 } from "@jayyuen66/dsh-plugin-shared/client";
 import type { SelectOption } from "@jayyuen66/dsh-plugin-shared/client";
 import {
@@ -164,6 +165,12 @@ interface CardDeps {
   root: string;
   rebuild: RebuildState;
   dirty: boolean;
+  /** 有字段越界：这次提交会把它静默丢掉，所以整张卡不给保存。 */
+  blocked: boolean;
+  /** 保存/撤销后自增一次，把数字框里的越界草稿清回已提交值。 */
+  resetToken: number;
+  /** 数字框把「本字段现在越界」上报进来（越界草稿不进 touched，只能另记一份）。 */
+  reportInvalid: (field: string, invalid: boolean) => void;
   /** 本次待保存的字段条数（保存条上的「已修改 N 项」）。 */
   dirtyCount: number;
   busy: boolean;
@@ -270,6 +277,10 @@ function buildModelSection(deps: CardDeps): ReactNode {
     unit: t("unitResults"),
     invalidHint: t("outOfRange"),
     disabled: !editable,
+    resetToken: deps.resetToken,
+    onInvalidChange: (invalid: boolean): void => {
+      deps.reportInvalid("defaultLimit", invalid);
+    },
     onChange: (next: number | undefined): void => {
       setField("defaultLimit", next);
     },
@@ -395,6 +406,10 @@ function buildIndexSection(deps: CardDeps): ReactNode {
     unit: t("unitTimes"),
     invalidHint: t("outOfRange"),
     disabled: !editable,
+    resetToken: deps.resetToken,
+    onInvalidChange: (invalid: boolean): void => {
+      deps.reportInvalid("grepBudgetPerSearch", invalid);
+    },
     onChange: (next: number | undefined): void => {
       setField("grepBudgetPerSearch", next);
     },
@@ -410,6 +425,10 @@ function buildIndexSection(deps: CardDeps): ReactNode {
     unit: t("unitMinutes"),
     invalidHint: t("outOfRange"),
     disabled: !editable,
+    resetToken: deps.resetToken,
+    onInvalidChange: (invalid: boolean): void => {
+      deps.reportInvalid("unlockWindowMin", invalid);
+    },
     onChange: (next: number | undefined): void => {
       setField("unlockWindowMin", next);
     },
@@ -433,9 +452,10 @@ function buildCardBody(deps: CardDeps): ReactNode {
   const { t } = deps;
   const saveBar = createElement(SaveBar, {
     dirty: deps.dirty,
+    blocked: deps.blocked,
     busy: deps.busy,
     writable: deps.writable,
-    error: deps.saveError,
+    error: deps.saveError ?? (deps.blocked ? t("invalidFields") : null),
     saveLabel: t("save"),
     savingLabel: t("saving"),
     revertLabel: t("revert"),
@@ -673,15 +693,22 @@ function ZgCard(props: CardSlotProps): ReactNode {
   // 该字段的受控输入就会吞键击（select 弹回旧值、input 改不动），而旁边的字段却
   // 能改——同一张卡两种行为，用户只能理解为「这个设置改了没用」。
   const fields = draftFields(touched, value);
-  const dirtyCount = diffTouched(touched, value).length;
-  const dirty = dirtyCount > 0;
+  // 越界字段集 / 重置信号：越界草稿压根不进 touched（`NumberField` 对它不调 `onChange`），
+  // 不单独记就与「草稿为空」在保存条上同形 —— 用户点保存，别的字段写出去、这一格静默丢掉。
+  // 越界集与重置信号由 shared 的 `useInvalidFields()` 提供（与其他带数字字段的卡共用同一套判定）。
+  const invalid = useInvalidFields();
+  const { blocked, fields: invalidFields, resetToken, reportInvalid } = invalid;
+  // 计数按字段去重：一个字段可以先写进合法草稿（进 touched）再改成越界草稿，两处都记
+  // 会把「已修改 N 项」多算一格。shared 的 `InvalidFields.fields` 就是给这一步用的。
+  const dirtyCount = new Set([...diffTouched(touched, value), ...invalidFields]).size;
+  const dirty = dirtyCount > 0 || blocked;
   const setField = (field: string, draft: unknown): void => {
     setTouched((prev) => ({ ...prev, [field]: draft }));
   };
 
   const save = async (): Promise<void> => {
     const keys = diffTouched(touched, value);
-    if (keys.length === 0) {
+    if (keys.length === 0 || blocked) {
       return;
     }
     setBusy(true);
@@ -718,10 +745,12 @@ function ZgCard(props: CardSlotProps): ReactNode {
     );
     setBusy(false);
     setTouched(next);
+    invalid.clear();
   };
   const discard = (): void => {
     setTouched({});
     setSaveError(null);
+    invalid.clear();
   };
 
   const deps: CardDeps = {
@@ -734,6 +763,9 @@ function ZgCard(props: CardSlotProps): ReactNode {
     root: rebuildView.root,
     rebuild: rebuildView.state,
     dirty,
+    blocked,
+    resetToken,
+    reportInvalid,
     dirtyCount,
     busy,
     saveError,
@@ -855,12 +887,14 @@ const inject = ["slots", "configForms", "locale"];
 
 function apply(ctx: ClientCtx): void {
   ctx.effect(() => {
+    const disposeShared = ensureCardUiCss();
     const tag = document.createElement("style");
     tag.id = "zvec-grep-card-css";
-    tag.textContent = `${CARD_CSS}\n${CARD_UI_CSS}`;
+    tag.textContent = CARD_CSS;
     document.head.append(tag);
     return () => {
       tag.remove();
+      disposeShared();
     };
   }, "zvec-grep-card: styles");
   // 本条目的共享表单：条目 id == cordis.patch.yml 里的裸 id `zvec-grep`（0.1.7 起

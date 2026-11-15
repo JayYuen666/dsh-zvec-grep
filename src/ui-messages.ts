@@ -28,6 +28,9 @@ export interface UiMessages {
   readonly revert: string;
   /** 保存失败（后接错误摘要）：`{reason}`。 */
   readonly saveFailed: string;
+  /** 有字段越界时的保存条提示：`NumberField` 对越界草稿不调 `onChange`，
+   *  只看草稿差异的门禁会以为什么都没改，于是照样提交其余字段。 */
+  readonly invalidFields: string;
   /** 保存被宿主拒绝（受理结果 false：校验未通过或写入被跳过），修改未生效。 */
   readonly saveRejected: string;
 
@@ -182,6 +185,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     saving: "保存中…",
     revert: "撤销",
     saveFailed: "保存失败：{reason}",
+    invalidFields: "有字段超出范围，先修正或撤销后再保存。",
     saveRejected: "保存被宿主拒绝（配置校验未通过或写入被跳过），修改未生效",
     modelSection: "检索模型",
     indexSection: "网络与索引",
@@ -245,6 +249,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     saving: "Saving…",
     revert: "Revert",
     saveFailed: "save failed: {reason}",
+    invalidFields: "Some fields are out of range; fix them or revert before saving.",
     saveRejected:
       "save rejected by host (validation failed or write skipped) — changes not applied",
     modelSection: "Retrieval model",

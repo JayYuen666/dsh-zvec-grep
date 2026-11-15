@@ -1,8 +1,8 @@
 // lib/messages.ts 单元测试：{占位符} 插值 + 两语字典的键集/占位符一致性。
 //
 // 键集一致由 tsc 兜（两份都标注同一个 ZvecGrepMessages），本文件补的是编译期管不到
-// 的两件事：模板里的占位符在两语间不得多不得少（漏了就渲染出空串），以及 fill 的
-// 三种取值形态（有值 / null / 缺键）。
+// 的两件事：模板里的占位符在两语间不得多不得少（漏了就渲染出空占位符），以及 fill 的
+// 三种取值形态（有值 / null / 缺值保留原文）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
 import { MESSAGES, fill } from "../lib/messages.ts";
@@ -25,13 +25,14 @@ describe("fill（host 侧 {name} 插值）", () => {
     assert.equal(fill("exit={exit}", { exit: null }), "exit=null");
   });
 
-  it("原型链上的键不当作参数：constructor/toString 渲染成空串", () => {
-    assert.equal(fill("{constructor}-{toString}", {}), "-");
+  it("原型链上的键不当作参数：constructor/toString 保留原文", () => {
+    // 只取自有属性 ⇒ 原型链上的同名成员不参与填充，占位符原样留着。
+    assert.equal(fill("{constructor}-{toString}", {}), "{constructor}-{toString}");
     assert.equal(fill("{constructor}", { constructor: "own" }), "own");
   });
 
-  it("缺键替成空串：文案不该因一个占位符打断工具调用", () => {
-    assert.equal(fill("a{missing}b", { other: 1 }), "ab");
+  it("缺键保留原文：写错占位符时一眼可见", () => {
+    assert.equal(fill("a{missing}b", { other: 1 }), "a{missing}b");
   });
 
   it("无占位符的文本原样返回", () => {

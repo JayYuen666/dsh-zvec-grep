@@ -13,6 +13,8 @@ interface Recorded {
   readonly name: string;
   readonly description: string;
   readonly content: string;
+  /** 宿主 `validateDefinition()` 的必填项：缺了它注册照样成功，只有加载全文才抛。 */
+  readonly source: string;
 }
 
 /** skill 服务的替身：只实现本包用到的 `register`，把实参原样收进数组。 */
@@ -55,6 +57,7 @@ describe("registerRoutingSkill（完整规则注册成虚拟 skill）", () => {
       name: SKILL_NAME,
       description: "目录那行说明",
       content: "规则全文",
+      source: "runtime",
     });
   });
 

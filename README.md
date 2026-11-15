@@ -108,6 +108,7 @@ If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entr
 
 - `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries a single `- id: zvec-grep` entry with `name: "@jayyuen66/dsh-zvec-grep"` - the **bare package name** is what makes the host scan the client half. The card components are bundled into `client.js` (only `react` / `zod` stay external to the host's module table), so the card does not depend on a second package being loaded. Bundle installation goes through pnpm (>= 12.3.0).
 - A missing injected surface keeps cordis from activating the entry (startup diagnostic: `pending (waiting for service: …)`); a malformed ctx throws `required services … missing` from apply.
+- The two delivery paths - a dshmarket hot-mounted `mkt-*` include and the bundle layer - can resolve to the same module and run `apply` twice in one scope. The second assembly claims a private instance service and stands down with a single `console.warn`; the tools, the prompt section and the `zvecGrepRebuild` namespace stay with the registered copy, and the lock is released when that fiber unloads.
 - The card is registered in the `plugins.bundle.config` slot keyed by the **bundle package name**; the settings namespace and `configForms` reads stay the bare entry id `zvec-grep` (implicit registration by entry id).
 - The rebuild read surface is installed on the apply fiber - no `webServer` dependency, no child fiber. On a TUI host the service still registers; the card simply has nowhere to render.
 - The status poll is the client's own timer (2000 ms), not a server push; every read answers a result object, never a thrown error.
@@ -162,7 +163,7 @@ Output is plain text; timeouts 5 min (search) / 10 min (index) / 60 s (status); 
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Settings
 
-Namespace `zvec-grep` equals the settings entry id; the schema has 18 fields with built-in defaults, 7 of them volatile and on the card.
+Namespace `zvec-grep` equals the settings entry id; the schema has 18 fields with built-in defaults, 7 of them volatile and on the card. An out-of-range numeric draft never reaches `onChange`, so **Save** is blocked while any numeric field is invalid; **Revert** stays enabled, and the save bar names the reason.
 
 | Field | Type | Default | Purpose |
 | --- | --- | --- | --- |

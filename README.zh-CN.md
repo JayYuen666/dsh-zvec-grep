@@ -108,6 +108,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 - `dsh.bundle.patch` 指向 `cordis.patch.yml`，其 `insert:` 块只有一条 `- id: zvec-grep`、`name: "@jayyuen66/dsh-zvec-grep"`——让宿主扫描 client 半的是**不带子路径的包名**。卡片组件直接打进 `client.js`（只有 `react` / `zod` 外置给宿主模块表），卡片不依赖第二份包被装载。bundle 安装走 pnpm（>= 12.3.0）。
 - 缺任一注入宿主服务，cordis 就不激活本条目（启动诊断点名 `pending (waiting for service: …)`）；ctx 形状不对时 apply 抛 `required services … missing`。
+- 两条装载路径——dshmarket 热挂的 `mkt-*` 子树与 bundle 层——可能解析到同一份模块而在同一作用域里跑两遍 `apply`。第二份会抢一把私有实例服务锁并安静让路（只 `console.warn` 一行）；三个工具、提示词段与 `zvecGrepRebuild` 命名空间仍由在册那一份提供，那一份 fiber 卸载时锁自动释放。
 - 卡片注册在 `plugins.bundle.config` 槽的 **bundle 包名**键下；设置命名空间与 `configForms` 的读仍走裸条目 id `zvec-grep`（按条目 id 隐式注册）。
 - 重建读取接口注册在 apply fiber 上——不声明 `webServer`、没有子 fiber。TUI 宿主上服务照常注册，只是卡片没有地方渲染。
 - 状态轮询是客户端自己的定时器（2000 ms），不是服务端推送；每次读都以结果对象回答，不抛错。
@@ -162,7 +163,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ## <img src="https://api.iconify.design/lucide/sliders-horizontal.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 设置项
 
-命名空间 `zvec-grep` 即设置条目 id；schema 共 18 个字段、逐字段带内置默认，其中卡上那 7 枚标 `.volatile()`。
+命名空间 `zvec-grep` 即设置条目 id；schema 共 18 个字段、逐字段带内置默认，其中卡上那 7 枚标 `.volatile()`。越界数字草稿不会进 `onChange`，所以只要有数字字段越界，**保存**就被禁用（**撤销**保持可点），保存条同时点名原因。
 
 | 字段 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |

@@ -649,6 +649,24 @@ function incompleteHosts(): unknown[] {
   ];
 }
 
+/**
+ * 临时接管 `console.warn`，把每一行收进 `sink` 并交回还原函数。
+ *
+ * 为什么需要它：本仓根 `pnpm check` 的噪点表把「测试期间漏出的 console 输出」判成一条噪点，
+ * 而「让路」那一支按设计就要 warn 一行给用户看。捕获而不是静音，顺带把「确实说了一声」
+ * 变成可断言的判据（真静音会让"忘了告知"也照样绿）。
+ * @param sink 收到的每一行
+ * @returns 还原 `console.warn` 的函数
+ */
+function captureWarn(sink: string[]): () => void {
+  const spy = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]): void => {
+    sink.push(args.map(String).join(" "));
+  });
+  return (): void => {
+    spy.mockRestore();
+  };
+}
+
 function makeCtx(): MockCtx {
   /** 与 ctx.jobs 同一份数组：登记一条就追加一枚号（见 withJobIdSink）。 */
   const jobIds: string[] = [];
@@ -887,6 +905,11 @@ function makeCtx(): MockCtx {
     },
     reflect: {
       provide(name: string, instance: unknown) {
+        // 复刻真 cordis：同作用域同名再 provide 同步抛（`Service` 构造即走这里）。
+        // 不去重而静默覆盖，会让「第二份装配被锁挡住」这条判据在单测里看不见。
+        if (ctx.services[name] !== undefined) {
+          throw new Error(`service "${name}" has been registered`);
+        }
         ctx.services[name] = instance;
         return () => {
           ctx.services[name] = undefined;
@@ -2017,6 +2040,40 @@ describe("host.apply 注册面", () => {
         applyPlugin(hostArg);
       }, /required services/u);
     }
+  });
+
+  it("同一作用域第二次装配让路：不重复注册、不抛错（market 热挂 + bundle 层双路径的现场）", () => {
+    // 现场：dshmarket 运行期热装会在 `.dsh-market/` 下造一棵 `mkt-*` 子树，把**同一份 host.js**
+    // 再挂一次；bundle 层那条行也还在。于是同一进程里 apply 跑两遍，第二遍的工具/section/服务
+    // 注册全部撞「同名已注册」而抛 —— 抛错穿出 apply ⇒ fiber 落 failed，插件页显示「启动失败」。
+    // 判据：第二次装配**不抛**，且**不新增**任何注册（工具数、section 数、Remote 服务都不变）。
+    const ctx = makeCtx();
+    applyTo(ctx);
+    const toolsAfterFirst = ctx.toolsRegistered.length;
+    const sectionsAfterFirst = ctx.sections.length;
+    const remoteAfterFirst = ctx.services["zvecGrepRebuild"];
+
+    // 让路那一支会 console.warn 一行（真机上那是给用户看的告知）。捕获它：本仓根 `pnpm check`
+    // 的噪点表把「测试期间漏出的 console 输出」判成噪点，同时把「让路时确实说了一声」变成断言。
+    const warned: string[] = [];
+    const restoreWarn = captureWarn(warned);
+    try {
+      assert.doesNotThrow(() => {
+        applyTo(ctx);
+      }, "第二份装配必须安静让路，绝不能把 fiber 打成 failed");
+    } finally {
+      restoreWarn();
+    }
+    assert.equal(warned.length, 1, "让路时应当只告知一次");
+    assert.match(warned[0] ?? "", /本次装配让路/u);
+
+    assert.equal(ctx.toolsRegistered.length, toolsAfterFirst, "让路的那一份不该再注册工具");
+    assert.equal(ctx.sections.length, sectionsAfterFirst, "让路的那一份不该再注册 prompt section");
+    assert.equal(
+      ctx.services["zvecGrepRebuild"],
+      remoteAfterFirst,
+      "Remote 服务仍是第一份那一个（第二份没能覆盖它）",
+    );
   });
 
   it("卸载 effect 终止在跑的重建进程并清空侧表", async () => {

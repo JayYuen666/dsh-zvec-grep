@@ -2,6 +2,30 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.18
+
+market 热挂与 bundle 层双路径装载时第二份 `apply` 整份让路（此前第二遍会撞「同名已注册」把 fiber 打成 failed）；设置卡接「有字段越界就不许保存」那道门禁；卡片样式改用 shared 的共享 `<style>`；shared 抬到 `^0.2.9`，输入框不再撑出容器、小节内补上纵向间距。工具面与 grep/rg 门禁的行为一字未变。
+
+### Added
+
+- **单实例锁**：`apply` 在首道宿主守卫之后用 shared 的 `claimInstance` 抢 `INSTANCE_LOCK_KEY = "@jayyuen66/dsh-zvec-grep/instance"`，抢不到就 `console.warn` 一行「本次装配让路，工具与设置卡由在册的那一份提供」并直接返回。成因是 dshmarket 运行期热装会在 `<profile>/.dsh-market/` 下造一棵它自己的 Include 子树（`mkt-*`，`file://` 直连 `host.js`），与 profile 的 bundle 层解析到同一份模块却各起一个 fiber ⇒ 同一进程里 `apply` 跑两遍，第二遍的三个工具、prompt section 与 Typert Remote 服务注册全部撞名。锁随在册那一份的 fiber 卸载自动释放。
+- **回归测试 `test/instance-lock.test.ts`（6 条）**：空作用域抢到且锁名落进服务表 / 已有一份在册时让路且**不再尝试 provide** / `provide` 抛错时让路、不把异常抛给调用方 / 没有注册口时放行 / `reflect` 在但没有 `provide` 时放行 / 两个不同键互不影响。`test/host.test.ts` 另加一条装配级用例：「第二份装配必须安静让路，绝不能把 fiber 打成 failed」，断言工具数、section 数、Remote 服务三者不变且 `warn` 恰好一次。夹具的 `reflect.provide` 因此从「重复写入覆盖」改成「重复即抛」——真 cordis 的 `Service` 构造就走这里，第二遍若没被锁挡住会当场抛错，而不是静默覆盖。
+
+### Changed
+
+- **三处逐字重复收进 shared**：`lib/skill.ts` 的注册正文（取可选 `skills` 服务 → 判形状 → 空正文不注册 → `register`）换成 shared 的 `registerSkill(ctx, spec)`，本文件只剩 `SKILL_NAME` 与把正文收成 spec 的那一层；`lib/messages.ts` 的 `fill()` 换成 shared 的 `fillPlaceholders`；`lib/daemon-client.ts` 的私有 `isRecord` 换成 shared 的 `lib/record`（本包那份少了 `!Array.isArray`，数组会被判成 record —— 这次顺手修掉）。
+- **`fill()` 的缺值语义从「替空串」改成「保留原文」**：漏传或写错占位符时原样留着的 `{xxx}` 一眼可见，比一句悄悄塌成残句的文案好排查。`null` 仍照实渲染成 `"null"`（`exitCode` 这类字段的正常取值）。两条既有断言随之改判。
+- **卡片样式改用 shared 的 `ensureCardUiCss()`**：不再把 `CARD_UI_CSS` 整段拼进本仓的 `<style>`，改为固定 id `dsh-card-ui-css` 的幂等注入 + 引用计数。
+- **运行时依赖 shared 抬到 `^0.2.9`**。
+
+### Fixed
+
+- **越界数字草稿会被静默丢掉**：`NumberField` 对越界草稿**不调 `onChange`**，于是它根本不进 `touched`。三个数字字段（`defaultLimit` / `grepBudgetPerSearch` / `unlockWindowMin`）现在都接 `onInvalidChange` 上报，卡片据此灰掉保存并在保存条上点名「有字段超出范围，先修正或撤销后再保存。」（`src/ui-messages.ts` 的 `invalidFields`）；`resetToken` 在保存/撤销后把框里的非法草稿清回已提交值。
+- **越界时连撤销都点不动**：上一版把「有未保存改动」与「有越界字段」混成保存条的一个 `disabled`。现在 `SaveBar` 分开算：保存被 `blocked` 拦下，撤销保持可点。
+- **「已修改 N 项」把越界字段算重**：一个字段先写进合法草稿（进 `touched`）再改成越界草稿时，草稿差异与越界集各算一次。现在按字段名去重（`InvalidFields.fields`），一格只算一项。
+- **输入控件撑出容器**（shared 侧）：`.dsu-form` 整棵子树统一 `border-box`，否则 `.dsu-input` 的 `width:100%` 会连同左右 padding 一起撑出容器 26px。
+- **小节内相邻元素间距为 0**（shared 侧）：`.dsu-form .dsu-section>*+*` 给 10px，`.dsu-sectionHint` 4px，`.dsu-field` 之间仍 0。
+
 ## 0.1.17
 
 检索规则从常驻提示词搬进了按需加载的虚拟 skill；工具结果带上可判的错误码与调用态卡片；三个工具各声明自己的墙钟。工具面与 grep/rg 门禁的行为一字未变。

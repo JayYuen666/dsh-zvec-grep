@@ -161,6 +161,10 @@ import {
 import { truncateEnd, truncateStart } from "@jayyuen66/dsh-plugin-shared/lib/text";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
 import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
+// 双路径装载的自保：market 热挂子树与 bundle 层会各跑一次 apply，注册面在第二遍撞名即抛。
+// 判据与取舍见 `@jayyuen66/dsh-plugin-shared/lib/instance-lock` 的头注释（本模块已收进 shared，
+// 各插件仓不再各留一份副本）。
+import { claimInstance } from "@jayyuen66/dsh-plugin-shared/lib/instance-lock";
 // 工作区重建的宿主读取接口（官方 Typert Remote）与它背后的作业编排：起写操作、登记、
 // 状态投影、卸载统一处理都在那一层，设置卡与模型侧后台索引共用同一个 spawn/attach。
 import { attachIndexWrite, installRebuildRemote, spawnIndexWrite } from "./lib/rebuild-remote.ts";
@@ -216,6 +220,13 @@ const MAX_LEDGER_ROOTS = 64;
 const LEDGER_TTL_MS = 24 * 60 * 60 * 1000;
 /** 成功执行里回显 stderr 的尾部长度（降级提示常就在这一行）。 */
 const STDERR_NOTE_CHARS = 400;
+/**
+ * 单实例锁的服务名。dshmarket 热挂子树与 bundle 层会各跑一次 `apply`，第二遍的注册面会撞
+ * 「同名已注册」而把 fiber 打成 failed；抢这把锁能把第二遍安静地挡在注册面之外。
+ * 取包名形态而**不带随机后缀**：名字必须每一份实例都算出同一个串才可能互斥，随机后缀等于
+ * 谁都能抢到。判据与边界见 shared 的 `lib/instance-lock` 头注释。
+ */
+const INSTANCE_LOCK_KEY = "@jayyuen66/dsh-zvec-grep/instance";
 
 // ── 宿主服务（类型全绑官方声明；运行时由 ctx 注入，绝不值导入 @deepseek-ai/*）──
 
@@ -3120,6 +3131,19 @@ function apply(ctx: Context, config: Config): void {
   }
   const host = ctx;
   const platform = runtimePlatform();
+
+  // 双路径装载的自保：market 热挂子树（`mkt-*`，走 file:// 直连 host.js）与 bundle 层会各跑
+  // 一次 apply，第二遍的工具/section/服务注册会撞「同名已注册」并把这条 fiber 打成 failed
+  // （插件页显示「启动失败」）。抢不到锁就整份让路：注册面已经由在册的那一份提供了，再注册
+  // 一遍本来也不可能成功。锁随那一份的 fiber 卸载自动释放，所以后续装配仍能抢到。
+  // 顺序上「后到者让路」与持久性天然一致：双挂只发生在用户经 market 现场启用插件的那一次会话
+  // 里（`hot-*.yml` 每次 boot 被 wipe），下一次启动只剩 bundle 层一条，自己就会恢复。
+  if (!claimInstance({ get: host.get, reflect: host.reflect }, INSTANCE_LOCK_KEY)) {
+    console.warn(
+      "[zvec-grep] 检测到本插件已在同一作用域内装载：本次装配让路，工具与设置卡由在册的那一份提供。",
+    );
+    return;
+  }
 
   configureSettingsPage(host);
   const localeMessages = createLocaleMessages(host);

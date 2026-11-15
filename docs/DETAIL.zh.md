@@ -24,7 +24,7 @@
 
 十一项部署值刻意不进设置卡：`searchTimeoutMs`（300000）、`statusTimeoutMs`（60000）、`indexTimeoutMs`（600000）、`stdoutMaxBytes`（400000）、`rebuildWaitMs`（120000）、`clientMode`（`auto` / `direct` / `server`）、`daemonUrl`（`http://127.0.0.1:7999/mcp`，MCP 传输的守护进程端点）、`allowRemoteEmbedding`（false）、`remoteEmbeddingEndpoint`、`remoteEmbeddingApiKeyFrom`、`requireApprovalForExplicitRoot`（false）。这十一项在卡上没有入口，能生效的只有下一段那条注册行 `config:`；优先级是注册行 `config:` > 代码里的 `.default()`。
 
-「工作区内容能不能离开本机」被当成部署决定，而不是给模型选的开关，所以远程嵌入那三枚既不在卡上也不在工具参数里；即便开了，`zg` 自己仍要求 `--allow-remote`（部署开放后本插件在远程引用的索引命令上自动补）或一次 `zg --auth grant` 持久授权。这些值都写在**自己 profile 的 `cordis.yml`** 里本插件注册行的 `config:` 块（随包那份 `cordis.patch.yml` 带本行的 `id` / `name`，另有一条**不写 id** 的 `@jayyuen66/dsh-plugin-shared` 条目供应卡片组件——删掉它设置卡会失去组件供应），改值随重启生效。
+「工作区内容能不能离开本机」被当成部署决定，而不是给模型选的开关，所以远程嵌入那三枚既不在卡上也不在工具参数里；即便开了，`zg` 自己仍要求 `--allow-remote`（部署开放后本插件在远程引用的索引命令上自动补）或一次 `zg --auth grant` 持久授权。这些值都写在**自己 profile 的 `cordis.yml`** 里本插件注册行的 `config:` 块（随包那份 `cordis.patch.yml` 带本行的 `id` / `name`；卡片组件已打进 `client.js`，不需要第二条包条目），改值随重启生效。
 
 ## 需要外部提供什么
 

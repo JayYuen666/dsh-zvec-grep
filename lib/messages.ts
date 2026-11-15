@@ -12,6 +12,7 @@
 // 那一行人读规则写在 lib/embedding-catalog.ts 的注释里）。
 
 import type { MessagesCatalog } from "@jayyuen66/dsh-plugin-shared/lib/locale";
+import { fillPlaceholders } from "@jayyuen66/dsh-plugin-shared/lib/placeholder";
 
 /** 本包 host 侧产出的全部人读文案（工具描述、工具回显、guard 理由、重建读取接口的拒绝）。 */
 export interface ZvecGrepMessages {
@@ -1056,16 +1057,13 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
 /**
  * `{name}` 占位符插值（与官方 locale 的 Translate 参数语义同源）。
  *
- * host 侧没有官方 translator，字典里的模板要自己填；缺键（占位符没给值）一律替成
- * 空串——文案是给人看的，不该因为一个占位符打断工具调用。
+ * 实现已收进 shared 的 `@jayyuen66/dsh-plugin-shared/lib/placeholder`。本包此前缺键即替空串，
+ * 现在统一成「缺值保留原文」：写错占位符时原样留着的 `{xxx}` 一眼可见，比一句悄悄塌掉的
+ * 文案好排障。`null` 仍照实渲染成 `"null"`（`exitCode` 这类字段的正常取值）。
  * @param template - 字典里的模板。
- * @param params - 占位符名 → 值（null 照实渲染成 "null"，与旧模板字符串一致）。
+ * @param params - 占位符名 → 值。
  * @returns 填好的文本。
  */
 export function fill(template: string, params: Record<string, string | number | null>): string {
-  return template.replaceAll(/\{(?<key>\w+)\}/gu, (_all: string, key: string) => {
-    // 只取自有属性：模板里出现 {constructor}/{toString} 时不能把原型链上的函数 String 化。
-    const value = Object.hasOwn(params, key) ? params[key] : undefined;
-    return value === undefined ? "" : String(value);
-  });
+  return fillPlaceholders(template, params);
 }

@@ -7,39 +7,21 @@
 //   · systemPrompt 只留摘要（messages.routingSummary），逐条对应「不照做会被拦」；
 //   · 全文注册成 skill，模型按名加载（`skill({ name: "zvec-grep" })`）。
 //
-// 为什么是 `register` 而不是 `registerProvider`：正文就在内存里（文案字典已经带语言了），
-// 没有文件要读、没有远端要探。`registerProvider` 的 `list()`/`get()` 是异步发现协议，
-// 拿它包一份现成字符串只会多一层间接。
+// **注册动作本身已经收进 shared**：`@jayyuen66/dsh-plugin-shared/lib/skill` 的
+// `registerSkill(ctx, spec)` 承担「取可选服务 → 判形状 → register → 回布尔」的全过程
+// （含「正文为空不注册」）。本文件只剩两样本仓自己的东西：skill 名，与把三份文本收成
+// spec 的那一层。此前三个带常驻提示词的插件各写一遍同一段正文，逐行同构——留着没有意义。
 //
-// 服务是**可选**的：`@deepseek-ai/dsh-skill` 未装载（精简 profile）时 `ctx.get("skills")`
-// 回 undefined，此时只是没有 skill 可加载——systemPrompt 那段摘要照旧生效，门禁照旧拦截。
-// 所以这里不进 inject 依赖表：进了就把「有 skill 服务」变成插件的硬性前提。
+// 服务是**可选**的：`@deepseek-ai/dsh-skill` 未装载（精简 profile）时注册只是回 false，
+// systemPrompt 那段摘要照旧生效，门禁照旧拦截。shared 那边因此只收 `get`、不要求 skills
+// 进 inject 依赖表：进了就把「有 skill 服务」变成插件的硬性前提。
 //
 // 名字用 kebab-case（`isSkillName` 的语法），与工具名前缀区分开：工具是 zg_search /
 // zg_index / zg_status，skill 是 zvec-grep。
+import { registerSkill } from "@jayyuen66/dsh-plugin-shared/lib/skill";
 
 /** skill 名：kebab-case，也是模型用 skill 工具加载时的入参。 */
 export const SKILL_NAME = "zvec-grep";
-
-/** `ctx.get("skills")` 交回来的那一面（只取本包用得到的两个方法）。
- *  官方 `SkillRegistry.register(skill): () => void` 与 `list()/get()` 见
- *  `@deepseek-ai/dsh-skill/lib/types/index.d.ts`；这里只声明调用的那一位。 */
-interface SkillsFace {
-  readonly register: (skill: {
-    readonly name: string;
-    readonly description: string;
-    readonly content: string;
-  }) => () => void;
-}
-
-/** 收窄判定：只认「有 register 且是函数」的对象，空对象不能冒充 skill 服务。 */
-function isSkillsFace(value: unknown): value is SkillsFace {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-  const member: unknown = Reflect.get(value, "register");
-  return typeof member === "function";
-}
 
 /**
  * 注册（或重新注册）本包的检索规则 skill。
@@ -49,17 +31,12 @@ function isSkillsFace(value: unknown): value is SkillsFace {
  * @param ctx - 只需 `get`（读可选服务），不要求 skills 进 inject
  * @param content - 规则全文（`messages.routingText`）
  * @param description - skill 目录里那行说明（模型据此决定要不要加载）
- * @returns 注册成功与否；未装载 skill 服务时为 false（不抛，摘要段照旧生效）
+ * @returns 注册成功与否；未装载 skill 服务或正文为空时为 false（不抛，摘要段照旧生效）
  */
 export function registerRoutingSkill(
   ctx: { readonly get: (name: string) => unknown },
   content: string,
   description: string,
 ): boolean {
-  const found = ctx.get("skills");
-  if (!isSkillsFace(found)) {
-    return false;
-  }
-  found.register({ name: SKILL_NAME, description, content });
-  return true;
+  return registerSkill(ctx, { name: SKILL_NAME, description, content });
 }

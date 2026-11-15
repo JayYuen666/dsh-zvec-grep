@@ -20,6 +20,8 @@
 // 复用，超过 MAX_IDLE_SESSIONS 的旧会话被移出（daemon 侧 30 分钟空闲回收）。这样多个
 // agent 同时检索时不会在客户端串行排队。
 
+import { isRecord } from "@jayyuen66/dsh-plugin-shared/lib/record";
+
 /** 上游缺省监听地址（`zg --server on` 的帮助原文：[–listen 127.0.0.1:7999]）。 */
 export const DEFAULT_DAEMON_URL = "http://127.0.0.1:7999/mcp";
 
@@ -55,10 +57,6 @@ interface PostOutcome {
   readonly status: number;
   readonly sessionId: string | undefined;
   readonly payloads: unknown[];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }
 
 /** 从 SSE 正文收集全部 `data:` 行的 JSON 载荷；解析不了的行（心跳/注释）跳过。 */
