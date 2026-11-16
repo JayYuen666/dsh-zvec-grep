@@ -59,6 +59,7 @@
 - [ Known boundaries](#-known-boundaries)
 - [ FAQ](#-faq)
 - [ Development](#-development)
+- [ Feedback](#feedback)
 - [ License](#-license)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> What it does
@@ -106,7 +107,7 @@ If your profile pins `@jayyuen66/dsh-plugin-shared` with a pnpm `overrides` entr
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> Enabling it in dsh
 
-- `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries a single `- id: zvec-grep` entry with `name: "@jayyuen66/dsh-zvec-grep"` - the **bare package name** is what makes the host scan the client half. The card components are bundled into `client.js` (only `react` / `zod` stay external to the host's module table), so the card does not depend on a second package being loaded. Bundle installation goes through pnpm (>= 12.3.0).
+- `dsh.bundle.patch` points at `cordis.patch.yml`, whose `insert:` block carries a `- id: dsh-plugin-shared` supplier row (keep it enabled; disabling it removes the cards' shared component supply) plus the `- id: zvec-grep` entry with `name: "@jayyuen66/dsh-zvec-grep"` - the **bare package name** is what makes the host scan the client half. The card components come from the shared client row, externalized as `@jayyuen66/dsh-plugin-shared/client`; the host module table provides `react`, `zod` and that shared row. Bundle installation goes through pnpm (>= 12.3.0).
 - A missing injected surface keeps cordis from activating the entry (startup diagnostic: `pending (waiting for service: …)`); a malformed ctx throws `required services … missing` from apply.
 - The two delivery paths - a dshmarket hot-mounted `mkt-*` include and the bundle layer - can resolve to the same module and run `apply` twice in one scope. The second assembly claims a private instance service and stands down with a single `console.warn`; the tools, the prompt section and the `zvecGrepRebuild` namespace stay with the registered copy, and the lock is released when that fiber unloads.
 - The card is registered in the `plugins.bundle.config` slot keyed by the **bundle package name**; the settings namespace and `configForms` reads stay the bare entry id `zvec-grep` (implicit registration by entry id).
@@ -277,6 +278,12 @@ pnpm run check   # typecheck (three tsconfig programs) → lint → both bundle 
 - Coverage is **100%** across four metrics over the opted-in surface (`host.ts` + `lib/**` + the two card-side sources `src/ui-messages.ts` / `src/rebuild-reader.ts`); only the pure browser entry `src/client-entry.ts` stays outside the denominator and is exercised through the bundle.
 - `host.js` / `client.js` are not committed; `prepare` / `prepack` rebuild them and two tests compare the on-disk bundle against an in-memory build byte for byte. Never hand-edit the bundles.
 - Manifest gates (`test/publish-manifest.test.ts`) guard the published surface: entry targets covered by `files`, host packages out of `dependencies`, `dsh-*` pinned exactly, no local paths in artifacts. `test/dist-size.test.ts` budgets bundle bytes; `test/readme-parity.test.ts` keeps both READMEs structurally in sync.
+
+## Feedback
+
+Issues and pull requests are welcome: [https://github.com/JayYuen666/dsh-zvec-grep/issues](https://github.com/JayYuen666/dsh-zvec-grep/issues).
+
+If a plugin fails to boot, include the dsh host version, the profile install shape, and the browser console line. The `missed the module table` line is especially useful: it tells us whether the shared client row was materialized.
 
 ## <img src="https://api.iconify.design/lucide/scale.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> License
 

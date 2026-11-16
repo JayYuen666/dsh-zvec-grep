@@ -432,9 +432,9 @@ describe("发布形态", () => {
 
   it("产物没有本机指涉（绝对路径、pnpm store 布局）", async () => {
     // 注释门读不到产物：rolldown 构建时剥掉源码注释，而 `//#region` 标记里的路径、字符串字面量
-    // 里的本机路径会原样进 tarball。client 半必须把 shared 的产物**内联**（浏览器解析不了
-    // bare说明符），所以它的标记里一度烙着 `node_modules/.pnpm/<名>@<版>_<哈希>/`——那既是安装布局
-    // 外泄，也让同一份源码在不同机器上产出不同字节。
+    // 里的本机路径会原样进 tarball。shared 的客户端行现在外置成 bare 说明符，但本仓仍会内联
+    // 其它构建期依赖；内联模块的标记里一度烙着 `node_modules/.pnpm/<名>@<版>_<哈希>/`——那既是
+    // 安装布局外泄，也让同一份源码在不同机器上产出不同字节。
     const { shipped } = await readSurface();
     const artifacts = [...shipped].filter((file) => isArtifactFile(file)).toSorted();
     expect(artifacts.length, "至少要扫到一枚产物，否则这道门是空转的").toBeGreaterThan(0);

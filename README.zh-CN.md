@@ -59,6 +59,7 @@
 - [ 已知边界](#-已知边界)
 - [ 常见问题](#-常见问题)
 - [ 开发](#-开发)
+- [ 反馈](#反馈)
 - [ 许可](#-许可)
 
 ## <img src="https://api.iconify.design/lucide/shield.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 它做什么
@@ -106,7 +107,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ## <img src="https://api.iconify.design/lucide/plug.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 在 dsh 里启用
 
-- `dsh.bundle.patch` 指向 `cordis.patch.yml`，其 `insert:` 块只有一条 `- id: zvec-grep`、`name: "@jayyuen66/dsh-zvec-grep"`——让宿主扫描 client 半的是**不带子路径的包名**。卡片组件直接打进 `client.js`（只有 `react` / `zod` 外置给宿主模块表），卡片不依赖第二份包被装载。bundle 安装走 pnpm（>= 12.3.0）。
+- `dsh.bundle.patch` 指向 `cordis.patch.yml`，其 `insert:` 块含一条 `- id: dsh-plugin-shared` 供应行（必须保持开启；停用后卡片会失去 shared 组件供应），再加一条 `- id: zvec-grep`、`name: "@jayyuen66/dsh-zvec-grep"`——让宿主扫描 client 半的是**不带子路径的包名**。卡片组件来自 shared 的客户端行，以 `@jayyuen66/dsh-plugin-shared/client` 外置；宿主模块表提供 `react`、`zod` 与这条 shared 供应。bundle 安装走 pnpm（>= 12.3.0）。
 - 缺任一注入宿主服务，cordis 就不激活本条目（启动诊断点名 `pending (waiting for service: …)`）；ctx 形状不对时 apply 抛 `required services … missing`。
 - 两条装载路径——dshmarket 热挂的 `mkt-*` 子树与 bundle 层——可能解析到同一份模块而在同一作用域里跑两遍 `apply`。第二份会抢一把私有实例服务锁并安静让路（只 `console.warn` 一行）；三个工具、提示词段与 `zvecGrepRebuild` 命名空间仍由在册那一份提供，那一份 fiber 卸载时锁自动释放。
 - 卡片注册在 `plugins.bundle.config` 槽的 **bundle 包名**键下；设置命名空间与 `configForms` 的读仍走裸条目 id `zvec-grep`（按条目 id 隐式注册）。
@@ -277,6 +278,12 @@ pnpm run check   # 类型检查（三个 tsconfig 程序）→ lint → 两个 b
 - 覆盖率四项 **100%**，分母是选进来的文件（`host.ts` + `lib/**`，以及卡片侧两个可单测源文件 `src/ui-messages.ts` / `src/rebuild-reader.ts`）；只有纯浏览器入口 `src/client-entry.ts` 在分母外，经 bundle 覆盖。
 - `host.js` / `client.js` 不入库；`prepare` / `prepack` 现产，两条测试拿磁盘产物与内存构建逐字节比。发布物不手改。
 - manifest 门（`test/publish-manifest.test.ts`）守发布清单：入口目标被 `files` 覆盖、宿主包不进 `dependencies`、`dsh-*` 精确钉、产物无本机路径。`test/dist-size.test.ts` 设体积预算，`test/readme-parity.test.ts` 钉两份 README 的结构对等。
+
+## 反馈
+
+欢迎提 issue 和 PR：[https://github.com/JayYuen666/dsh-zvec-grep/issues](https://github.com/JayYuen666/dsh-zvec-grep/issues)。
+
+插件启动失败时，请附上 dsh 宿主版本、profile 安装形态和浏览器控制台原文。`missed the module table` 这一行尤其有用：它能直接说明 shared 客户端供应行有没有被物化。
 
 ## <img src="https://api.iconify.design/lucide/scale.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 许可
 

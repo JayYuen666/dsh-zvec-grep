@@ -23,16 +23,16 @@ const pkgDir = path.join(import.meta.dirname, "..");
 // Windows 支持又加入双档路径归一（lib/platform.ts、win32 的盘符/UNC 与 pwsh 切词）、
 // 会话池与 token 认领，实测 ~282KB；预算按同一口径抬到 310KB。
 const HOST_BUDGET_BYTES = 310_000;
-/** client 半产物体积预算（取实测值加余量后的整数档）。浏览器侧加载，按平台单独计账。 */
-// 设置卡迁到 @jayyuen66/dsh-plugin-shared/lib/card-ui 后，卡片样式与组件逻辑随包进
-// client.js（实测增加约 9 KB），预算按迁移后的实量重定。
-const CLIENT_BUDGET_BYTES = 80_000;
+/** client 半产物体积预算（取实测值加余量后的整数档）。浏览器侧加载，按平台单独计账。
+ *  shared 客户端行改为 external 并开启 minify 后实测 23,818 B；shared card-ui 的字节
+ * 不再计入本产物，按实测 × 1.25 取整重定。 */
+const CLIENT_BUDGET_BYTES = 30_000;
 
 /** 下限：只卡「别超」时，构建异常只写出空文件或残片会让 `bytes <= budget` 永远成立。
- *  取值远低于当期实测（host.js 227,142 B / client.js 65,390 B），正常演进不会撞到；
+ *  取值远低于当期实测（host.js 299,104 B / client.js 23,818 B），正常演进不会撞到；
  *  撞到它就说明产物不是「变快了」而是「变没了」。 */
 const HOST_FLOOR_BYTES = 120_000;
-const CLIENT_FLOOR_BYTES = 40_000;
+const CLIENT_FLOOR_BYTES = 12_000;
 
 /** 产物文件名与「下限 / 上限」的对照。 */
 const BUDGETS: readonly (readonly [string, number, number])[] = [

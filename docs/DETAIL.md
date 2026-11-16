@@ -24,7 +24,7 @@ The card's Rebuild button runs the equivalent of `zg --index --rebuild` for a wo
 
 Eleven deployment values stay off the card: `searchTimeoutMs` (300000), `statusTimeoutMs` (60000), `indexTimeoutMs` (600000), `stdoutMaxBytes` (400000), `rebuildWaitMs` (120000), `clientMode` (`auto` / `direct` / `server`), `daemonUrl` (`http://127.0.0.1:7999/mcp`, the MCP transport's daemon endpoint), `allowRemoteEmbedding` (false), `remoteEmbeddingEndpoint`, `remoteEmbeddingApiKeyFrom`, `requireApprovalForExplicitRoot` (false). None of these eleven has a card control; the only thing that makes them take effect is the `config:` block of the registration row in the next paragraph, and precedence is row `config:` > the `.default()` in code.
 
-Whether workspace content may leave the machine at all is treated as a deployment decision rather than a model-visible choice, which is why the remote-embedding trio appears in neither the card nor the tool parameters; and even when it is enabled, `zg` itself still requires `--allow-remote` (added automatically by this plugin to remote-reference index commands once the deployment switch is on) or a one-time persistent `zg --auth grant`. Set all of these in the `config:` block of this plugin's row in your profile's `cordis.yml` (the `cordis.patch.yml` shipped in this package carries that row's `id` / `name`; the card components are bundled into `client.js`, so no second package entry is needed); they take effect on restart.
+Whether workspace content may leave the machine at all is treated as a deployment decision rather than a model-visible choice, which is why the remote-embedding trio appears in neither the card nor the tool parameters; and even when it is enabled, `zg` itself still requires `--allow-remote` (added automatically by this plugin to remote-reference index commands once the deployment switch is on) or a one-time persistent `zg --auth grant`. Set all of these in the `config:` block of this plugin's row in your profile's `cordis.yml` (the `cordis.patch.yml` shipped in this package carries the `dsh-plugin-shared` supplier row plus that row's `id` / `name`; the card components come from the shared client row, externalized as `@jayyuen66/dsh-plugin-shared/client`); they take effect on restart.
 
 ## What it needs from outside
 
@@ -33,3 +33,9 @@ The external `zg` CLI (`@zvec/zvec-grep`, installed with `npm install -g @zvec/z
 ## Further detail
 
 The error-code table, the argument guards and the background-job surface are in the package README (`README.md` / `README.zh-CN.md`).
+
+## Feedback
+
+Issues and pull requests are welcome: [https://github.com/JayYuen666/dsh-zvec-grep/issues](https://github.com/JayYuen666/dsh-zvec-grep/issues).
+
+If a plugin fails to boot, include the dsh host version, the profile install shape, and the browser console line. The `missed the module table` line is especially useful: it tells us whether the shared client row was materialized.

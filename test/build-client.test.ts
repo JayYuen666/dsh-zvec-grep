@@ -98,10 +98,12 @@ function patchEntryIds(): string[] {
   // 条目层级是结构性的：顶层 `- insert:` 之下，每条条目是 4 空格缩进的 `- id: <裸条目 id>`。
   // 不用 `^\s*`：它在 m 标志下会把任意缩进层级（乃至嵌套子项的 id）都当成条目，
   // patch 结构一加嵌套，bareIds 就会多出条目而误红。
-  return Array.from(
+  const ids = Array.from(
     patch.matchAll(/^ {4}- id:\s+(?<id>\S+)\s*$/gmu),
     (row) => row.groups?.["id"] ?? "",
   );
+  assert.ok(ids.includes("dsh-plugin-shared"), "shared 供应行必须使用固定 id");
+  return ids.filter((id) => id !== "dsh-plugin-shared");
 }
 
 /** 本条目那张表单的官方快照类型（别名要保持**已实例化**，否则每处使用都得再给类型参）。 */
@@ -387,16 +389,13 @@ describe("buildClient()", () => {
     assert.ok(out.includes("locale.register("), "官方 locale 注册面在产物里");
   });
 
-  it("ZgCard 的配置值取自 snap.value 那一层，不是整枚快照", async () => {
-    const out = await buildClient();
+  it("ZgCard 的配置值取自 snap.value 那一层，不是整枚快照", () => {
     // 快照契约是 {status, writable, value: {...}}：把 snap 整个当 value 用时配置读不到，
-    // 卡片只会恒显示默认值，而且一声不响。
-    // 单一判据：只认 snap.value 这一层。三选一兜底几乎永远通过——`.value ?? {}` 与
-    // `[snap.value` 这种片段在无关代码里也很容易命中，卡片改回「整枚快照当 value」时
-    // 只要产物别处恰好有一个 `.value ?? {}` 就仍然通过。
+    // 卡片只会恒显示默认值，而且一声不响。压缩会 mangle 局部变量，判据读源码而不是产物。
+    const source = readFileSync(new URL("../src/client-entry.ts", import.meta.url), "utf8");
     assert.ok(
-      out.includes("snap.value"),
-      "产物应含 snap.value 取用（快照契约 {status, writable, value:{...}}）",
+      source.includes("snap.value"),
+      "源码应含 snap.value 取用（快照契约 {status, writable, value:{...}}）",
     );
   });
 });
@@ -451,10 +450,36 @@ async function loadClientExports(): Promise<{
     if (name === "zod") {
       return { z };
     }
-    // shared 的 `./client` 不再是可满足的请求：卡片组件已内联进产物（build-client.mjs 的
-    // 外置清单只留 react / zod）。工厂真发起这个 require 时按「未知请求」抛出，把外置回流
-    // 挡在这里——宿主页面上的同款失败是启动期的 "missed the module table"
-    // （dsh-ocr-review 仓 issue #2）。
+    if (name === "@jayyuen66/dsh-plugin-shared/client") {
+      // 本用例只验证 apply 的装配；卡片组件不渲染，shared 侧给最小可调用替身。
+      return {
+        CardForm: () => null,
+        Field: () => null,
+        NumberField: () => null,
+        SaveBar: () => null,
+        Section: () => null,
+        SelectField: () => null,
+        TextField: () => null,
+        ToggleField: () => null,
+        diffTouched: () => [],
+        ensureCardUiCss: () => () => {
+          void 0;
+        },
+        errorText: String,
+        splitHint: () => ({}),
+        useInvalidFields: () => ({
+          blocked: false,
+          fields: [],
+          resetToken: 0,
+          reportInvalid: () => {
+            void 0;
+          },
+          clear: () => {
+            void 0;
+          },
+        }),
+      };
+    }
     throw new Error(`unexpected require in client factory: ${name}`);
   });
   const exports = mod as { apply?: unknown; inject?: unknown };

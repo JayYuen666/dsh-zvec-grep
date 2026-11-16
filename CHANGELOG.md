@@ -2,6 +2,10 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.19
+
+将 `@jayyuen66/dsh-plugin-shared` 抬到 `^0.2.10`。设置卡吸底保存条的旧固定 id 冲突与底色随 shared 修复；shared 的 `registerSkill` 在 effect 挂不上时立即撤销注册并回 `false`，本包 skill 不会再在卸载后留在目录里。装载面反转 0.1.14 的内联取舍：`cordis.patch.yml` 显式插入固定 id `dsh-plugin-shared` 的供应行（停用后卡片失去 shared 组件供应），`package.json` 的 `dsh.client.external` 同步声明 `@jayyuen66/dsh-plugin-shared/client`，卡片组件改由 shared 客户端行供应；client bundle 开启 minify，产物 65,390 B → 23,818 B，体积预算按新实量重定。`registerRoutingSkill` 的入参改用 shared 的 `SkillRegistryContext`，让 `effect` 这条撤销权契约进类型。工具面与 grep/rg 门禁行为不变。
+
 ## 0.1.18
 
 market 热挂与 bundle 层双路径装载时第二份 `apply` 整份让路（此前第二遍会撞「同名已注册」把 fiber 打成 failed）；设置卡接「有字段越界就不许保存」那道门禁；卡片样式改用 shared 的共享 `<style>`；shared 抬到 `^0.2.9`，输入框不再撑出容器、小节内补上纵向间距。工具面与 grep/rg 门禁的行为一字未变。

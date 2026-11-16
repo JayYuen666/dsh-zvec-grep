@@ -24,7 +24,7 @@
 
 十一项部署值刻意不进设置卡：`searchTimeoutMs`（300000）、`statusTimeoutMs`（60000）、`indexTimeoutMs`（600000）、`stdoutMaxBytes`（400000）、`rebuildWaitMs`（120000）、`clientMode`（`auto` / `direct` / `server`）、`daemonUrl`（`http://127.0.0.1:7999/mcp`，MCP 传输的守护进程端点）、`allowRemoteEmbedding`（false）、`remoteEmbeddingEndpoint`、`remoteEmbeddingApiKeyFrom`、`requireApprovalForExplicitRoot`（false）。这十一项在卡上没有入口，能生效的只有下一段那条注册行 `config:`；优先级是注册行 `config:` > 代码里的 `.default()`。
 
-「工作区内容能不能离开本机」被当成部署决定，而不是给模型选的开关，所以远程嵌入那三枚既不在卡上也不在工具参数里；即便开了，`zg` 自己仍要求 `--allow-remote`（部署开放后本插件在远程引用的索引命令上自动补）或一次 `zg --auth grant` 持久授权。这些值都写在**自己 profile 的 `cordis.yml`** 里本插件注册行的 `config:` 块（随包那份 `cordis.patch.yml` 带本行的 `id` / `name`；卡片组件已打进 `client.js`，不需要第二条包条目），改值随重启生效。
+「工作区内容能不能离开本机」被当成部署决定，而不是给模型选的开关，所以远程嵌入那三枚既不在卡上也不在工具参数里；即便开了，`zg` 自己仍要求 `--allow-remote`（部署开放后本插件在远程引用的索引命令上自动补）或一次 `zg --auth grant` 持久授权。这些值都写在**自己 profile 的 `cordis.yml`** 里本插件注册行的 `config:` 块（随包那份 `cordis.patch.yml` 带 `dsh-plugin-shared` 供应行与本行的 `id` / `name`；卡片组件来自 shared 客户端行，以 `@jayyuen66/dsh-plugin-shared/client` 外置），改值随重启生效。
 
 ## 需要外部提供什么
 
@@ -33,3 +33,9 @@
 ## 更完整的说明
 
 参数守卫、`root`判据与后台作业那一节都写在随包 README（`README.md` / `README.zh-CN.md`）。README 没有独立的错误码表：`zg` 不在 PATH 上按 `exit 127` 归到「未安装」（见「外部依赖」一节），其余失败按工具回执里的 `reason` 读。
+
+## 反馈
+
+欢迎提 issue 和 PR：[https://github.com/JayYuen666/dsh-zvec-grep/issues](https://github.com/JayYuen666/dsh-zvec-grep/issues)。
+
+插件启动失败时，请附上 dsh 宿主版本、profile 安装形态和浏览器控制台原文。`missed the module table` 这一行尤其有用：它能直接说明 shared 客户端供应行有没有被物化。
