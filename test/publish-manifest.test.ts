@@ -85,6 +85,9 @@ const SKIP_DIRS = new Set([
   "__tests__",
   // 角色文档库：那里的日期是内容（例如下一份威胁报告的时间线）。
   "agents",
+  // BMad 工作流工件（计划书/代理输出）：frontmatter 的 created 日期是元数据，不是注释噪音。
+  "_bmad",
+  "_bmad-output",
 ]);
 
 /** package.json 里与入口有关的形状；其余字段本门禁不关心。 */

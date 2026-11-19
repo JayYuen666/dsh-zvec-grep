@@ -13,6 +13,7 @@ import path from "node:path";
 import {
   startHost,
   installEnvDumpZg,
+  installDaemonStartZg,
   zgAvailable,
   TEST_EMBEDDING,
   drainCleanups,
@@ -146,6 +147,106 @@ describe("真实宿主：凭据经环境变量下发到 zg 子进程", () => {
       const env = readEnv(dump);
       assert.equal(env["ZVEC_GREP_ENDPOINT"], null);
       assert.equal(env["ZVEC_GREP_API_KEY"], null);
+    } finally {
+      restore();
+      await host?.dispose();
+    }
+  }, 60_000);
+});
+
+// 0.1.20 会话沙箱策略（plan-fix-shell-sandbox-session-policy）：CLI 通道 shell.resolve 的
+// 请求要带上 `sandboxPolicy`，且 workspace 根随**会话 cwd** 走（否则部署默认策略把 zg
+// 子进程圈成只读，写 .zvec-grep/locks 直接 os error 30）。两条都在官方件全链路上钉：
+// 服务在场 → 请求里看得到会话根；服务缺席 → 不带字段、行为与从前一致。同样用假 zg，
+// 与机器上装没装真 zg 无关。
+describe("真实宿主：会话沙箱策略随请求下发", () => {
+  const cleanups: Cleanups = [];
+
+  afterAll(() => {
+    drainCleanups(cleanups);
+  });
+
+  it("sandboxPolicy 服务在场 → 请求带策略，workspace 根等于会话 cwd", async () => {
+    const dump = dumpFile(cleanups);
+    const restore = installEnvDumpZg(dump);
+    let host: Host | undefined;
+    try {
+      host = await startHost({ sandboxPolicy: true });
+      const ws = workspace(cleanups);
+      const outcome = await host.call("zg_status", {}, host.agentOf(ws));
+      assert.ok(!outcome.isError, host.textOf(outcome));
+      // 版本/就绪探测（`zg --version`、`zg --server ...`）按 plan 刻意不带策略：只断
+      // 真正的状态命令 `zg --status`。
+      const call = host.shellCalls.find((row) => row.request.command.startsWith("zg --status"));
+      assert.ok(call !== undefined, "至少要有一条 zg --status 命令");
+      const policy: unknown = call.request.sandboxPolicy;
+      assert.ok(typeof policy === "object" && policy !== null, "请求要带 sandboxPolicy");
+      const { mode, workspaceRoot } = policy as { mode?: string; workspaceRoot?: string };
+      assert.equal(mode, "workspace-write");
+      assert.equal(workspaceRoot, ws);
+      // 反向钉住：版本/就绪两类**纯读探测**刻意不带策略（tmpdir 只读探测、TTL 缓存跨会话
+      // 共享，带上反而把策略钉进缓存键语义之外）——即便服务在场。
+      const probes = host.shellCalls.filter(
+        (row) =>
+          row.request.command.startsWith("zg --version") ||
+          row.request.command.startsWith("zg --server status"),
+      );
+      assert.ok(probes.length > 0, "探测命令至少出现一条");
+      for (const probe of probes) {
+        assert.strictEqual(probe.request.sandboxPolicy, undefined);
+      }
+    } finally {
+      restore();
+      await host?.dispose();
+    }
+  }, 60_000);
+
+  it("服务缺席 → 不带字段，命令照常执行（降级不报错）", async () => {
+    const dump = dumpFile(cleanups);
+    const restore = installEnvDumpZg(dump);
+    let host: Host | undefined;
+    try {
+      host = await startHost();
+      const ws = workspace(cleanups);
+      const outcome = await host.call("zg_status", {}, host.agentOf(ws));
+      assert.ok(!outcome.isError, host.textOf(outcome));
+      const call = host.shellCalls.find((row) => row.request.command.startsWith("zg --status"));
+      assert.ok(call !== undefined, "至少要有一条 zg --status 命令");
+      assert.strictEqual(call.request.sandboxPolicy, undefined);
+    } finally {
+      restore();
+      await host?.dispose();
+    }
+  }, 60_000);
+
+  it("daemon 拉起（zg --server on）不带策略：Landlock 进程不可逆，单例 daemon 不能被某个会话的边界圈住", async () => {
+    const restore = installDaemonStartZg();
+    let host: Host | undefined;
+    try {
+      // transport=mcp + 就绪探测恒失败 ⇒ 索引通道检索自启 daemon（zg --server on 成功、
+      // 再探仍未就绪 ⇒ daemonStartFailed）。工作区用手工 manifest 冒充「已建索引」
+      // （indexProbe 只看 .zvec-grep/manifest.json 的 recordedPath 覆盖），免去真 zg +
+      // embedding 的建索引成本。本条只断言拉起那条 resolve 请求的形状，检索结局不在断言里。
+      const ws = workspace(cleanups);
+      mkdirSync(path.join(ws, ".zvec-grep"), { recursive: true });
+      writeFileSync(
+        path.join(ws, ".zvec-grep", "manifest.json"),
+        JSON.stringify({ indexVersion: 2, sourceRoot: { recordedPath: ws } }),
+      );
+      host = await startHost({
+        sandboxPolicy: true,
+        config: { transport: "mcp", daemonUrl: "http://127.0.0.1:9/mcp" },
+      });
+      // 检索结局（daemonStartFailed 等）不在断言里，但要等待它落定：拉起请求已在此前发生。
+      const outcome = await host.call("zg_search", { query: "hi" }, host.agentOf(ws));
+      void host.textOf(outcome);
+      const start = host.shellCalls.find((row) => row.request.command.startsWith("zg --server on"));
+      assert.ok(start !== undefined, "transport=mcp 且 daemon 缺席时要有一条 zg --server on");
+      assert.strictEqual(
+        start.request.sandboxPolicy,
+        undefined,
+        "daemon 拉起刻意不带会话策略（用户侧决策）",
+      );
     } finally {
       restore();
       await host?.dispose();

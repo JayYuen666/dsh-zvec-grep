@@ -2,6 +2,17 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.20
+
+修复会话内 zg 子进程被宿主沙箱圈成只读的问题。此前本包所有 `shell.resolve` 都不带 `sandboxPolicy`，执行器回落到无会话的部署默认策略——workspace 写边界是 web 宿主进程的 cwd，而不是发起会话的工作区；zg 在 Landlock 下变只读，写 `.zvec-grep/locks/write-intent` 直接 `Read-only file system (os error 30)`，`zg_search` / `zg_status` 恒失败、grep/rg 门禁随之死锁。
+
+### Added
+
+- **会话沙箱策略随 CLI 请求下发**：`PluginRuntime.sandboxPolicyOf(exec)` 在每次工具执行时现读 `host.get("sandboxPolicy")`（官方 `SandboxPolicyService`，不缓存引用——服务可热替换），有会话时 `resolve({session})` 得到以会话 cwd 为 workspace-write 边界的策略，随 `shell.resolve` 的 `sandboxPolicy` 字段下发（对照官方 bash 工具的回落链 `sandboxPolicy: request.sandboxPolicy ?? ctx.sandboxPolicy.resolve()`）。三条 CLI 路径全部接上：`zg_search`、`zg_status`、`zg_index`（前台与模型侧后台索引——`spawnIndexWrite` 增可选参）。版本/就绪探测（tmpdir 只读探测，TTL 缓存跨会话共享）、daemon 拉起与设置卡重建路径刻意不带（用户决策：mcp 档维持现状，卡路径由 additionalWritableRoots 缓解）。
+- **降级不抛错**：服务缺席、执行无会话、或 `resolve` 抛 `SandboxInvalidRootError` 时都不带字段照常执行（检索可用性优先于策略精确性），降级事实经新文案 `sandboxPolicyDegradedNote`（中英）作为成功结果尾注出现。
+- **测试**：`test/host.test.ts` 新 describe「会话沙箱策略」6 条（带策略/服务缺席/抛错降级尾注/无会话/后台索引，以及 resolve 抛**非 Error**（裸字符串）时 `String()` 分支的降级注用例）；`test/integration/shell-facts.test.ts` 新 describe 3 条（官方 SandboxPolicyService 在场 → 请求里 `workspaceRoot` 等于会话 cwd 且纯读探测不带；缺席 → 不带字段行为不变；daemon 拉起 `zg --server on` 刻意不带——配 `host-stack.ts` 的 `installDaemonStartZg` 夹具与 `sandboxPolicy` 装载选项、`agentOf` 会话替身补 `snapshotEvents` 最小面）；`test/integration/rebuild-endpoints.test.ts` 在设置卡重建用例里加负断言：服务在场时该路径的 spawn 仍不带策略。
+- devDependencies 增 `@deepseek-ai/dsh-sandbox-policy: 0.2.2-rc.2`（type-only 引用，产物零运行时依赖）。
+
 ## 0.1.19
 
 将 `@jayyuen66/dsh-plugin-shared` 抬到 `^0.2.10`。设置卡吸底保存条的旧固定 id 冲突与底色随 shared 修复；shared 的 `registerSkill` 在 effect 挂不上时立即撤销注册并回 `false`，本包 skill 不会再在卸载后留在目录里。装载面反转 0.1.14 的内联取舍：`cordis.patch.yml` 显式插入固定 id `dsh-plugin-shared` 的供应行（停用后卡片失去 shared 组件供应），`package.json` 的 `dsh.client.external` 同步声明 `@jayyuen66/dsh-plugin-shared/client`，卡片组件改由 shared 客户端行供应；client bundle 开启 minify，产物 65,390 B → 23,818 B，体积预算按新实量重定。`registerRoutingSkill` 的入参改用 shared 的 `SkillRegistryContext`，让 `effect` 这条撤销权契约进类型。工具面与 grep/rg 门禁行为不变。

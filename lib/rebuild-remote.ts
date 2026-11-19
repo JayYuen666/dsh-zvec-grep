@@ -34,7 +34,7 @@ import type {
   JobStatus,
   JobView,
 } from "@deepseek-ai/dsh-jobs";
-import type { ShellExecution, ShellExecutor } from "@deepseek-ai/dsh-shell";
+import type { ShellExecution, ShellExecRequest, ShellExecutor } from "@deepseek-ai/dsh-shell";
 import type { TimerService } from "@deepseek-ai/cordis-plugin-timer";
 import { errorText } from "@jayyuen66/dsh-plugin-shared/lib/errors";
 import { jobOutcomeOf } from "@jayyuen66/dsh-plugin-shared/lib/job-outcome";
@@ -583,6 +583,9 @@ function rebuildJobSpec(options: {
  * @param started 本次请求语言的文案表
  * @param indexArgs 已归一 root 的索引入参
  * @param embedding 设置里的默认 embedding（`indexArgs.embedding` 为空时用它）
+ * @param sandboxPolicy 发起方的会话沙箱策略（0.1.20）：模型侧后台索引传它让写边界跟会话
+ *   cwd 走；设置卡那条重建路径不传（用户侧决策：卡路径由 additionalWritableRoots 缓解，
+ *   见 plan-fix-shell-sandbox-session-policy）。undefined = 不带字段，回落宿主默认链。
  * @returns 起来的进程与它跑的命令；失败为 `{ error, status }`
  */
 export async function spawnIndexWrite(
@@ -590,6 +593,7 @@ export async function spawnIndexWrite(
   started: ZvecGrepMessages,
   indexArgs: IndexArgs,
   embedding: string,
+  sandboxPolicy?: ShellExecRequest["sandboxPolicy"],
 ): Promise<
   { proc: ShellExecution; command: string } | { error: string; status: RebuildRefusedStatus }
 > {
@@ -626,6 +630,7 @@ export async function spawnIndexWrite(
       onExpiry: "none",
       stdoutMaxBytes: config.stdoutMaxBytes,
       ...(env ? { env } : {}),
+      ...(sandboxPolicy ? { sandboxPolicy } : {}),
     });
     spawned = { proc: await host.shell.execute(spec), command: built.command };
   } catch (error) {

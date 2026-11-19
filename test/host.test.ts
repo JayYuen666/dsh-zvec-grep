@@ -382,6 +382,8 @@ interface ResolveRequest {
   stdoutMaxBytes?: number;
   onExpiry?: string;
   env?: Record<string, string>;
+  /** 0.1.20 会话沙箱策略：由 sandboxPolicyOf 按每次执行现取后随请求带给 shell.resolve。 */
+  sandboxPolicy?: unknown;
 }
 
 interface ShellMock {
@@ -2657,6 +2659,141 @@ describe("zg_search 执行", () => {
       `HITS\n${fill(MESSAGES.zh.stderrNote, { marked: "", tail: bareTail.slice(1) })}`,
     );
     assert.equal(out.text.isWellFormed(), true, "成功结果含孤立代理 ⇒ 该会话后续请求全废");
+  });
+});
+
+// 0.1.20 会话沙箱策略：zg 子进程的 workspace-write 边界要跟会话 cwd 走（否则被宿主默认
+// 策略圈成只读，写 .zvec-grep/locks 直接 os error 30）。三条边界都在这里钉住：
+// 服务在场+有会话 → 带策略；服务缺席 / 无会话 / resolve 抛错 → 不带字段并照常出结果。
+describe("会话沙箱策略", () => {
+  let root: string;
+  beforeAll(() => {
+    root = wsForSuite("zvec-sandbox-");
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("服务在场且有会话 → 策略随请求带给 shell.resolve，服务收到的是该次会话", async () => {
+    const ctx = makeCtx();
+    const resolved: unknown[] = [];
+    const policy = { mode: SANDBOX_WORKSPACE_WRITE, workspaceRoot: root };
+    ctx.services["sandboxPolicy"] = {
+      resolve: (request: { session?: unknown }) => {
+        resolved.push(request.session);
+        return policy;
+      },
+    };
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const exec = execOf(root, "sess-policy");
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, exec);
+    assert.equal(ctx.shell.resolveCalls.length, 1);
+    assert.strictEqual(ctx.shell.resolveCalls[0]?.sandboxPolicy, policy, "策略要原样进请求");
+    assert.equal(resolved.length, 1, "每次执行现取，不缓存");
+    assert.strictEqual(
+      resolved[0],
+      (exec as { agent: { session: unknown } }).agent.session,
+      "resolve 收到的就是这次执行的会话对象",
+    );
+    assert.deepEqual(out, { text: "RESULT" });
+  });
+
+  it("服务缺席（宿主没装 sandboxPolicy）→ 不带字段、不报错，行为与从前一致", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.equal(ctx.shell.resolveCalls.length, 1);
+    assert.strictEqual(
+      ctx.shell.resolveCalls[0]?.sandboxPolicy,
+      undefined,
+      "服务缺席 ⇒ 不带 sandboxPolicy 字段",
+    );
+    assert.deepEqual(out, { text: "RESULT" });
+  });
+
+  it("resolve 抛错 → 降级不带字段，成功尾部注明降级事实", async () => {
+    const ctx = makeCtx();
+    ctx.services["sandboxPolicy"] = {
+      resolve: () => {
+        throw new Error("cwd is not absolute");
+      },
+    };
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.strictEqual(ctx.shell.resolveCalls[0]?.sandboxPolicy, undefined, "抛错 ⇒ 降级不带字段");
+    assert.ok(
+      out.text.endsWith(
+        fill(MESSAGES.zh.sandboxPolicyDegradedNote, { detail: "cwd is not absolute" }),
+      ),
+      "降级事实要作为成功尾注出现",
+    );
+    assert.ok(out.text.startsWith("RESULT"), "检索结果照常交回");
+  });
+
+  it("resolve 抛的不是 Error（如裸字符串）→ detail 走 String() 那一支，降级照常", async () => {
+    const ctx = makeCtx();
+    ctx.services["sandboxPolicy"] = {
+      resolve: () => {
+        // oxlint-disable-next-line eslint/no-throw-literal, typescript/only-throw-error -- 故意抛裸字符串：钉 catch 里 String(error) 那一支分支
+        throw "boom";
+      },
+    };
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.strictEqual(ctx.shell.resolveCalls[0]?.sandboxPolicy, undefined);
+    assert.ok(
+      out.text.endsWith(fill(MESSAGES.zh.sandboxPolicyDegradedNote, { detail: "boom" })),
+      "非 Error 抛出物也要 stringify 进降级注",
+    );
+  });
+
+  it("无会话执行（服务在场）→ 同样不带字段", async () => {
+    const ctx = makeCtx();
+    let calls = 0;
+    ctx.services["sandboxPolicy"] = {
+      resolve: () => {
+        calls += 1;
+        return { mode: "read-only" };
+      },
+    };
+    applyTo(ctx);
+    trackRoot(ctx, root);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf());
+    assert.strictEqual(
+      ctx.shell.resolveCalls[0]?.sandboxPolicy,
+      undefined,
+      "agentless 执行没有会话 ⇒ 不带字段",
+    );
+    assert.equal(calls, 0, "无会话时根本不去 resolve");
+  });
+
+  it("模型侧后台 zg_index → spawn 请求同样带策略", async () => {
+    const ctx = makeCtx();
+    const policy = { mode: SANDBOX_WORKSPACE_WRITE, workspaceRoot: root };
+    ctx.services["sandboxPolicy"] = { resolve: () => policy };
+    applyTo(ctx);
+    const bgRoot = bareWs("bg-sandbox");
+    await toolOf(ctx, "zg_index").execute(
+      { root: bgRoot, confirm: true, background: true },
+      execOf(bgRoot),
+    );
+    assert.equal(ctx.shell.resolveCalls.length, 1, "只起一条 zg");
+    assert.equal(
+      ctx.shell.resolveCalls[0]?.sandboxPolicy,
+      policy,
+      "后台索引进程的写边界也要跟会话走",
+    );
+    assert.equal(ctx.shell.resolveCalls[0].onExpiry, "none", "后台路径要无界执行");
   });
 });
 
