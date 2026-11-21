@@ -36,8 +36,11 @@ import {
   WINDOW_MAX,
 } from "../lib/limits.ts";
 import {
+  Callout,
   CardForm,
   Field,
+  FieldTwoCol,
+  LogPanel,
   NumberField,
   SaveBar,
   Section,
@@ -94,11 +97,7 @@ const NS: LocaleNs = "zvec-grep";
 const BUNDLE_PKG = "@jayyuen66/dsh-zvec-grep";
 /** 重建轮询间隔（宿主后台进程，2s 足够跟上 zg 的进度输出）。 */
 const REBUILD_POLL_MS = 2000;
-const CARD_CSS = [
-  ".zgc-rebuildInput{flex:1 1 240px;min-width:0}",
-  ".zgc-output{font-size:12px;line-height:1.6;color:var(--dsw-alias-label-secondary,inherit);white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;background:var(--dsw-alias-fill-primary,transparent);border:1px solid var(--dsw-alias-border-l2);border-radius:6px;padding:8px;margin-top:8px}",
-  ".zgc-error{font-size:12px;color:var(--dsw-alias-text-danger,#d33);margin-top:8px}",
-].join("\n");
+const CARD_CSS = [".zgc-rebuildInput{flex:1 1 240px;min-width:0}"].join("\n");
 
 const BACKENDS: readonly LocalEmbeddingBackend[] = ["llama-cpp", "transformers-js", "model2vec"];
 
@@ -285,7 +284,13 @@ function buildModelSection(deps: CardDeps): ReactNode {
       setField("defaultLimit", next);
     },
   });
-  return createElement(Section, { title: t("modelSection") }, embedding, limit);
+  // 计数徽章随字段增减维护。
+  return createElement(
+    Section,
+    { title: t("modelSection"), count: t("fieldCount", { count: "2" }) },
+    embedding,
+    limit,
+  );
 }
 
 /** 重建行：root 输入（白名单候选进 <datalist>）+ 触发按钮（在跑时禁用）。 */
@@ -343,20 +348,26 @@ function buildDaemonNote(deps: CardDeps): ReactNode | null {
   return createElement("p", { className: "dsu-hint" }, t(key));
 }
 
-/** 重建状态节点：phase 非 idle 才出现；done 且无输出时给一句「已完成」。 */
+/** 重建状态节点：phase 非 idle 才出现；错误走警示条，进度/回执走日志面板。 */
 function buildRebuildStatusRow(deps: CardDeps): ReactNode | null {
   const { rebuild, t } = deps;
   if (rebuild.phase === "idle") {
     return null;
   }
-  const displayClass = rebuild.phase === "error" ? "zgc-error" : "zgc-output";
+  if (rebuild.phase === "error") {
+    return createElement(Callout, { tone: "err" }, rebuild.output);
+  }
   let displayText: string;
   if (rebuild.output === "") {
     displayText = rebuild.phase === "done" ? t("rebuildDone") : "";
   } else {
     displayText = rebuild.output;
   }
-  return createElement("div", { className: displayClass }, displayText);
+  return createElement(
+    LogPanel,
+    { label: t("rebuildStatusTitle"), tone: rebuild.phase === "done" ? "ok" : "mute" },
+    displayText,
+  );
 }
 
 /** 网络与索引小节：传输三档、镜像地址、search-first 开关、配额与时效、工作区重建与守护进程状态。 */
@@ -435,12 +446,12 @@ function buildIndexSection(deps: CardDeps): ReactNode {
   });
   return createElement(
     Section,
-    { title: t("indexSection") },
+    { title: t("indexSection"), count: t("fieldCount", { count: "5" }) },
     transport,
     endpoint,
     enforce,
-    budget,
-    window,
+    // 并发预算与解锁窗口是两个数字，按设计稿双列成对。
+    createElement(FieldTwoCol, null, budget, window),
     buildDaemonNote(deps),
     buildRebuildField(deps),
     buildRebuildStatusRow(deps),

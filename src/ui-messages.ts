@@ -36,6 +36,8 @@ export interface UiMessages {
 
   /** 小节标题：「检索模型」「网络与索引」。 */
   readonly modelSection: string;
+  /// 表单小节标题旁的字段计数徽章（{count} 为字段数）。
+  readonly fieldCount: string;
   readonly indexSection: string;
   /** 数字输入里的单位后缀。 */
   readonly unitResults: string;
@@ -99,6 +101,8 @@ export interface UiMessages {
   readonly rebuildRunning: string;
   /** 重建成功且无输出时的提示。 */
   readonly rebuildDone: string;
+  /** 重建状态面板的头部标题（进度/回执正文见下方各态文案）。 */
+  readonly rebuildStatusTitle: string;
   /** 点下重建后的首帧提示。 */
   readonly rebuildStarting: string;
   /** 重建进程被终止。 */
@@ -188,6 +192,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     invalidFields: "有字段超出范围，先修正或撤销后再保存。",
     saveRejected: "保存被宿主拒绝（配置校验未通过或写入被跳过），修改未生效",
     modelSection: "检索模型",
+    fieldCount: "{count} 字段",
     indexSection: "网络与索引",
     unitResults: "条",
     unitTimes: "次",
@@ -226,6 +231,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildButton: "重建索引（动作，点击即执行）",
     rebuildRunning: "重建中…",
     rebuildDone: "重建完成",
+    rebuildStatusTitle: "重建作业",
     rebuildStarting: "正在后台重建索引…（首次会下载 embedding 模型，可能较慢）",
     rebuildKilled: "重建进程被终止",
     rebuildFailed: "重建作业被宿主注册表判定失败（没拿到进程退出码）",
@@ -253,6 +259,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     saveRejected:
       "save rejected by host (validation failed or write skipped) — changes not applied",
     modelSection: "Retrieval model",
+    fieldCount: "{count} fields",
     indexSection: "Network and index",
     unitResults: "hits",
     unitTimes: "times",
@@ -302,6 +309,7 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildButton: "Rebuild index (action, runs on click)",
     rebuildRunning: "rebuilding…",
     rebuildDone: "rebuild finished",
+    rebuildStatusTitle: "rebuild job",
     rebuildStarting:
       "Rebuilding in the background… (the first run downloads the embedding model and may be slow)",
     rebuildKilled: "the rebuild process was terminated",

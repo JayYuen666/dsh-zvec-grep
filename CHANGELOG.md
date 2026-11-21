@@ -2,6 +2,17 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.20
+
+宿主基线抬到 `0.2.2-rc.5`；daemon token 的原子落盘换官方件；上游 zg 0.3.1 的密钥跳过行为对齐。
+
+### Changed
+
+- **宿主依赖线抬到 `0.2.2-rc.5`**：devDependencies 全族精确钉 rc.5，`engines.dsh` 与 dsh 家族 peer 同一条窗口；shared 经 catalog 抬到 `^0.2.12`，`pnpm-lock.yaml` 经 `pnpm install --lockfile-only` 重解到 registry 现量；devDependencies 补 `react-dom`（`^19.3.0`，与 react 相邻）——shared 0.2.12 的 card-ui 经 `createPortal` 引 `react-dom`，客户端测试经 ESM 链解析到它（与 danger-guard / dir-prep / session-rescue 的既有供应同形）。两份 README 的支持窗口徽章同步。
+- **`persistToken` 的原子替换换官方 `writeFileAtomic`**（devDependencies 加 `dsh-atomic-write`，peer 同窗口，产物保持裸说明符）：`wx` 独占创建保证新建 inode 必带 0600、随机后缀临时件、失败自带临时件清理、win32 对瞬态 rename 错误退避重试。「失败不外抛、返 boolean」的降级契约由本函数这一层保持——官方件抛错，写不进去时本会话仍用内存 token，恢复退化为 daemonStartFailed 的指引（变异验证：摘掉吞错层，失败路径用例当场红）。
+- **上游 zg 0.3.1 的密钥跳过行为对齐**：0.3.0 默认把 binary/unsupported 两类都挡在索引外，0.3.1 实测只跳 `secret.pem`（binary），未知扩展名的 `.P12` 已随正常源码收进索引——插件的排除规则（README 密钥清单，含大小写不敏感的 `*.p12`）回到唯一防线，e2e 用例按 0.3.1 的实测行为改写（两种开关都真建索引、真检索对质）。
+- **rebuild-reader 的 `RemoteHost` / `isRemoteMounter` 收编 shared `./lib/typert-client`**（七仓逐字副本的正主）。
+
 ## 0.1.19
 
 将 `@jayyuen66/dsh-plugin-shared` 抬到 `^0.2.10`。设置卡吸底保存条的旧固定 id 冲突与底色随 shared 修复；shared 的 `registerSkill` 在 effect 挂不上时立即撤销注册并回 `false`，本包 skill 不会再在卸载后留在目录里。装载面反转 0.1.14 的内联取舍：`cordis.patch.yml` 显式插入固定 id `dsh-plugin-shared` 的供应行（停用后卡片失去 shared 组件供应），`package.json` 的 `dsh.client.external` 同步声明 `@jayyuen66/dsh-plugin-shared/client`，卡片组件改由 shared 客户端行供应；client bundle 开启 minify，产物 65,390 B → 23,818 B，体积预算按新实量重定。`registerRoutingSkill` 的入参改用 shared 的 `SkillRegistryContext`，让 `effect` 这条撤销权契约进类型。工具面与 grep/rg 门禁行为不变。

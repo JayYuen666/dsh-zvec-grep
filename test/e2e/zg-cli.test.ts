@@ -558,13 +558,18 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     );
   }, 120_000);
 
-  it("0.3.0 默认跳过密钥文件（binary/unsupported），插件的排除规则是双保险", async () => {
+  it("0.3.1 默认只跳过 .pem（binary），未知扩展名的 .P12 已收进索引——插件的排除规则回到唯一防线", async () => {
     // 0.2.2 实测：`.pem`/`.P12` 照样 `3 scanned, 3 added` 进索引，插件的 --iglob 排除是
     // **唯一**防线。0.3.0 实测（--debug 的 Index diagnostics 原文）：`secret.pem`/`cert.pem`
     // 记 `reason:"binary"`（格式目录把 Pem 归 Binary，text-only 索引直接跳过），
     // `id_rsa`/`secret.P12` 记 `reason:"unsupported"`（无/未知扩展名不识别格式，同样跳过）
-    // ——上游默认就把本包排除清单的全部对象挡在索引外。规则保留为双保险：两种开关下
-    // 都取不回来，正常源码照常可检索。
+    // ——那一版上游默认替本包挡了一道。0.3.1 实测（同法取 diagnostics 原文）：
+    // `secret.pem` 仍记 `reason:"binary"` 跳过，但 `secret.P12` 不再有 unsupported 那一档，
+    // `files 2 scanned, 2 added` 把它和正常源码一起收进索引——上游默认防线对未知扩展名
+    // 这一类失效，插件的排除规则（README 的密钥清单，含大小写不敏感的 `*.p12`）是
+    // **唯一**防线。两种开关都真建索引、真检索对质；密钥排除只挂在索引命令
+    // （lib/cli.ts 的 pushIndexGlobs），检索通道不带它，所以 bare 模式下索引进了
+    // 什么就检索得到什么。
     const secretName = "secret.pem";
     const secretMarker = "ZZSECRETP EMLINE";
     const mixedName = "secret.P12";
@@ -595,11 +600,16 @@ describe.skipIf(!indexSuiteReady)("点对点：索引检索的输出形状与摘
     }
 
     const bare = await indexSecrets(false);
-    // 上游默认（排除关着）就不收密钥文件：回执只有正常源码那一枚（`1 scanned, 1 added`）。
-    expect(bare.receipt).toContain("1 scanned, 1 added");
+    // 上游默认（排除关着）：正常源码 + secret.P12 两枚进索引（0.3.1 起；0.3.0 是 1 枚）。
+    expect(bare.receipt).toContain("2 scanned, 2 added");
+    // 进了索引就真检索得到：.P12 的正文在 bare 模式下可取回（上游不再替本包挡）。
+    await expect(searchLiteral(bare.dir, mixedMarker)).resolves.toContain(mixedName);
+    // .pem 仍被上游按 binary 跳过：bare 模式也取不回。
+    await expect(searchLiteral(bare.dir, secretMarker)).resolves.not.toContain(secretName);
 
     const guarded = await indexSecrets(true);
-    // 排除开着（本包默认）：同样取不回来，正常源码仍在 —— 规则是双保险，不是死规则。
+    // 排除开着（本包默认）：两枚密钥都进不了索引，只剩正常源码一枚——规则是唯一防线，不是死规则。
+    expect(guarded.receipt).toContain("1 scanned, 1 added");
     await expect(searchLiteral(guarded.dir, secretMarker)).resolves.not.toContain(secretName);
     await expect(searchLiteral(guarded.dir, mixedMarker)).resolves.not.toContain(mixedName);
     await expect(searchLiteral(guarded.dir, AUTH_QUERY)).resolves.toContain(AUTH_TS_NAME);

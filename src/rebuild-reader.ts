@@ -22,6 +22,8 @@ import type {
   TypertCodec,
 } from "@deepseek-ai/dsh-typert-protocol";
 import { isRecord } from "@jayyuen66/dsh-plugin-shared/client";
+import { isRemoteMounter } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
+import type { RemoteHost } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
 import { z } from "zod";
 
 import type {
@@ -33,6 +35,10 @@ import type {
 } from "../lib/rebuild-shape.ts";
 
 import { REBUILD_REMOTE_NAMESPACE } from "../lib/rebuild-shape.ts";
+/** 客户端上下文里本模块用到的那一位：**显式读取**一个可选服务（见文件头为什么不用
+ *  inject）。正主在 shared `./lib/typert-client`（含 isRemoteMounter，七份逐字副本收编）。
+ *  再导出放在 import 块之后：夹在中间会让后续 import 被判「不在文件顶部」。 */
+export type { RemoteHost } from "@jayyuen66/dsh-plugin-shared/lib/typert-client";
 
 const REBUILD_NAMESPACE = REBUILD_REMOTE_NAMESPACE;
 
@@ -130,25 +136,12 @@ export const REBUILD_DESCRIPTORS: readonly InvocationDescriptor[] = [
   },
 ];
 
-/** 客户端上下文里本模块用到的那一位：**显式读取**一个可选服务（见文件头为什么不用 inject）。 */
-export interface RemoteHost {
-  get?: (name: string, strict?: boolean) => unknown;
-}
-
 /** 读取器抛出文案的来源：由卡片入口按当前 locale 现取，读取器本身不绑定语言。 */
 export interface RebuildReaderMessages {
   /** `remote` 服务缺席（可选服务未装）。 */
   readonly remoteMissing: () => string;
   /** 挂载后读不到命名空间服务键：入参是 `remote.<namespace>`。 */
   readonly namespaceMissing: (serviceKey: string) => string;
-}
-
-/** 官方网关的客户端宿主服务：本卡只用 `$mount` 一位（挂载一枚手写贡献）。 */
-interface RemoteMounter {
-  $mount: (contribution: {
-    package: string;
-    descriptors: readonly InvocationDescriptor[];
-  }) => Promise<unknown>;
 }
 
 /** 挂载后由网关提供的命名空间宿主服务（方法名 = descriptor.method，位置参数）。 */
@@ -164,10 +157,6 @@ export interface RebuildReader {
   rebuild: (root: string) => Promise<RebuildStartResult & { ok: true }>;
   status: (jobId: string) => Promise<Record<string, unknown>>;
 }
-
-/** 这个值能当远程通道用吗（只核我们要调的那一位；服务来自别的实现或版本时保守当作没有）。 */
-const isRemoteMounter = (value: unknown): value is RemoteMounter =>
-  isRecord(value) && typeof value["$mount"] === "function";
 
 /** 同上：命名空间服务（挂载之后才有，缺它说明网关没认这枚贡献）。 */
 const isRebuildNamespace = (value: unknown): value is RebuildNamespace =>
