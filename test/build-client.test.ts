@@ -251,8 +251,12 @@ function makeHost(form: FakeForm): {
         key?: string;
         inject?: () => Record<string, unknown>;
       }): (() => void) => {
-        trace.desc = { name: desc.name, key: desc.key };
-        trace.payload = desc.inject?.() ?? null;
+        // 只有 keyed 的设置卡槽带 key 与卡片 payload；会话侧栏是 list 槽、inject 只交
+        // t/reader，不能把 trace.desc / payload 覆盖成它那一份。
+        if (desc.key !== undefined) {
+          trace.desc = { name: desc.name, key: desc.key };
+          trace.payload = desc.inject?.() ?? null;
+        }
         const cleanup = (): void => {
           trace.payload = null;
         };
@@ -525,7 +529,10 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
     const bareIds = patchEntryIds();
     assert.deepEqual(bareIds, ["zvec-grep"], "cordis.patch.yml 只声明一行裸条目 id");
     assert.deepEqual(trace.entryIds, bareIds, "只取本条目那张共享表单，且只取一次");
-    assert.deepEqual(trace.slotNames, ["plugins.bundle.config"]);
+    assert.deepEqual(trace.slotNames, [
+      "conversation.session.panel.section",
+      "plugins.bundle.config",
+    ]);
     assert.equal(trace.desc?.name, "plugins.bundle.config");
     // 槽 key = profile bundles 清单里的 bundle 包名（解析而来，见 profileBundleName）。
     const bundleName = profileBundleName();
@@ -558,16 +565,18 @@ describe("client.js 冒烟（stub ModuleLoader + stub react）", () => {
     assert.deepEqual(formTrace.unsetCalls, ["hfEndpoint"], "payload.unset 必须清空本条目表单");
     // slot 清理：只注销这次声明，**绝不** dispose provider 持有的共享表单（绊线 =
     // disposeCalls）。旧 settingsScope 时代在这里 dispose 会让重挂后的卡片静默丢写入。
-    assert.equal(trace.cleanups.length, 1);
-    trace.cleanups[0]?.();
+    assert.equal(trace.cleanups.length, 2, "设置卡与会话侧栏两个槽各交回一枚注销函数");
+    for (const cleanup of trace.cleanups) {
+      cleanup();
+    }
     assert.deepEqual(
       formTrace.disposeCalls,
       [],
       "disposer 不得销毁 provider 持有的共享表单（0.1.7 ConfigForm 契约无 dispose）",
     );
     // 槽位声明被收回、再次声明：工厂重跑，拿回的仍是同一张长活表单，写入照常写到磁盘。
-    const [redeploy] = trace.slotFactories;
-    assert.ok(redeploy, "slots.inject 登记了可重跑的工厂");
+    const [, redeploy] = trace.slotFactories;
+    assert.ok(redeploy, "设置卡槽位登记了可重跑的工厂（第 0 位是会话侧栏）");
     const cleanupAgain = redeploy();
     assert.equal(typeof cleanupAgain, "function", "重跑仍交回注销函数");
     const revived = trace.payload as CardPayload;

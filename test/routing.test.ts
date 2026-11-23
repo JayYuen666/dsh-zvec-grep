@@ -15,6 +15,7 @@ import {
   MAX_PARENT_WALK,
   rootSessionKeyOf,
   sessionKeyOf,
+  sessionWorkingDirectory,
   DEFAULT_GREP_BUDGET,
   DEFAULT_UNLOCK_WINDOW_MIN,
   INDEX_DIR_NAME,
@@ -1050,6 +1051,11 @@ describe("rootSessionKeyOf（子代理与主代理共享一份配额）", () => 
   });
 });
 
+const ctxWith = (service: unknown): Context =>
+  ({
+    get: (name: string) => (name === "workingDirectory" ? service : undefined),
+  }) as unknown as Context;
+
 describe("unlockActive", () => {
   const NOW = 1_000_000_000;
 
@@ -1073,5 +1079,28 @@ describe("unlockActive", () => {
     // routing.ts 里落一份副本时只有取值不同才会在这里显形（同值副本要等下一次改值）。
     assert.equal(DEFAULT_GREP_BUDGET, BUDGET_FROM_LIMITS);
     assert.equal(DEFAULT_UNLOCK_WINDOW_MIN, WINDOW_FROM_LIMITS);
+  });
+
+  const CREATED_AT = "/created-at";
+  const execution = (ctx: Context | undefined): GuardExecution => ({
+    agent: {
+      session: { header: { cwd: CREATED_AT } },
+      ...(ctx === undefined ? {} : { ctx }),
+    },
+  });
+
+  it("会话活目录优先，服务形状不全或给空值时回落 header.cwd", () => {
+    // 活目录（宿主 cd 之后）压过创建期快照。
+    const live = execution(ctxWith({ get: () => "/live" }));
+    assert.equal(sessionWorkingDirectory(live), "/live");
+    // 服务在但 get 缺席 / 返回空串：回落 header.cwd，不能把空串当目录。
+    const noGet = execution(ctxWith({}));
+    assert.equal(sessionWorkingDirectory(noGet), CREATED_AT);
+    const empty = execution(ctxWith({ get: () => "" }));
+    assert.equal(sessionWorkingDirectory(empty), CREATED_AT);
+    // 服务缺席、执行体没有会话：都给 undefined。
+    const noCtx = execution(undefined);
+    assert.equal(sessionWorkingDirectory(noCtx), CREATED_AT);
+    assert.equal(sessionWorkingDirectory({}), undefined);
   });
 });

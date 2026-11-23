@@ -78,7 +78,7 @@ export function isZgToolName(name: unknown): name is ZgToolName {
 //   2. 「必选 → 可选」这一层放宽是**运行时容错**，不是类型疏漏：`arguments` 官方本就是
 //      `unknown`（模型产出的 JSON），`session.id` 的类型品牌只是编译期标记
 //      （`string & { [BRAND] }`，宿主从磁盘 header 复原的值不经校验），而无 agent 的执行体
-//      （`agent?: Agent`）确实存在。放宽的部分由读点补偿：sessionHeaderCwd / sessionKeyOf
+//      （`agent?: Agent`）确实存在。放宽的部分由读点补偿：sessionWorkingDirectory / sessionKeyOf
 //      先 `const x: unknown = …` 再 typeof 收窄（与 shared/lib/tool-events.ts 的 usableCallId
 //      同一种做法），不用类型去说服运行时。
 
@@ -144,9 +144,31 @@ function searchAdmitted(execution: GuardExecution): boolean {
   return toolSet.view(scope).has(ZG_SEARCH_NAME);
 }
 
-/** 会话工作区（官方 Agent.session.header.cwd；值按 unknown 读，理由见 SessionFace）。 */
-function sessionHeaderCwd(execution: GuardExecution): string | undefined {
-  const raw: unknown = execution.agent?.session?.header?.cwd;
+/** 官方工作目录服务的最小读取形状（`WorkingDirectoryService.get(session)` 同步、无 fs I/O）。 */
+interface WorkingDirectoryFace {
+  get?: (session: unknown) => unknown;
+}
+
+function isWorkingDirectory(value: unknown): value is WorkingDirectoryFace {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return value["get"] === undefined || typeof value["get"] === "function";
+}
+
+/** 会话**当前**工作区：活目录优先（`ctx.workingDirectory.get(session)`），服务缺席或
+ *  给不出非空串时回落 `header.cwd`（创建期快照）。宿主 `cd` 之后只有前者会跟着变，
+ *  相对 root 的判据必须按它解析，否则会把目标归一到建会话时的旧目录。 */
+export function sessionWorkingDirectory(execution: GuardExecution): string | undefined {
+  const session = execution.agent?.session;
+  const service: unknown = execution.agent?.ctx?.get("workingDirectory");
+  if (session !== undefined && isWorkingDirectory(service)) {
+    const live: unknown = service.get?.(session);
+    if (typeof live === "string" && live.length > 0) {
+      return live;
+    }
+  }
+  const raw: unknown = session?.header?.cwd;
   return typeof raw === "string" && raw.length > 0 ? raw : undefined;
 }
 
@@ -184,7 +206,7 @@ function zgToolProblem(
   } else if (root === undefined || root === null || root === "") {
     // root 缺失但 execution.agent 提供会话 cwd → 放行（execute 内 resolveRoot 兜底）。
     problem =
-      sessionHeaderCwd(execution) === undefined
+      sessionWorkingDirectory(execution) === undefined
         ? fill(messages.guardAbsoluteRootRequired, { name })
         : undefined;
   } else {
@@ -574,7 +596,7 @@ export function searchFirstGuard(
 ): string | undefined {
   const { name } = execution;
   const args = isRecord(execution.arguments) ? execution.arguments : {};
-  const cwd = sessionHeaderCwd(execution);
+  const cwd = sessionWorkingDirectory(execution);
   let reason: string | undefined;
   // 门禁关着、执行体没有会话工作区（无从判「索引根之内」）、或本步骤根本调不动
   // `zg_search` → 两道拦截都无从谈起（强迫先调一个不可执行的工具是死路）。

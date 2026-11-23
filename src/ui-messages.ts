@@ -89,6 +89,11 @@ export interface UiMessages {
   readonly daemonReadyNote: string;
   /** 守护进程未就绪那一行（无占位符）。 */
   readonly daemonOfflineNote: string;
+  /** 会话侧栏索引小节的 KPI 标签与状态词。 */
+  readonly panelRoots: string;
+  readonly panelServer: string;
+  readonly panelReady: string;
+  readonly panelNotReady: string;
   /** 重建行说明（整行模板）：`{embedding}`、`{roots}`。 */
   readonly rebuildHint: string;
   /** 有候选工作区时的尾注。 */
@@ -103,6 +108,10 @@ export interface UiMessages {
   readonly rebuildDone: string;
   /** 重建状态面板的头部标题（进度/回执正文见下方各态文案）。 */
   readonly rebuildStatusTitle: string;
+  /** 日志面板的复制动作。 */
+  readonly copy: string;
+  /** 日志面板复制成功后的动作。 */
+  readonly copied: string;
   /** 点下重建后的首帧提示。 */
   readonly rebuildStarting: string;
   /** 重建进程被终止。 */
@@ -225,6 +234,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     daemonReadyNote: "守护进程：就绪（zg --server 在跑）。",
     daemonOfflineNote:
       "守护进程：未就绪。守护进程提供的索引增量刷新、refresh=background 与常驻模型池在缺席时都不可用；需要时在终端执行 `zg --server on`。",
+    panelRoots: "索引根",
+    panelServer: "索引服务",
+    panelReady: "就绪",
+    panelNotReady: "未就绪",
     rebuildHint: "以当前默认模型重建：{embedding}；等价于 zg --index --rebuild。{roots}",
     rootsNoteWith: "候选工作区来自本 daemon 已打开过的会话（服务端白名单）。",
     rootsNoteEmpty: "尚无可选工作区：先在该工作区里开一个会话（任一次工具调用即登记）。",
@@ -232,6 +245,8 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildRunning: "重建中…",
     rebuildDone: "重建完成",
     rebuildStatusTitle: "重建作业",
+    copy: "复制",
+    copied: "已复制",
     rebuildStarting: "正在后台重建索引…（首次会下载 embedding 模型，可能较慢）",
     rebuildKilled: "重建进程被终止",
     rebuildFailed: "重建作业被宿主注册表判定失败（没拿到进程退出码）",
@@ -302,6 +317,10 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
       "Daemon: not ready. What the daemon provides — incremental index refresh, refresh=background and the resident embedding model pool — is unavailable while it is absent; run `zg --server on` in a terminal when you want it.",
     rebuildHint:
       "Rebuild with the current default model: {embedding}; same as zg --index --rebuild. {roots}",
+    panelRoots: "Index roots",
+    panelServer: "Index server",
+    panelReady: "Ready",
+    panelNotReady: "Not ready",
     rootsNoteWith:
       "Candidates come from sessions this daemon already opened (server-side whitelist).",
     rootsNoteEmpty:
@@ -310,6 +329,8 @@ export const UI_MESSAGES: MessagesCatalog<UiMessages> = {
     rebuildRunning: "rebuilding…",
     rebuildDone: "rebuild finished",
     rebuildStatusTitle: "rebuild job",
+    copy: "Copy",
+    copied: "Copied",
     rebuildStarting:
       "Rebuilding in the background… (the first run downloads the embedding model and may be slow)",
     rebuildKilled: "the rebuild process was terminated",

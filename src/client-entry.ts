@@ -40,11 +40,14 @@ import {
   CardForm,
   Field,
   FieldTwoCol,
+  KpiGrid,
+  KpiTile,
   LogPanel,
   NumberField,
   SaveBar,
   Section,
   SelectField,
+  StatusDot,
   TextField,
   ToggleField,
   diffTouched,
@@ -60,12 +63,14 @@ import {
   WINDOW_SCHEMA,
   cardStore,
   daemonNoteKey,
+  daemonTone,
   draftFields,
   parseRebuildPoll,
 } from "../lib/card-logic.ts";
 import type { CardFields, CardSnapshot, SettingScope } from "../lib/card-logic.ts";
 import { createRebuildReader } from "./rebuild-reader.ts";
 import type { RebuildReader } from "./rebuild-reader.ts";
+import type { RebuildRoots } from "../lib/rebuild-shape.ts";
 import { EMBEDDING_MIRROR_URL, UI_MESSAGES } from "./ui-messages.ts";
 import type { LocaleNs, Translate, UiMessages } from "./ui-messages.ts";
 
@@ -97,8 +102,6 @@ const NS: LocaleNs = "zvec-grep";
 const BUNDLE_PKG = "@jayyuen66/dsh-zvec-grep";
 /** 重建轮询间隔（宿主后台进程，2s 足够跟上 zg 的进度输出）。 */
 const REBUILD_POLL_MS = 2000;
-const CARD_CSS = [".zgc-rebuildInput{flex:1 1 240px;min-width:0}"].join("\n");
-
 const BACKENDS: readonly LocalEmbeddingBackend[] = ["llama-cpp", "transformers-js", "model2vec"];
 
 /** 重建 root 输入框的候选列表 id（与 <datalist> 配对）。 */
@@ -299,7 +302,7 @@ function buildRebuildField(deps: CardDeps): ReactNode {
   const rootOptions = roots.map((entry) => createElement("option", { key: entry, value: entry }));
   const rootDatalist = createElement("datalist", { id: ROOT_OPTIONS_ID }, ...rootOptions);
   const rebuildInput = createElement("input", {
-    className: "dsu-input zgc-rebuildInput",
+    className: "dsu-input dsu-grow",
     value: root,
     list: ROOT_OPTIONS_ID,
     placeholder: t("rebuildInputPlaceholder"),
@@ -326,8 +329,7 @@ function buildRebuildField(deps: CardDeps): ReactNode {
       wide: true,
     },
     rootDatalist,
-    rebuildInput,
-    rebuildButton,
+    createElement("div", { className: "dsu-inlineRow" }, rebuildInput, rebuildButton),
   );
 }
 
@@ -345,7 +347,13 @@ function buildDaemonNote(deps: CardDeps): ReactNode | null {
   if (key === undefined) {
     return null;
   }
-  return createElement("p", { className: "dsu-hint" }, t(key));
+  // 第三方守护进程的检查结论：就绪 ok、未就绪 warn；旧宿主未报这一位时整行不画（不谎称未就绪）。
+  return createElement(
+    "div",
+    { className: "dsu-inlineRow", "data-field": "daemon-status" },
+    createElement(StatusDot, { tone: daemonTone(deps.serverReady === true) }),
+    createElement("p", { className: "dsu-hint" }, t(key)),
+  );
 }
 
 /** 重建状态节点：phase 非 idle 才出现；错误走警示条，进度/回执走日志面板。 */
@@ -365,7 +373,14 @@ function buildRebuildStatusRow(deps: CardDeps): ReactNode | null {
   }
   return createElement(
     LogPanel,
-    { label: t("rebuildStatusTitle"), tone: rebuild.phase === "done" ? "ok" : "mute" },
+    {
+      label: t("rebuildStatusTitle"),
+      tone: rebuild.phase === "done" ? "ok" : "mute",
+      semanticLines: true,
+      copyText: displayText,
+      copyLabel: t("copy"),
+      copiedLabel: t("copied"),
+    },
     displayText,
   );
 }
@@ -801,6 +816,73 @@ function ZgCard(props: CardSlotProps): ReactNode {
  */
 export type LocaleCatalog = Record<BuiltInLocaleId, LocaleDictOf<typeof NS>>;
 
+/** 会话侧栏小节槽位名（与下面 SlotMap 声明及宿主契约逐字一致）。 */
+const SESSION_PANEL_SECTION = "conversation.session.panel.section";
+
+/**
+ * session-panel 的 SlotMap 合并来自 @deepseek-ai/dsh-client-ui-session-panel/client。
+ * 本包不声明该 UI 包作依赖（它只在宿主里提供槽位，不进本包发布面），这里按
+ * `lib/types/client/slots.d.ts` 的 list 契约就地补一条声明。
+ */
+declare module "@deepseek-ai/dsh-client-ui-slots" {
+  interface SlotMap {
+    "conversation.session.panel.section": {
+      kind: "list";
+      scope: "session";
+      owner: {
+        readonly presentation: "docked" | "overlay";
+        readonly dismissOverlay: () => void;
+      };
+    };
+  }
+}
+
+/** 会话侧栏的索引小节：只读宿主 daemon 的候选根与服务状态。 */
+function ZgPanelSection(props: {
+  readonly t: Translate;
+  readonly reader: RebuildReader | undefined;
+}): ReactNode {
+  const { t, reader } = props;
+  const [roots, setRoots] = useState<RebuildRoots | null>(null);
+  useEffect(() => {
+    let live = true;
+    const load = async (): Promise<void> => {
+      if (reader === undefined) {
+        return;
+      }
+      try {
+        const next = await reader.roots();
+        if (live) {
+          setRoots(next);
+        }
+      } catch {
+        // 侧栏小节允许静默缺席：读不到就不画。
+      }
+    };
+    void load();
+    return () => {
+      live = false;
+    };
+  }, [reader]);
+  if (reader === undefined || roots === null) {
+    return null;
+  }
+  const ready = roots.serverReady === true;
+  return createElement(
+    KpiGrid,
+    null,
+    createElement(KpiTile, {
+      label: t("panelRoots"),
+      value: roots.roots.length,
+      count: roots.roots.length,
+    }),
+    createElement(KpiTile, {
+      label: t("panelServer"),
+      value: ready ? t("panelReady") : t("panelNotReady"),
+    }),
+  );
+}
+
 export interface ClientCtx {
   /**
    * cordis 官方效应面（installed `@deepseek-ai/cordis/lib/types/fiber.d.ts` 的
@@ -897,17 +979,7 @@ export interface ClientCtx {
 const inject = ["slots", "configForms", "locale"];
 
 function apply(ctx: ClientCtx): void {
-  ctx.effect(() => {
-    const disposeShared = ensureCardUiCss();
-    const tag = document.createElement("style");
-    tag.id = "zvec-grep-card-css";
-    tag.textContent = CARD_CSS;
-    document.head.append(tag);
-    return () => {
-      tag.remove();
-      disposeShared();
-    };
-  }, "zvec-grep-card: styles");
+  ctx.effect(() => ensureCardUiCss(), "zvec-grep-card: shared styles");
   // 本条目的共享表单：条目 id == cordis.patch.yml 里的裸 id `zvec-grep`（0.1.7 起
   // settings 命名空间即条目 id，不再有独立的 register 命名空间），与 host 半隐式注册的
   // 命名空间同源，故直接复用 NS。表单生命周期归 provider（消费者这边没有 dispose）。
@@ -944,6 +1016,18 @@ function apply(ctx: ClientCtx): void {
       throw error;
     }
   };
+  ctx.slots.inject(SESSION_PANEL_SECTION, () =>
+    ctx.slots.register(
+      {
+        name: SESSION_PANEL_SECTION,
+        id: "zvec-index",
+        order: 130,
+        label: () => t("indexSection"),
+        inject: () => ({ t, reader: rebuildRemote }),
+      },
+      ZgPanelSection,
+    ),
+  );
   ctx.slots.inject("plugins.bundle.config", () => {
     const unregister = ctx.slots.register(
       {

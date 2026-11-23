@@ -2,6 +2,10 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.21
+
+宿主基线切到 `dsh 0.2.3-alpha.2`（Node `^24.22.3 || >=26.13.1`），shared 经 catalog 抬到 `^0.2.13`。root 判据改用会话的活动工作目录（`workingDirectory` 活值优先、服务缺席或无值回落 `header.cwd`），`cd` 之后相对 root 仍按当前目录解析。设置卡随 shared v3 视觉层更新，并新增 `ZgPanelSection` 会话面板段与 roots/server 就绪文案；客户端槽位/清理与路由用例同步。
+
 ## 0.1.20
 
 宿主基线抬到 `0.2.2-rc.5`；daemon token 的原子落盘换官方件；上游 zg 0.3.1 的密钥跳过行为对齐。

@@ -35,7 +35,7 @@ import {
   apply as applyNativeExecutor,
   inject as nativeExecutorInject,
 } from "@deepseek-ai/dsh-tool-executor-native";
-import { ToolCallId as brandToolCallId } from "@deepseek-ai/dsh-llm/brand";
+import { ToolCallId as brandToolCallId } from "@deepseek-ai/dsh-llm";
 import { ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { ApprovalRequestEvent } from "@deepseek-ai/dsh-user-approval/types";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
@@ -161,6 +161,8 @@ export async function startHost(
   // 监听端口、已激活的官方服务 fiber。否则失败点会从「插件装不上」漂成下一条用例的端口冲突。
   let pluginFiber!: { dispose: () => Promise<unknown> };
   try {
+    await load(SessionStore);
+    await load(SessionProjectionRegistry);
     await load(SystemPrompt);
     await load(ToolRuntime);
     // alpha.2 起批次交给组合里显式提供的执行器；不装这一枚，`tools.execute` 直接以
@@ -176,8 +178,6 @@ export async function startHost(
     // 官方 ApprovalService 的 `static inject = ["sessionProjections"]`：alpha.2 起它要把
     // 每次问/答写进会话日志，投影注册表不在位时整条 fiber 不激活，`ctx.get("approval")`
     // 读不到 ⇒ 流水线的 ask 静默降级成拒绝。会话与投影都用官方件，不在台架里造替身。
-    await load(SessionStore);
-    await load(SessionProjectionRegistry);
     if (options.approval === true) {
       await load(ApprovalService, { policy: "never" });
     }
