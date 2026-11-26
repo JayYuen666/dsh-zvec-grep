@@ -127,6 +127,7 @@ import {
   findIndexRoot,
   rootSessionKeyOf,
   isZgToolName,
+  sessionWorkingDirectory as liveSessionCwd,
   DEFAULT_GREP_BUDGET,
   DEFAULT_UNLOCK_WINDOW_MIN,
   INDEX_DIR_NAME,
@@ -492,12 +493,7 @@ function isZvecGrepHost(value: unknown): value is Context & HostCtx {
   );
 }
 
-/** 当前会话工作区（root 缺省回退源）；非字符串视为缺（读取方式见 lib/routing.ts 的 SessionFace）。 */
-function sessionHeaderCwd(exec: GuardExecution): string | undefined {
-  const raw: unknown = exec.agent?.session?.header?.cwd;
-  return typeof raw === "string" && raw.length > 0 ? raw : undefined;
-}
-
+/** 当前会话工作区（root 缺省回退源）；活目录读数与判据共用 lib/routing.ts 的同一条函数。 */
 // ── 工具输出：纯文本 ────────────────────────────────────────────────────────
 
 /**
@@ -1616,7 +1612,7 @@ function rootOf(
   ledger: RootLedger,
   platform: PathPlatform,
 ): string {
-  const decision = judgeRoot(args["root"], sessionHeaderCwd(exec), messages, ledger, platform);
+  const decision = judgeRoot(args["root"], liveSessionCwd(exec), messages, ledger, platform);
   if (!decision.allowed) {
     throw new ZgToolError(ZG_TOOL_ERROR_CODES.rootRejected, decision.reason);
   }
@@ -2125,7 +2121,7 @@ function createLocaleMessages(host: HostCtx): () => ZvecGrepMessages {
 
 /** 观测到的工作区：既给重建当白名单，也让卡片能列出可重建的 root。 */
 function trackObservedRoot(ledger: RootLedger, exec: ToolExec): void {
-  const cwd = sessionHeaderCwd(exec);
+  const cwd = liveSessionCwd(exec);
   if (cwd !== undefined) {
     ledger.add(cwd);
   }
@@ -3118,7 +3114,7 @@ function explicitRootAsk(
     // **pre-execute 跑在 guard 之前**（官方 ToolGuard 注释："evaluated after every
     // tools/pre-execute"），所以此刻 ledger 里还没有本会话的工作区——判据里那一支「就是会话
     // 工作区」不能靠 ledger 兜，由 judgeRoot 自己按 cwd 比。
-    const decision = judgeRoot(raw, sessionHeaderCwd(execution), messages, ledger, platform);
+    const decision = judgeRoot(raw, liveSessionCwd(execution), messages, ledger, platform);
     question = decision.allowed ? decision.question : undefined;
   }
   // 只留一个返回点（本仓 consistent-return）：被拒的那一路与「放行但无需授权」的（root 就是会话

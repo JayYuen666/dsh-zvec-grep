@@ -9,9 +9,10 @@
 // 的暴露面；文件权限仍按 0600 写。路径由 `ZVEC_GREP_HOME`（zg 的运行时目录）决定，
 // 默认 `~/.zvec-grep/dsh-zvec-grep.token`；不写进发布包、不写宿主数据目录。
 
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { writeFileAtomic } from "@deepseek-ai/dsh-atomic-write";
 
 /** 文件名（放在 zg home 下，与 daemon 的 instance.lock / logs 同级）。 */
 const TOKEN_FILE_NAME = "dsh-zvec-grep.token";
@@ -44,18 +45,17 @@ export async function readPersistedToken(file: string): Promise<string | undefin
 }
 
 /**
- * 原子写入 token（同目录临时文件 → rename），权限 0600。失败**不外抛**：持久化只是恢复
- * 路径的增强，写不进去时本次会话仍用内存 token，恢复退化为 daemonStartFailed 的指引。
+ * 原子写入 token，权限 0600。原子替换本体交官方 `writeFileAtomic`（同目录随机后缀临时件 +
+ * rename；`wx` 独占创建保证新建 inode 必带 mode，失败自带临时件清理，win32 对瞬态 rename
+ * 错误退避重试）。失败**不外抛**：持久化只是恢复路径的增强，写不进去时本次会话仍用内存
+ * token，恢复退化为 daemonStartFailed 的指引——官方件抛错，吞错语义由本函数这一层保持。
  * @param file 目标路径
  * @param token 待写入的 token
  * @returns 是否写入成功（测试用；生产调用可忽略）
  */
 export async function persistToken(file: string, token: string): Promise<boolean> {
   try {
-    await mkdir(path.dirname(file), { recursive: true });
-    const temporary = `${file}.${String(process.pid)}.tmp`;
-    await writeFile(temporary, token, { mode: 0o600 });
-    await rename(temporary, file);
+    await writeFileAtomic(file, token, { mode: 0o600 });
     return true;
   } catch {
     return false;

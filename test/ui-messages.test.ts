@@ -72,6 +72,7 @@ describe("设置卡双语字典", () => {
     //   · 渲染点 params 少传一位，模板留下一段 `{reason}` 字面量也没人发现。
     const EXPECTED: Partial<Record<keyof UiMessages, readonly string[]>> = {
       dirtyCount: ["count"],
+      fieldCount: ["count"],
       saveFailed: ["reason"],
       limitInvalid: ["min", "max"],
       limitClamped: ["min", "max", "value"],

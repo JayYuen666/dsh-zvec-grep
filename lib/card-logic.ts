@@ -64,6 +64,11 @@ export function daemonNoteKey(ready: unknown): "daemonReadyNote" | "daemonOfflin
   return key;
 }
 
+/** 守护进程就绪态 → 状态点色调：就绪 ok，未就绪 warn。未报（undefined）由调用方整行不画。 */
+export function daemonTone(ready: boolean): "ok" | "warn" {
+  return ready ? "ok" : "warn";
+}
+
 /**
  * 取文案函数：官方 `ctx.locale.bind(ns)` 返回的 Translate 的子集（结构声明，
  * 与 src/ui-messages.ts 同源；键更窄、参数更宽的一侧才接得进来）。params 收到

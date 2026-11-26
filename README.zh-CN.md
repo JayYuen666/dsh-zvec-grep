@@ -11,8 +11,8 @@
   <a href="https://www.npmjs.com/package/@jayyuen66/dsh-zvec-grep"><img src="https://img.shields.io/npm/d18m/@jayyuen66/dsh-zvec-grep?style=flat-square" alt="npm downloads (total)" /></a>
   <a href="https://github.com/JayYuen666/dsh-zvec-grep/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-zvec-grep/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
-  <img src="https://img.shields.io/badge/node-%3E%3D24.9-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.2-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/node-%5E24.22.3%7C%7C%3E%3D26.13.1-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.3--alpha.2-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -78,9 +78,9 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-zvec-grep`。包在公共 npm registry 上，不需要凭据，也不需要 scoped-registry 配置行。
 
-- **Node.js `>= 24.9`**（纯 ESM；正是这个下限让 `require()` 一枚 ESM 入口成为可能，`engines.node` 因此声明）。
-- **宿主 `dsh` 在 `0.2.2-rc.2` 或更新的 `0.2.2` 这条线上。** 宿主读 `engines.dsh`（`^0.2.2-rc.2`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.2-rc.2` 的都通过宿主装载门；npm 的严格 peer 解析从 `0.2.2-rc.2` 起算。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
-- **按约定，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.2-rc.2`），`devDependencies` 里的精确钉版才是防「第二份宿主类型」的编译期纪律——那不是宿主会去读的声明。
+- **Node.js `^24.22.3 || >=26.13.1`**（纯 ESM；正是这个下限让 `require()` 一枚 ESM 入口成为可能，`engines.node` 因此声明）。
+- **宿主 `dsh` 在 `0.2.3-alpha.2` 这条线上（含更晚的 `0.2.x`）。** 宿主读 `engines.dsh`（`^0.2.3-alpha.2`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.3-alpha.2` 的都通过宿主装载门；npm 的严格 peer 解析从 `0.2.3-alpha.2` 起算。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
+- **按约定，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.3-alpha.2`），`devDependencies` 里的精确钉版才是防「第二份宿主类型」的编译期纪律——那不是宿主会去读的声明。
 - **值导入都是必需 peer。** `@deepseek-ai/schemastery` 是宿主 fork（只有它的 `resolve` 认 `.volatile()` 字段）；`@deepseek-ai/dsh-typert-protocol` 提供 `TypertRemoteService` 这个要 `extends` 的类；`@deepseek-ai/dsh-scope` 提供步骤准入判定用的 `scopeOf`；shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`。四者都落 peer 加同版精确钉的 devDependencies——缺一枚就是装载期 `ERR_MODULE_NOT_FOUND`，不是优雅降级。`dependencies` 里是 `@jayyuen66/dsh-plugin-shared` 与 `zod`（后者版本走伞根 catalog，供设置卡的 strict codec 校验）。
 - **随包发什么**：`host.js`、`client.js`、`cordis.patch.yml`、`icon.svg`、两份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`locale/zh.json` + `locale/en.json`、`docs/`（两份 DETAIL）。产物由 `prepack` 现产，不入库。
 
@@ -117,7 +117,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ## <img src="https://api.iconify.design/lucide/search.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 提供给模型的工具
 
-输出为纯文本；超时 5 分钟（search）/ 10 分钟（index）/ 60 秒（status）；stdout 上限 400000 字节，超限截尾并提示。沙箱 runner 失败、策略拒绝与 zg 自身失败分开归因；结果可能不完整时显式打标。`root` 必须是字符串，构造出的命令按 UTF-8 字节（不是码元）封顶：非字符串的 root 与超长命令直接拒绝，不会回落到会话工作区，也不会撞上内核参数上限。`limit` 越出 1-50 同样直接拒绝并点名区间，不会静默钳制——钳过的少结果会被模型当成这次检索的事实；省略则用默认值。
+输出为纯文本；超时 5 分钟（search）/ 10 分钟（index）/ 60 秒（status）；stdout 上限 400000 字节，超限截尾并提示。沙箱 runner 失败、策略拒绝与 zg 自身失败分开归因；结果可能不完整时显式打标。`root` 必须是字符串，构造出的命令按 UTF-8 字节（不是码元）封顶：非字符串的 root 与超长命令直接拒绝，不会回落到会话的工作目录，也不会撞上内核参数上限。`limit` 越出 1-50 同样直接拒绝并点名区间，不会静默钳制——钳过的少结果会被模型当成这次检索的事实；省略则用默认值。
 
 ### zg_search
 
@@ -149,8 +149,8 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 
 ### root 判据
 
-- 三者的 root 都可省略（缺省=当前会话工作区）。校验：以 `/` 开头的绝对路径、词典归一；空串/非字符串/NUL/相对路径/越界的 `..`、归一后为 `/` 都拒；目录不存在单报「root 目录不存在」，不冒成 spawn ENOENT。
-- 会话工作区之外的 root 只有走共享判据（`judgeRoot`）的「祖先/后代」分支才放行，且每个过判据的 root 都登记进卡片重建所用的观测白名单。guard 与 execute 同一套判据——不会同一件事拒两遍、说法还不同。
+- 三者的 root 都可省略（缺省=会话的活动工作目录：宿主服务在场且给出活值时用它，否则回落 `header.cwd`；`cd` 之后相对 root 仍按当前目录解析）。校验：以 `/` 开头的绝对路径、词典归一；空串/非字符串/NUL/相对路径/越界的 `..`、归一后为 `/` 都拒；目录不存在单报「root 目录不存在」，不冒成 spawn ENOENT。
+- 会话活动工作目录之外的 root 只有走共享判据（`judgeRoot`）的「祖先/后代」分支才放行，且每个过判据的 root 都登记进卡片重建所用的观测白名单。guard 与 execute 同一套判据——不会同一件事拒两遍、说法还不同。
 
 ## <img src="https://api.iconify.design/lucide/ban.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> search-first 门禁
 

@@ -3,7 +3,13 @@
 // lib/card-draft.ts，用例逐条照旧）/ 重建轮询应答解析（completed 且 exit 0 才算成功）。
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { cardStore, daemonNoteKey, draftFields, parseRebuildPoll } from "../lib/card-logic.ts";
+import {
+  cardStore,
+  daemonNoteKey,
+  daemonTone,
+  draftFields,
+  parseRebuildPoll,
+} from "../lib/card-logic.ts";
 import type { CardText, SettingScope } from "../lib/card-logic.ts";
 import { draftOf } from "../lib/card-draft.ts";
 import { DEFAULT_EMBEDDING } from "../lib/embedding-catalog.ts";
@@ -552,5 +558,10 @@ describe("daemonNoteKey：守护进程就绪态该显示哪一行", () => {
       assert.ok(UI_MESSAGES.zh[key].length > 0, `中文缺 ${key}`);
       assert.ok(UI_MESSAGES.en[key].length > 0, `英文缺 ${key}`);
     }
+  });
+
+  it("就绪态的状态点：就绪 ok，未就绪 warn（不给未报的第三档编颜色）", () => {
+    assert.equal(daemonTone(true), "ok");
+    assert.equal(daemonTone(false), "warn");
   });
 });
