@@ -4,7 +4,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## 0.1.22
 
-并入两线：把本地 0.1.20 的会话沙箱策略修复（见下方 0.1.20 沙箱修复版条目）合入 0.1.21 上游线，宿主依赖线统一到 dsh 0.2.3-alpha.2，`@deepseek-ai/dsh-sandbox-policy` 抬至同版（type-only 引用不变，沙箱策略测试基线随新官方件适配）。**宿主兼容注记**：0.2.2-rc 系宿主（rc.2–rc.5）不在本版 `engines.dsh`（`^0.2.3-alpha.2`）支持窗口内；rc 系宿主的最后一个可用版本是 0.1.20（npm 0.1.20 实发内容即会话沙箱策略修复，其窗口为 `^0.2.2-rc.2`）。版本号注记：npm 的 0.1.20 实发内容为本地沙箱修复版；上游开发线的 0.1.20（宿主基线 rc.5、token 原子落盘、zg 0.3.1 对齐）内容随 0.1.21 一并发布，两段历史均保留如下。
+并入两线：把本地 0.1.20 的会话沙箱策略修复（见下方 0.1.20 沙箱修复版条目）合入 0.1.21 上游线，宿主依赖线统一到 dsh 0.2.3-alpha.2，`@deepseek-ai/dsh-sandbox-policy` 抬至同版（type-only 引用不变，沙箱策略测试基线随新官方件适配）。**宿主兼容**：`engines.dsh` 与全族 `@deepseek-ai/dsh*` peer 放宽为并列区间 `^0.2.2-rc.2 || ^0.2.3-alpha.2`（`dsh-atomic-write` 亦从 `0.2.2-rc.2`、`schemastery` 从 `^3.19.0` 起算）——rc 系缺的服务代码侧均有降级（`workingDirectory` 回落 `header.cwd`、`sandboxPolicy` 缺席不带策略）；rc 线为声明式兼容、未逐版装载取证，遇问题的回退是固定 0.1.20。版本号注记：npm 的 0.1.20 实发内容为本地沙箱修复版；上游开发线的 0.1.20（宿主基线 rc.5、token 原子落盘、zg 0.3.1 对齐）内容随 0.1.21 一并发布，两段历史均保留如下。
 
 ## 0.1.21
 
