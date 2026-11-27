@@ -12,8 +12,9 @@
 //      transport 档选传输：auto = daemon 就绪走 MCP（HTTP 直调守护进程，见
 //      lib/daemon-client.ts）、缺席落回 CLI；cli = 恒 CLI spawn；mcp = 恒 MCP、daemon 缺席
 //      由插件拉起。CLI spawn 的 --mode 取部署值 clientMode（缺省 auto：守护进程就绪走
-//      server、缺席由 zg 静默落回 direct），故本包另按 TTL 缓存 `zg --server status
-//      --check-ready` 的退出码，把这一档显式化并统一处理 refresh=background（见
+//      server、缺席由 zg 静默落回 direct），故本包另按 TTL 缓存对 daemonUrl 的一次
+//      MCP initialize 握手结果（HTTP 200 = 就绪，判据不受 PID-namespace 沙箱影响），
+//      把这一档显式化并统一处理 refresh=background（见
 //      createZgServerGate 与 backgroundSupportFor）。
 //   3. 注册 systemPrompt 硬规则段（routing，order 1550）+ tools.guard 安全兜底
 //      + search-first 门禁（工作区已建索引时 grep/rg 前必须先 zg_search，
@@ -827,50 +828,124 @@ function createZgVersionGate(
 // 存在**。旧版本把这一整档能力差摊成了「检索超时给 5 分钟」和「改动搜不到」两条使用限制，
 // 却没有任何一处告诉使用者症结在哪。
 //
-// 就绪判据取上游自己的退出码：`zg --server status --check-ready` 就绪时正常退出、未就绪时
-// 以「Error: server is not ready」非零退出（实测原文；main 统一按退出码 1）。
-// 读 stdout 文本不行——那里是给人看的状态表，格式不在本包的依赖契约里。
+// 就绪判据是对 daemonUrl 做一次 MCP initialize 握手：HTTP 200 = 就绪，401/网络错/超时
+// 一律未就绪。为什么弃用 `zg --server status --check-ready`：那发 CLI 的判据链含 PID
+// 可见性——DSH 沙箱（bwrap --unshare-pid）里宿主 PID 不可见，活着、端口正常应答的
+// daemon 会被它判成 not ready（退出码恒 1），mcp 档于是反复拉起撞端口、auto 档被误判
+// 拖去 CLI 冷加载；网络栈不受 PID namespace 隔离，裸 fetch 实测 91ms 拿到应答（这是
+// --check-ready 唯一已知的失真场景）。`zg_status` 的 `--check-ready` 透传保留不动：
+// 那是给人看的诊断输出，不是判定输入。
+//
+// 判据取「initialize 握手 200 + mcp-session-id 应答头」而不是「端口可连」：后者会把任何
+// 占了 7999 的进程误判成 daemon，前者与 lib/daemon-client.ts 的 MCP 调用同源——对端不是
+// 预期的 MCP HTTP 面就不算就绪。401 明确算未就绪（token 不匹配时 MCP 调用必 401，判 ready
+// 是自欺）。
+// 探测请求形态与 lib/daemon-client.ts 的 initialize 同款但不 import 它——探测要独立于
+// 会话池（无会话状态、独立超时），且 daemon-client 的握手绑会话生命周期。
 //
 // **探测失败一律按未就绪**，且绝不影响别的通道：daemon 起不来时 `wait`/`off` 与穷举检索照旧
 // 能用，本包只是不再接受 `background` 这一档，并把这件事说清楚。
 
 /** 就绪态缓存时长：daemon 可被随时 `zg --server on/off` 起停，比版本探测勤得多。 */
 const SERVER_READY_TTL_MS = 60_000;
-/** 探测自身超时：`zg --server status` 是纯读，不该借检索超时。 */
+/** 探测自身超时：initialize 握手是纯读，不该借检索超时。语义与旧 CLI 探测不同——旧 10s 是
+ * 子进程墙钟（超时后 kill 收尾），新 10s 是 AbortSignal（超时后 abort 掉 fetch 本身）。 */
 const SERVER_READY_PROBE_TIMEOUT_MS = 10_000;
-/** 就绪探测命令行（0.3.0 旗标形态）：`--check-ready` 把「就绪与否」表达成退出码。 */
-const SERVER_READY_COMMAND = "zg --server status --check-ready";
+
+/**
+ * 就绪探测的 fetch 入口：缺省 undefined = 每次探测现取全局 fetch。不用 apply 期绑定，
+ * 是为了让测试能整条替换网络层（`setServerProbeFetch`）；生产路径零差异——同走 Node
+ * 全局 fetch，与 lib/daemon-client.ts 同款，不引入新依赖。
+ */
+let serverProbeFetch: typeof fetch | undefined;
+
+/**
+ * 仅测试使用：替换/还原就绪探测的 fetch（host.ts 单测不经真网络）。生产代码不调用；
+ * 传 undefined 还原为全局 fetch。
+ */
+export function setServerProbeFetch(impl: typeof fetch | undefined): void {
+  serverProbeFetch = impl;
+}
 
 /** 守护进程就绪门槛的执行上下文。 */
 interface ZgServerGate {
-  /** 就绪返回 true；未就绪、探测不出来、zg 没装都返回 false。**从不抛错**。 */
+  /** 就绪返回 true；未就绪、探测不出来（网络错/超时/非 200/401）都返回 false。**从不抛错**。 */
   ready: () => Promise<boolean>;
   /** 清空就绪缓存：插件自启 daemon 后立即重探，不等 TTL 走完。 */
   invalidate: () => void;
 }
 
-/** 探一次守护进程就绪态：退出码 0 = 就绪。任何异常与非零退出都算未就绪。
- *  注：插件自启的 daemon 带自生成 token，探测命令必须带上同一枚，否则 401 会被
- *  误读成「未就绪」并触发重复拉起。 */
+/**
+ * 探一次守护进程就绪态：对 daemonUrl 发 MCP initialize 握手，HTTP 200 = 就绪。
+ * 任何异常（网络错、超时 abort）与任何非 200（含 401：有内存 token 时凭据不匹配
+ * 算未就绪）都算未就绪——拉起流程与恢复文案照旧走 daemonStartFailed 那一侧。
+ * 注：插件自启的 daemon 带自生成 token，探测必须带同一枚 Bearer，否则 401 会被
+ * 误读成「未就绪」并触发重复拉起（四路同源纪律见 createDaemonHandle 头注）。
+ */
+/** 消费/释放应答 body，防止 SSE 200 长应答钉住连接；无 body（202 等）则无事可做。 */
+async function drain(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel();
+  } catch {
+    // cancel 失败（连接已断/已消费）不是判据：释放失败不影响就绪判定。
+  }
+}
+
 async function probeServerReady(
-  host: HostCtx,
-  config: Config,
+  daemonUrl: string,
   tokenOf: () => string | undefined,
 ): Promise<boolean> {
+  const signal = AbortSignal.timeout(SERVER_READY_PROBE_TIMEOUT_MS);
   try {
     const token = tokenOf();
-    const env = zgEnv(config, token === undefined ? undefined : { ZVEC_GREP_SERVER_TOKEN: token });
-    // workdir 取系统临时目录：与工作区无关的纯读探测，不该因为某个会话的目录不存在而失败。
-    const spec = host.shell.resolve({
-      command: SERVER_READY_COMMAND,
-      workdir: tmpdir(),
-      timeoutMs: SERVER_READY_PROBE_TIMEOUT_MS,
-      stdoutMaxBytes: config.stdoutMaxBytes,
-      ...(env ? { env } : {}),
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      ...(token === undefined ? {} : { Authorization: `Bearer ${token}` }),
+    };
+    const res = await (serverProbeFetch ?? globalThis.fetch)(daemonUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 0,
+        method: "initialize",
+        params: {
+          // 协议版本与 lib/daemon-client.ts 的 PROTOCOL_VERSION 同值（"2025-06-18"，
+          // 上游实测接受）；独立抄一份而不是 import——本函数刻意不依赖 daemon-client。
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "dsh-zvec-grep-readiness-probe", version: "0.0.0" },
+        },
+      }),
+      signal,
     });
-    const execution = await host.shell.execute(spec);
-    const result = await execution.result();
-    return result.exitCode === 0;
+    // SSE 200 应答的 body 不消费就会钉住连接——判定期统一 cancel，收尾不做第二判据。
+    await drain(res);
+    if (res.status !== 200) {
+      return false;
+    }
+    // 头校验与 lib/daemon-client.ts 的 initialize 同源：无 mcp-session-id 的 200 说明
+    // 对端不是预期的 MCP HTTP 面（daemon-client 侧同为硬失败），不算就绪。
+    const sessionId = res.headers.get("mcp-session-id");
+    if (sessionId === null) {
+      return false;
+    }
+    // 补发 notifications/initialized（202 即可、不期待应答），避免每发一次探测就在
+    // daemon 侧遗留一条半开会话。失败不改判：就绪事实由上面 200+会话头确立。
+    try {
+      await drain(
+        await (serverProbeFetch ?? globalThis.fetch)(daemonUrl, {
+          method: "POST",
+          headers: { ...headers, "mcp-session-id": sessionId },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+          signal,
+        }),
+      );
+    } catch {
+      // 初始化通知发不出去不影响就绪判定（探测结论已确立）；半开会话由 daemon 侧超时收。
+    }
+    return true;
   } catch {
     return false;
   }
@@ -879,14 +954,10 @@ async function probeServerReady(
 /**
  * 建这道门槛。缓存挂闭包（随 apply 生死），TTL 到期后重探。
  *
- * **并发不合并**：两条检索同时撞上 TTL 边界会各探一次，多起一发纯读进程而已——
+ * **并发不合并**：两条检索同时撞上 TTL 边界会各探一次，多发一发纯读 HTTP 而已——
  * 换来的是没有「在途 Promise 该不该共享」这层状态可测（与版本下限同一种做法）。
  */
-function createZgServerGate(
-  host: HostCtx,
-  config: Config,
-  tokenOf: () => string | undefined,
-): ZgServerGate {
+function createZgServerGate(daemonUrl: string, tokenOf: () => string | undefined): ZgServerGate {
   let cachedAt = 0;
   let cachedReady = false;
   let probed = false;
@@ -896,7 +967,7 @@ function createZgServerGate(
       if (probed && now - cachedAt < SERVER_READY_TTL_MS) {
         return cachedReady;
       }
-      cachedReady = await probeServerReady(host, config, tokenOf);
+      cachedReady = await probeServerReady(daemonUrl, tokenOf);
       cachedAt = now;
       probed = true;
       return cachedReady;
@@ -916,9 +987,10 @@ function createZgServerGate(
  * 才是用户显式同意过的行为。
  *
  * token 纪律：只在插件自启时生成（crypto.randomBytes，仅存本插件内存），同一位经
- * env 喂给所有 CLI lane 子进程（含探测）、经 Bearer 喂给 MCP 调用——四路必须同源，
- * 否则 CLI 走 server 模式就会撞 401。用户自己起的 daemon（默认无鉴权）本插件不生成、
- * 不下发任何 token。已知限制写在 daemonStartFailed 文案里：插件重启后 token 失忆。
+ * env 喂给所有 CLI lane 子进程、经 Bearer 喂给就绪探测（HTTP initialize）与 MCP 调用
+ * ——四路必须同源，否则 CLI 走 server 模式与探测/MCP 都会撞 401。用户自己起的 daemon
+ * （默认无鉴权）本插件不生成、不下发任何 token。已知限制写在 daemonStartFailed 文案里：
+ * 插件重启后 token 失忆。
  */
 interface DaemonHandle {
   /** 仅插件自启 daemon 后非空；CLI lane env 与 MCP Bearer 同源。 */
@@ -3259,7 +3331,7 @@ function apply(ctx: Context, config: Config): void {
   const daemonUrl = readDaemonUrl(config.daemonUrl, localeMessages());
   const tokenFile = tokenFilePath();
   const versionGate = createZgVersionGate(host, config, tokenOf);
-  const serverGate = createZgServerGate(host, config, tokenOf);
+  const serverGate = createZgServerGate(daemonUrl, tokenOf);
   const runtime: PluginRuntime = {
     host,
     platform,

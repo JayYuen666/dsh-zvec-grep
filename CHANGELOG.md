@@ -2,6 +2,14 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.23
+
+修复 daemon 就绪探测在 PID 不可见沙箱下的误判。旧判据是 `zg --server status --check-ready` 的退出码——该 CLI 依赖 PID 可见性，DSH 沙箱（bwrap `--unshare-pid`）看不到宿主 PID，宿主上活着的 daemon 恒被判成未就绪；于是 transport=mcp 档去拉起 daemon 撞端口（「server address 127.0.0.1:7999 is already in use」），auto 档也被误判拖去 CLI lane 冷加载。索引无损，纯判定问题。
+
+### Changed
+
+- **就绪探测改为 HTTP 直探**：`probeServerReady` 对 daemonUrl 发一次 MCP initialize 握手（POST + Bearer（有内存 token 时），`AbortSignal.timeout(10s)` 独立超时，任何异常/非 200 → 未就绪；401 明确算未就绪——token 不匹配时 MCP 调用必 401，判 ready 是自欺）。网络栈不受 `--unshare-pid` 隔离，沙箱内照常探到宿主 daemon；且对 `daemonUrl` 端点直探比 `--check-ready` 更正确（后者不接受 `--listen`）。所有消费方（ensure/routeOf/background 档/status 决策）经 `createZgServerGate` 一并修好；`zg_status` 的 `--check-ready` 透传行为不变（那是给用户看的诊断输出）。`test/host.test.ts` 就绪用例改为 HTTP 四态（200/401/连接拒绝/超时），e2e 与真机用例的就绪来源同步换 HTTP；`test/integration/shell-facts.test.ts` 顺手修了就绪分支从未跑到的潜伏错判据（find 前缀 `zg --rg`→`zg --hybrid`）。README 双语与 `docs/transport-modes.md` 的就绪描述同步。
+
 ## 0.1.22
 
 并入两线：把本地 0.1.20 的会话沙箱策略修复（见下方 0.1.20 沙箱修复版条目）合入 0.1.21 上游线，宿主依赖线统一到 dsh 0.2.3-alpha.2，`@deepseek-ai/dsh-sandbox-policy` 抬至同版（type-only 引用不变，沙箱策略测试基线随新官方件适配）。**宿主兼容**：`engines.dsh` 与全族 `@deepseek-ai/dsh*` peer 放宽为并列区间 `^0.2.2-rc.2 || ^0.2.3-alpha.2`（`dsh-atomic-write` 亦从 `0.2.2-rc.2`、`schemastery` 从 `^3.19.0` 起算）——rc 系缺的服务代码侧均有降级（`workingDirectory` 回落 `header.cwd`、`sandboxPolicy` 缺席不带策略）；rc 线为声明式兼容、未逐版装载取证，遇问题的回退是固定 0.1.20。版本号注记：npm 的 0.1.20 实发内容为本地沙箱修复版；上游开发线的 0.1.20（宿主基线 rc.5、token 原子落盘、zg 0.3.1 对齐）内容随 0.1.21 一并发布，两段历史均保留如下。

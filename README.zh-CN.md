@@ -207,7 +207,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 - direct 与 server 是**两种能力**，不是快慢之分：direct 每次查询都冷加载 embedding 模型；增量刷新（watcher）、`refresh=background` 与常驻模型池只在 server 模式下存在。上游对 `auto` 只做就绪探测、不拉起 daemon。
 - 本包的拉起策略跟 `transport` 走：`auto` / `cli` 不拉；`mcp` 档会自启一个带随机 token 的 daemon（`zg --server on`，监听 `daemonUrl` 的 host:port，默认回环 7999），同一枚 token 经 env 喂给所有 CLI 子进程、经 Bearer 喂给 MCP 调用；卸载时用同一枚 token 执行 `zg --server off` 停掉**自己拉起**的那一个。用户自启的 daemon（默认无鉴权）本包只读就绪态，不会停它。token 持久化在 `<ZVEC_GREP_HOME 或 ~/.zvec-grep>/dsh-zvec-grep.token`（0600）：崩溃/重启或另一宿主能读回同一枚，并发冷启动经 O_EXCL 认领收敛到一枚，不会互相覆盖。
 - **多个 agent 可以同时检索。** 同一宿主内的冷启动合并成一发 `zg --server on`；共用 `ZVEC_GREP_HOME` 的多个宿主共用同一个 daemon（上游 `instance.lock`，重复启动退 0 并回同一个 PID）。每个并发工具调用各用一条 MCP 会话——同一条 zg 会话一次只处理一个 `tools/call`——空闲会话复用，agent 之间不排队。只有索引重建会占工作区写锁；检索最多等它 `rebuildWaitMs`（这是唯一的有界等待，不是启动等待）。不同 `ZVEC_GREP_HOME` 是不同 daemon，需各自配 `daemonUrl` 端口。
-- 就绪态按 60 秒 TTL 缓存 `zg --server status --check-ready` 的退出码（探测失败按未就绪统一处理，绝不外抛基础设施故障），据此统一处理 `refresh=background`，并在 `zg_status` 输出尾与卡片各回显一行。探测由 `roots()` 读取接口、`zg_status` 与 `backgroundSupportFor` 发出。
+- 就绪态按 60 秒 TTL 缓存一次对 `daemonUrl` 的 MCP initialize 握手（裸 HTTP POST，内存里有 token 时带 Bearer；HTTP 200 即就绪）的结果。网络错、超时或非 200（含 401——token 不匹配不算就绪）一律按未就绪统一处理，绝不外抛基础设施故障；据此统一处理 `refresh=background`，并在 `zg_status` 输出尾与卡片各回显一行。探测由 `roots()` 读取接口、`zg_status` 与 `backgroundSupportFor` 发出，且不经 shell 沙箱——PID-namespace 隔离下宿主 daemon 仍照常探到。
 - 卡片的 `serverReady` 在卡片层只可能是 `true` / `false`——探测失败按未就绪统一处理，就绪行恒渲染。`undefined` 只会出现在旧快照的 `roots()` 原始载荷里（那一次探测压根没跑），实时卡片把它折成 `false`。想手动起一个共享 daemon 就在终端里跑 `zg --server on`。
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 对外接口

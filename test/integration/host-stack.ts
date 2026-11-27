@@ -618,10 +618,14 @@ process.stdout.write("0.3.0\\n");
 }
 
 /**
- * 一枚专测 **daemon 拉起请求形状** 的假 zg：就绪探测恒报未就绪（非零退出——上游
- * `--check-ready` 的契约就是退出码表意），`zg --server on` 成功应答。于是 transport=mcp
- * 的索引检索会真的走一遍 `runStartCommand`，随后就绪探测仍失败 ⇒ daemonStartFailed；
- * 调用方要断言的是那条 `zg --server on` resolve 请求（尤其 sandboxPolicy 位），不是检索结局。
+ * 一枚专测 **daemon 拉起请求形状** 的假 zg：`zg --server on` 成功应答（0.1.23 起就绪
+ * 判据是对 daemonUrl 的 HTTP initialize 握手，不再经 shell 的 `--check-ready`）。
+ * 就绪恒为否的唯一确定性来源是**消费者把 daemonUrl 钉到 127.0.0.1:9**——那一发的
+ * 握手吃 ECONNREFUSED；复用这枚假 zg 的前提就是 daemonUrl 必须指向一个不可达端点
+ * （指向默认 7999 时本机若真有 daemon 在跑，就绪会翻成 true，拉起路径根本不触发）。
+ * 于是 transport=mcp 的索引检索会真的走一遍 `runStartCommand`，随后就绪探测仍失败
+ * ⇒ daemonStartFailed；调用方要断言的是那条 `zg --server on` resolve 请求（尤其
+ * sandboxPolicy 位），不是检索结局。
  */
 export function installDaemonStartZg(): () => void {
   const script = `#!/usr/bin/env node
@@ -629,10 +633,6 @@ const argv = process.argv.slice(2);
 if (argv.includes("--version")) {
   process.stdout.write("0.3.0\\n");
   process.exit(0);
-}
-if (argv.includes("--check-ready")) {
-  process.stderr.write("daemon not ready\\n");
-  process.exit(1);
 }
 process.exit(0);
 `;

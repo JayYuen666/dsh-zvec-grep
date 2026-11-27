@@ -5,10 +5,7 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import assert from "node:assert/strict";
-import { once } from "node:events";
-import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   startHost,
@@ -30,34 +27,36 @@ const ENV_KEY_NAME = DUMP_ENV_KEY_NAME;
 const FORWARDED_KEY = "sk-forwarded";
 
 /**
- * 这台机器上 zg 守护进程的真实就绪态。判据与 host.ts 同源：`--check-ready` 只用**退出码**
- * 表达就绪与否（非零即未就绪，那条错误没有 `Code:` 行）。用例跟着它给期望值，而不是替
- * 这台机器编一个答案——否则没起 daemon 的开发机上这条必红，起了 daemon 的机器上又永远通过。
- * 不用同步 API：本包的 node/no-sync 只开写盘那一组。
+ * 这台机器上 zg 守护进程的真实就绪态。判据与 host.ts 同源（0.1.23）：对缺省 daemonUrl
+ * 发一次 MCP initialize 握手，HTTP 200 = 就绪，401/连接失败/非 200 一律未就绪。
+ * 用例跟着它给期望值，而不是替这台机器编一个答案——否则没起 daemon 的开发机上这条必红，
+ * 起了 daemon 的机器上又永远通过。fetch 网络层任何失败（ECONNREFUSED 等）都归进未就绪。
  */
-async function daemonReady(timeoutMs = 10_000): Promise<boolean> {
-  const child = spawn("zg", ["server", "status", "--check-ready"]);
-  // 就绪报告是给人看的状态表，本用例只取退出码；不排空两路流，子进程会挂着不退出。
-  child.stdout.resume();
-  child.stderr.resume();
-  // 不用 events.once：它对 'error' 直接 reject。而「PATH 上有 zg 但不可执行」（EACCES/ENOENT）与「守护进程没起」是同一档事实——未就绪，不该红成一次抛错。
-  // 装在对象里：回调里的赋值不参与 TS 的控制流收窄，读出来仍是 boolean 而不是字面量 false。
-  const state = { failed: false };
-  child.once("error", () => {
-    state.failed = true;
-  });
-  // 守护进程挂住时 close 永不来：到点自己收，而不是等 600s 的用例超时替我们收尾。
-  const killer = setTimeout(() => {
-    child.kill("SIGKILL");
-  }, timeoutMs);
+async function daemonReady(): Promise<boolean> {
   try {
-    const [code] = (await once(child, "close")) as [unknown, unknown];
-    return !state.failed && code === 0;
+    const res = await fetch("http://127.0.0.1:7999/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          // clientInfo（含 version）不能省：真 daemon 对缺它的 initialize 回 422，
+          // 会被误读成「未就绪」。形状与 host.ts probeServerReady 同源。
+          clientInfo: { name: "shell-facts-daemon-ready", version: "0.0.0" },
+        },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return res.status === 200;
   } catch {
-    // 'error' 会让 once 以原始错误 reject（PATH 上有 zg 但不可执行就是这一支）：归进未就绪。
     return false;
-  } finally {
-    clearTimeout(killer);
   }
 }
 
@@ -184,12 +183,11 @@ describe("真实宿主：会话沙箱策略随请求下发", () => {
       const { mode, workspaceRoot } = policy as { mode?: string; workspaceRoot?: string };
       assert.equal(mode, "workspace-write");
       assert.equal(workspaceRoot, ws);
-      // 反向钉住：版本/就绪两类**纯读探测**刻意不带策略（tmpdir 只读探测、TTL 缓存跨会话
-      // 共享，带上反而把策略钉进缓存键语义之外）——即便服务在场。
-      const probes = host.shellCalls.filter(
-        (row) =>
-          row.request.command.startsWith("zg --version") ||
-          row.request.command.startsWith("zg --server status"),
+      // 反向钉住：版本这一类**纯读探测**刻意不带策略（TTL 缓存跨会话共享，带上反而把
+      // 策略钉进缓存键语义之外）——即便服务在场。就绪探测 0.1.23 起走 HTTP（不经 shell），
+      // 在 shellCalls 里天生不可见，它的「不带策略」由 host-stack 的 MCP 用例旁证。
+      const probes = host.shellCalls.filter((row) =>
+        row.request.command.startsWith("zg --version"),
       );
       assert.ok(probes.length > 0, "探测命令至少出现一条");
       for (const probe of probes) {
@@ -223,8 +221,9 @@ describe("真实宿主：会话沙箱策略随请求下发", () => {
     const restore = installDaemonStartZg();
     let host: Host | undefined;
     try {
-      // transport=mcp + 就绪探测恒失败 ⇒ 索引通道检索自启 daemon（zg --server on 成功、
-      // 再探仍未就绪 ⇒ daemonStartFailed）。工作区用手工 manifest 冒充「已建索引」
+      // transport=mcp + 就绪探测恒失败（daemonUrl 指到 127.0.0.1:9，HTTP 握手吃
+      // ECONNREFUSED）⇒ 索引通道检索自启 daemon（zg --server on 成功、再探仍未就绪
+      // ⇒ daemonStartFailed）。工作区用手工 manifest 冒充「已建索引」
       // （indexProbe 只看 .zvec-grep/manifest.json 的 recordedPath 覆盖），免去真 zg +
       // embedding 的建索引成本。本条只断言拉起那条 resolve 请求的形状，检索结局不在断言里。
       const ws = workspace(cleanups);
@@ -399,7 +398,12 @@ describe.skipIf(!zgAvailable() || !embeddingCached(TEST_EMBEDDING))(
           host.agentOf(ws),
         );
         const text = host.textOf(outcome);
-        const dispatched = host.shellCalls.find((row) => row.request.command.startsWith("zg --rg"));
+        // 索引通道主查询是 `zg --hybrid=…`（0.3.0 显式路由）；`zg --rg` 是穷举/文件发现
+        // 通道，不会出现在这条检索里。旧写法找 "zg --rg" 在缺席分支永远 undefined、
+        // 就绪分支从未跑到过（CLI 探测在无 daemon 机器上恒未就绪），是潜伏的错判据。
+        const dispatched = host.shellCalls.find((row) =>
+          row.request.command.startsWith("zg --hybrid"),
+        );
         // 断言写成**无条件**的形式，期望值本身由这台机器的真实就绪态决定：分支式 expect 会让
         // 「这次跳过了哪一分支」不可见，而这条用例的价值恰恰在于两分支都被钉住。
         assert.equal(outcome.isError, !ready, "缺席就必须在发命令前停住；就绪就该放行");
@@ -418,12 +422,16 @@ describe.skipIf(!zgAvailable() || !embeddingCached(TEST_EMBEDDING))(
           ready,
           "命令与请求的那一档必须一致",
         );
-        // 就绪态的探测本身是纯读，且挂在系统临时目录上（不因某个会话工作区不存在而失败）。
-        const probe = host.shellCalls.find(
-          (row) => row.request.command === "zg --server status --check-ready",
+        // 就绪探测 0.1.23 起是对 daemonUrl 的 HTTP initialize 握手：不经 shell，所以
+        // shellCalls 里不该出现任何 `zg --server status` 形态的探测（这也是判据本身）。
+        const legacyProbe = host.shellCalls.find((row) =>
+          row.request.command.startsWith("zg --server status"),
         );
-        assert.ok(probe !== undefined, "这一档要读守护进程的真实就绪态");
-        expect(probe.spec.workdir).toBe(tmpdir());
+        assert.strictEqual(
+          legacyProbe,
+          undefined,
+          "就绪探测走 HTTP 握手，不该再经 shell 发 `zg --server status`",
+        );
         const readyAfter = await daemonReady();
         assert.equal(
           readyAfter,
