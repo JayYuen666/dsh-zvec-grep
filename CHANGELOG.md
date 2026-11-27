@@ -2,11 +2,34 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The deviations below are deliberate: version headings carry no release date (publish times are recorded by the registry — `npm view <package> time`), and a release may add sections beyond the standard six, such as `Not changed, deliberately` and `Earlier`.
 
+## 0.1.23
+
+修复 daemon 就绪探测在 PID 不可见沙箱下的误判。旧判据是 `zg --server status --check-ready` 的退出码——该 CLI 依赖 PID 可见性，DSH 沙箱（bwrap `--unshare-pid`）看不到宿主 PID，宿主上活着的 daemon 恒被判成未就绪；于是 transport=mcp 档去拉起 daemon 撞端口（「server address 127.0.0.1:7999 is already in use」），auto 档也被误判拖去 CLI lane 冷加载。索引无损，纯判定问题。
+
+### Changed
+
+- **就绪探测改为 HTTP 直探**：`probeServerReady` 对 daemonUrl 发一次 MCP initialize 握手（POST + Bearer（有内存 token 时），`AbortSignal.timeout(10s)` 独立超时，任何异常/非 200 → 未就绪；401 明确算未就绪——token 不匹配时 MCP 调用必 401，判 ready 是自欺）。网络栈不受 `--unshare-pid` 隔离，沙箱内照常探到宿主 daemon；且对 `daemonUrl` 端点直探比 `--check-ready` 更正确（后者不接受 `--listen`）。所有消费方（ensure/routeOf/background 档/status 决策）经 `createZgServerGate` 一并修好；`zg_status` 的 `--check-ready` 透传行为不变（那是给用户看的诊断输出）。`test/host.test.ts` 就绪用例改为 HTTP 四态（200/401/连接拒绝/超时），e2e 与真机用例的就绪来源同步换 HTTP；`test/integration/shell-facts.test.ts` 顺手修了就绪分支从未跑到的潜伏错判据（find 前缀 `zg --rg`→`zg --hybrid`）。README 双语与 `docs/transport-modes.md` 的就绪描述同步。
+
+## 0.1.22
+
+并入两线：把本地 0.1.20 的会话沙箱策略修复（见下方 0.1.20 沙箱修复版条目）合入 0.1.21 上游线，宿主依赖线统一到 dsh 0.2.3-alpha.2，`@deepseek-ai/dsh-sandbox-policy` 抬至同版（type-only 引用不变，沙箱策略测试基线随新官方件适配）。**宿主兼容**：`engines.dsh` 与全族 `@deepseek-ai/dsh*` peer 放宽为并列区间 `^0.2.2-rc.2 || ^0.2.3-alpha.2`（`dsh-atomic-write` 亦从 `0.2.2-rc.2`、`schemastery` 从 `^3.19.0` 起算）——rc 系缺的服务代码侧均有降级（`workingDirectory` 回落 `header.cwd`、`sandboxPolicy` 缺席不带策略）；rc 线为声明式兼容、未逐版装载取证，遇问题的回退是固定 0.1.20。版本号注记：npm 的 0.1.20 实发内容为本地沙箱修复版；上游开发线的 0.1.20（宿主基线 rc.5、token 原子落盘、zg 0.3.1 对齐）内容随 0.1.21 一并发布，两段历史均保留如下。
+
 ## 0.1.21
 
 宿主基线切到 `dsh 0.2.3-alpha.2`（Node `^24.22.3 || >=26.13.1`），shared 经 catalog 抬到 `^0.2.13`。root 判据改用会话的活动工作目录（`workingDirectory` 活值优先、服务缺席或无值回落 `header.cwd`），`cd` 之后相对 root 仍按当前目录解析。设置卡随 shared v3 视觉层更新，并新增 `ZgPanelSection` 会话面板段与 roots/server 就绪文案；客户端槽位/清理与路由用例同步。
 
-## 0.1.20
+## 0.1.20（会话沙箱策略修复；npm 0.1.20 实发内容）
+
+修复会话内 zg 子进程被宿主沙箱圈成只读的问题。此前本包所有 `shell.resolve` 都不带 `sandboxPolicy`，执行器回落到无会话的部署默认策略——workspace 写边界是 web 宿主进程的 cwd，而不是发起会话的工作区；zg 在 Landlock 下变只读，写 `.zvec-grep/locks/write-intent` 直接 `Read-only file system (os error 30)`，`zg_search` / `zg_status` 恒失败、grep/rg 门禁随之死锁。
+
+### Added
+
+- **会话沙箱策略随 CLI 请求下发**：`PluginRuntime.sandboxPolicyOf(exec)` 在每次工具执行时现读 `host.get("sandboxPolicy")`（官方 `SandboxPolicyService`，不缓存引用——服务可热替换），有会话时 `resolve({session})` 得到以会话 cwd 为 workspace-write 边界的策略，随 `shell.resolve` 的 `sandboxPolicy` 字段下发（对照官方 bash 工具的回落链 `sandboxPolicy: request.sandboxPolicy ?? ctx.sandboxPolicy.resolve()`）。三条 CLI 路径全部接上：`zg_search`、`zg_status`、`zg_index`（前台与模型侧后台索引——`spawnIndexWrite` 增可选参）。版本/就绪探测（tmpdir 只读探测，TTL 缓存跨会话共享）、daemon 拉起与设置卡重建路径刻意不带（用户决策：mcp 档维持现状，卡路径由 additionalWritableRoots 缓解）。
+- **降级不抛错**：服务缺席、执行无会话、或 `resolve` 抛 `SandboxInvalidRootError` 时都不带字段照常执行（检索可用性优先于策略精确性），降级事实经新文案 `sandboxPolicyDegradedNote`（中英）作为成功结果尾注出现。
+- **测试**：`test/host.test.ts` 新 describe「会话沙箱策略」6 条（带策略/服务缺席/抛错降级尾注/无会话/后台索引，以及 resolve 抛**非 Error**（裸字符串）时 `String()` 分支的降级注用例）；`test/integration/shell-facts.test.ts` 新 describe 3 条（官方 SandboxPolicyService 在场 → 请求里 `workspaceRoot` 等于会话 cwd 且纯读探测不带；缺席 → 不带字段行为不变；daemon 拉起 `zg --server on` 刻意不带——配 `host-stack.ts` 的 `installDaemonStartZg` 夹具与 `sandboxPolicy` 装载选项、`agentOf` 会话替身补 `snapshotEvents` 最小面）；`test/integration/rebuild-endpoints.test.ts` 在设置卡重建用例里加负断言：服务在场时该路径的 spawn 仍不带策略。
+- devDependencies 增 `@deepseek-ai/dsh-sandbox-policy: 0.2.2-rc.2`（type-only 引用，产物零运行时依赖）。
+
+## 0.1.20（上游开发线；内容随 0.1.21 发布）
 
 宿主基线抬到 `0.2.2-rc.5`；daemon token 的原子落盘换官方件；上游 zg 0.3.1 的密钥跳过行为对齐。
 
@@ -16,6 +39,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **`persistToken` 的原子替换换官方 `writeFileAtomic`**（devDependencies 加 `dsh-atomic-write`，peer 同窗口，产物保持裸说明符）：`wx` 独占创建保证新建 inode 必带 0600、随机后缀临时件、失败自带临时件清理、win32 对瞬态 rename 错误退避重试。「失败不外抛、返 boolean」的降级契约由本函数这一层保持——官方件抛错，写不进去时本会话仍用内存 token，恢复退化为 daemonStartFailed 的指引（变异验证：摘掉吞错层，失败路径用例当场红）。
 - **上游 zg 0.3.1 的密钥跳过行为对齐**：0.3.0 默认把 binary/unsupported 两类都挡在索引外，0.3.1 实测只跳 `secret.pem`（binary），未知扩展名的 `.P12` 已随正常源码收进索引——插件的排除规则（README 密钥清单，含大小写不敏感的 `*.p12`）回到唯一防线，e2e 用例按 0.3.1 的实测行为改写（两种开关都真建索引、真检索对质）。
 - **rebuild-reader 的 `RemoteHost` / `isRemoteMounter` 收编 shared `./lib/typert-client`**（七仓逐字副本的正主）。
+
 
 ## 0.1.19
 

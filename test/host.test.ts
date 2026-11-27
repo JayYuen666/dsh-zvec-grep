@@ -30,6 +30,7 @@ import plugin, {
   createRootLedger,
   hitSummary,
   signalStderr,
+  setServerProbeFetch,
   INDEX_PROBE_CACHE_MAX,
   INDEX_PROBE_TTL_MS,
 } from "../host.ts";
@@ -100,11 +101,11 @@ const ZG_MANIFEST_FILE = "manifest.json";
 /** 版本下限的探测命令（字面量与 host.ts 的 probeZgVersion 同源，改一处两边都红）。 */
 const ZG_VERSION_COMMAND = "zg --version";
 /**
- * 守护进程就绪门槛的探测命令（字面量与 host.ts 的 probeServerReady 同源，0.3.0 旗标形态）。
- * 上游 `--check-ready` 的契约是「就绪报告照常打在 stdout，只用退出码表达就绪与否」，
- * 所以替身按退出码给答案，而不是伪造一份状态文本。
+ * 就绪探测打到的端点（与 host.ts readDaemonUrl 的缺省 daemonUrl 同值独立抄一份：
+ * 改了端点，这里对「探测到底打哪」的断言要先红）。0.1.23 起就绪判据是对 daemonUrl 的
+ * 一次 MCP initialize 握手（HTTP 200 = 就绪），不再经 shell 发 `--check-ready`。
  */
-const ZG_SERVER_COMMAND = "zg --server status --check-ready";
+const DEFAULT_DAEMON_URL = "http://127.0.0.1:7999/mcp";
 /** 自启/收尾命令（本包只在 transport=mcp 下发出）。 */
 const SERVER_START_COMMAND = "zg --server on";
 const SERVER_STOP_COMMAND = "zg --server off";
@@ -120,21 +121,13 @@ const NO_EXECUTOR = "no such executor";
 const ZG_VERSION_OK = `${MINIMUM_ZG_VERSION}\n`;
 
 /**
- * 守护进程就绪探测的执行结果。形状抄上游 `runServer` 的 `--check-ready` 契约：
- * 就绪退出码 0、未就绪以「zvec-grep server is not ready」非零退出（无 `Code:` 行）。
+ * 守护进程就绪探测的一发 HTTP 事实：打到的 URL 与随行的 Authorization 头
+ * （无 token 时 undefined）。就绪判据 0.1.23 起是 HTTP initialize 握手，探测不再
+ * 经 shell，所以记录的也是 HTTP 层形状（url/鉴权头），不是 ResolveRequest。
  */
-function serverProbeResult(ready: boolean): ShellRunResult {
-  return ready
-    ? {
-        exitCode: 0,
-        stdout: { text: "zvec-grep server: ready\n" },
-        stderr: { text: "" },
-      }
-    : {
-        exitCode: 1,
-        stdout: { text: "zvec-grep server: stopped\n" },
-        stderr: { text: "Error: zvec-grep server is not ready\n" },
-      };
+interface ServerProbeCall {
+  url: string;
+  authorization: string | undefined;
 }
 
 /** 一次健康的版本探测执行（stdout 只有版本号一行，实测形态）。 */
@@ -382,6 +375,8 @@ interface ResolveRequest {
   stdoutMaxBytes?: number;
   onExpiry?: string;
   env?: Record<string, string>;
+  /** 0.1.20 会话沙箱策略：由 sandboxPolicyOf 按每次执行现取后随请求带给 shell.resolve。 */
+  sandboxPolicy?: unknown;
 }
 
 interface ShellMock {
@@ -397,17 +392,25 @@ interface ShellMock {
   /** 版本探测这一次执行直接抛错（模拟执行器缺席/spawn 失败）：同样必须按「读不懂」放行。 */
   versionProbeThrows: boolean;
   /**
-   * 守护进程就绪探测的记录下来（与 versionProbeCalls 同一个理由：它是基础设施的一次自检，
-   * 不该占被测命令的队列，也不该混进 resolveCalls 的断言里）。
+   * 守护进程就绪探测（HTTP initialize 握手）的记录（与 versionProbeCalls 同一个理由：
+   * 它是基础设施的一次自检，不该占被测命令的队列，也不该混进 resolveCalls 的断言里）。
    */
-  serverProbeCalls: ResolveRequest[];
+  serverProbeCalls: ServerProbeCall[];
+  /** 就绪探测（initialize 握手）收到的 AbortSignal（独立超时断言用，与 calls 一一对应）。 */
+  serverProbeSignals: AbortSignal[];
   /** 守护进程就绪态：缺省 false（未就绪＝直连模式），要 background 用例显式改 true。 */
   serverReady: boolean;
   /** 自启用：置 true 后第二次就绪探测起读 true（第一发仍 false）——拉起→重探的窗口
    *  从测试外部钉不住（重探紧跟 spawn），让 mock 自己翻面。 */
   serverReadyAutoFlip: boolean;
-  /** 就绪探测这一次执行直接抛错（模拟执行器缺席/spawn 失败）：按未就绪处理，绝不外抛。 */
+  /** 就绪探测这一发直接抛错（模拟网络层失败/abort）：按未就绪处理，绝不外抛。 */
   serverProbeThrows: boolean;
+  /** 钉死应答状态码（401 用例）：置值后忽略 serverReady，一律回这个状态。 */
+  serverProbeStatus: number | undefined;
+  /** 回 200 但**不带** mcp-session-id 应答头：对端不是预期的 MCP 面，必须算未就绪。 */
+  serverProbeOmitSessionHeader: boolean;
+  /** notifications/initialized 补发这一支直接抛错：初始化通知失败不得改判就绪。 */
+  serverProbeNoticeThrows: boolean;
   runResults: ShellRunResult[];
   startCalls: ResolveRequest[];
   startedProcs: MockProc[];
@@ -669,6 +672,59 @@ function captureWarn(sink: string[]): () => void {
   };
 }
 
+/**
+ * 就绪探测的 HTTP 桩：形状对齐 host.ts probeServerReady 的真实 fetch 调用面
+ * （(url, init) 交回一个带 status 的 Response；200 必须带 mcp-session-id 应答头，
+ * 否则 host 侧的头校验会把一切就绪用例判红）。按 shell 的三个开关回答：
+ * serverProbeThrows → 直接抛错（网络层失败/abort 都算这一支）；
+ * serverProbeStatus 钉死 → 无视 serverReady 一律回该状态码（401 用例）；
+ * 其余 → serverReady 的翻面语义（serverReady / serverReadyAutoFlip）。
+ * 每一发 initialize 把 url、Authorization 头与 init.signal 记进 serverProbeCalls /
+ * serverProbeSignals（无 token 时 authorization 记 undefined）。就绪成立后 host 会
+ * 补发 notifications/initialized——那一发是收尾不是判据，回 202、不进计数数组。
+ */
+function makeServerProbeFetch(
+  shell: ShellMock,
+): (url: unknown, init?: unknown) => Promise<Response> {
+  return async (url: unknown, init?: unknown): Promise<Response> => {
+    const typedInit = init as
+      | { headers?: Record<string, string>; body?: string; signal?: AbortSignal }
+      | undefined;
+    const authorization =
+      typedInit?.headers?.["Authorization"] ?? typedInit?.headers?.["authorization"];
+    if (typedInit?.body?.includes("notifications/initialized") === true) {
+      if (shell.serverProbeNoticeThrows) {
+        throw new Error(NO_EXECUTOR);
+      }
+      return new Response("", { status: 202 });
+    }
+    shell.serverProbeCalls.push({
+      url: String(url),
+      authorization: typeof authorization === "string" ? authorization : undefined,
+    });
+    if (typedInit?.signal !== undefined) {
+      shell.serverProbeSignals.push(typedInit.signal);
+    }
+    if (shell.serverProbeThrows) {
+      throw new Error(NO_EXECUTOR);
+    }
+    let status: number;
+    if (shell.serverProbeStatus !== undefined) {
+      status = shell.serverProbeStatus;
+    } else if (shell.serverReadyAutoFlip && shell.serverProbeCalls.length > 1) {
+      status = 200;
+    } else {
+      status = shell.serverReady ? 200 : 503;
+    }
+    // 200 带会话头（host 侧判据 = 200 + mcp-session-id）；非 200 一律不带；
+    // serverProbeOmitSessionHeader 专门钉「200 却没有会话头」这一支（对端不是 MCP 面）。
+    if (status !== 200 || shell.serverProbeOmitSessionHeader) {
+      return new Response("probe stub", { status });
+    }
+    return new Response("probe stub", { status, headers: { "mcp-session-id": "probe-session" } });
+  };
+}
+
 function makeCtx(): MockCtx {
   /** 与 ctx.jobs 同一份数组：登记一条就追加一枚号（见 withJobIdSink）。 */
   const jobIds: string[] = [];
@@ -683,11 +739,15 @@ function makeCtx(): MockCtx {
     zgVersionResult: undefined,
     versionProbeThrows: false,
     serverProbeCalls: [],
+    serverProbeSignals: [],
     serverReady: false,
     /** 自启用：置 true 后第二次就绪探测起读 true（第一发仍 false）——拉起→重探的
      *  窗口从测试外部钉不住（重探紧跟在 spawn 之后），让 mock 自己翻面。 */
     serverReadyAutoFlip: false,
     serverProbeThrows: false,
+    serverProbeStatus: undefined,
+    serverProbeOmitSessionHeader: false,
+    serverProbeNoticeThrows: false,
     runResults: [],
     startCalls: [],
     startedProcs: [],
@@ -696,8 +756,6 @@ function makeCtx(): MockCtx {
     resolve(spec) {
       if (spec.command === ZG_VERSION_COMMAND) {
         shell.versionProbeCalls.push(spec);
-      } else if (spec.command === ZG_SERVER_COMMAND) {
-        shell.serverProbeCalls.push(spec);
       } else {
         shell.resolveCalls.push(spec);
       }
@@ -710,10 +768,6 @@ function makeCtx(): MockCtx {
       // 这里只读两个字段，故先收成最小形状而不是断言成某个具体请求类型。
       const spec = rawSpec as { command: string; timeoutMs?: number };
       const isVersionProbe = spec.command === ZG_VERSION_COMMAND;
-      const isServerProbe = spec.command === ZG_SERVER_COMMAND;
-      if (isServerProbe && shell.serverProbeThrows) {
-        throw new Error(NO_EXECUTOR);
-      }
       const isBackground = spec.timeoutMs === undefined;
       if (isBackground) {
         if (shell.startThrows === "error") {
@@ -772,18 +826,12 @@ function makeCtx(): MockCtx {
         },
         killCount: 0,
         // 前台投影：队列按序消费（保持旧 run() 「发起时 shift」的取值次序）。
-        // 版本与守护进程两发探测**都不吃这条队列**：它们不是被测命令的结果，是基础设施的
-        // 一次自检；混进队列会让每条断言命令结果的用例都被一次无关探测顶掉。
+        // 版本探测**不吃这条队列**：它不是被测命令的结果，是基础设施的一次自检；
+        // 混进队列会让每条断言命令结果的用例都被一次无关探测顶掉。
+        // （就绪探测 0.1.23 起走 HTTP，不再到 shell，这里不再有它的分支。）
         result: async () => {
           if (isVersionProbe) {
             return shell.zgVersionResult ?? versionOkRun();
-          }
-          if (isServerProbe) {
-            const ready =
-              shell.serverReadyAutoFlip && shell.serverProbeCalls.length >= 2
-                ? true
-                : shell.serverReady;
-            return serverProbeResult(ready);
           }
           return (
             shell.runResults.shift() ?? {
@@ -800,6 +848,11 @@ function makeCtx(): MockCtx {
       return proc;
     },
   };
+  // 0.1.23 起就绪探测走 HTTP（对 daemonUrl 的 initialize 握手），不再经 shell。
+  // 把桩装进 host.ts 模块级的 setServerProbeFetch：注意它是**最近一次 makeCtx 生效**
+  // （gate 在探测时现读模块级变量）。本文件里 ctx2 一类用法都是顺序性的（造完即用），
+  // 若出现「造 ctx2 后回头用 ctx」的用例，探测会落到 ctx2 的桩上——那是用例自己的错。
+  setServerProbeFetch(makeServerProbeFetch(shell));
   const ctx: MockCtx = {
     services: {},
     // 复刻 cordis 装载期的结果：volatile 字段的活值 = Config schema 的逐字段默认。
@@ -2657,6 +2710,141 @@ describe("zg_search 执行", () => {
       `HITS\n${fill(MESSAGES.zh.stderrNote, { marked: "", tail: bareTail.slice(1) })}`,
     );
     assert.equal(out.text.isWellFormed(), true, "成功结果含孤立代理 ⇒ 该会话后续请求全废");
+  });
+});
+
+// 0.1.20 会话沙箱策略：zg 子进程的 workspace-write 边界要跟会话 cwd 走（否则被宿主默认
+// 策略圈成只读，写 .zvec-grep/locks 直接 os error 30）。三条边界都在这里钉住：
+// 服务在场+有会话 → 带策略；服务缺席 / 无会话 / resolve 抛错 → 不带字段并照常出结果。
+describe("会话沙箱策略", () => {
+  let root: string;
+  beforeAll(() => {
+    root = wsForSuite("zvec-sandbox-");
+  });
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("服务在场且有会话 → 策略随请求带给 shell.resolve，服务收到的是该次会话", async () => {
+    const ctx = makeCtx();
+    const resolved: unknown[] = [];
+    const policy = { mode: SANDBOX_WORKSPACE_WRITE, workspaceRoot: root };
+    ctx.services["sandboxPolicy"] = {
+      resolve: (request: { session?: unknown }) => {
+        resolved.push(request.session);
+        return policy;
+      },
+    };
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const exec = execOf(root, "sess-policy");
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, exec);
+    assert.equal(ctx.shell.resolveCalls.length, 1);
+    assert.strictEqual(ctx.shell.resolveCalls[0]?.sandboxPolicy, policy, "策略要原样进请求");
+    assert.equal(resolved.length, 1, "每次执行现取，不缓存");
+    assert.strictEqual(
+      resolved[0],
+      (exec as { agent: { session: unknown } }).agent.session,
+      "resolve 收到的就是这次执行的会话对象",
+    );
+    assert.deepEqual(out, { text: "RESULT" });
+  });
+
+  it("服务缺席（宿主没装 sandboxPolicy）→ 不带字段、不报错，行为与从前一致", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root));
+    assert.equal(ctx.shell.resolveCalls.length, 1);
+    assert.strictEqual(
+      ctx.shell.resolveCalls[0]?.sandboxPolicy,
+      undefined,
+      "服务缺席 ⇒ 不带 sandboxPolicy 字段",
+    );
+    assert.deepEqual(out, { text: "RESULT" });
+  });
+
+  it("resolve 抛错 → 降级不带字段，成功尾部注明降级事实", async () => {
+    const ctx = makeCtx();
+    ctx.services["sandboxPolicy"] = {
+      resolve: () => {
+        throw new Error("cwd is not absolute");
+      },
+    };
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.strictEqual(ctx.shell.resolveCalls[0]?.sandboxPolicy, undefined, "抛错 ⇒ 降级不带字段");
+    assert.ok(
+      out.text.endsWith(
+        fill(MESSAGES.zh.sandboxPolicyDegradedNote, { detail: "cwd is not absolute" }),
+      ),
+      "降级事实要作为成功尾注出现",
+    );
+    assert.ok(out.text.startsWith("RESULT"), "检索结果照常交回");
+  });
+
+  it("resolve 抛的不是 Error（如裸字符串）→ detail 走 String() 那一支，降级照常", async () => {
+    const ctx = makeCtx();
+    ctx.services["sandboxPolicy"] = {
+      resolve: () => {
+        // oxlint-disable-next-line eslint/no-throw-literal, typescript/only-throw-error -- 故意抛裸字符串：钉 catch 里 String(error) 那一支分支
+        throw "boom";
+      },
+    };
+    applyTo(ctx);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    const out = (await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf(root))) as {
+      text: string;
+    };
+    assert.strictEqual(ctx.shell.resolveCalls[0]?.sandboxPolicy, undefined);
+    assert.ok(
+      out.text.endsWith(fill(MESSAGES.zh.sandboxPolicyDegradedNote, { detail: "boom" })),
+      "非 Error 抛出物也要 stringify 进降级注",
+    );
+  });
+
+  it("无会话执行（服务在场）→ 同样不带字段", async () => {
+    const ctx = makeCtx();
+    let calls = 0;
+    ctx.services["sandboxPolicy"] = {
+      resolve: () => {
+        calls += 1;
+        return { mode: "read-only" };
+      },
+    };
+    applyTo(ctx);
+    trackRoot(ctx, root);
+    ctx.shell.runResults.push(okRun("RESULT"));
+    await toolOf(ctx, "zg_search").execute({ root, query: "hi" }, execOf());
+    assert.strictEqual(
+      ctx.shell.resolveCalls[0]?.sandboxPolicy,
+      undefined,
+      "agentless 执行没有会话 ⇒ 不带字段",
+    );
+    assert.equal(calls, 0, "无会话时根本不去 resolve");
+  });
+
+  it("模型侧后台 zg_index → spawn 请求同样带策略", async () => {
+    const ctx = makeCtx();
+    const policy = { mode: SANDBOX_WORKSPACE_WRITE, workspaceRoot: root };
+    ctx.services["sandboxPolicy"] = { resolve: () => policy };
+    applyTo(ctx);
+    const bgRoot = bareWs("bg-sandbox");
+    await toolOf(ctx, "zg_index").execute(
+      { root: bgRoot, confirm: true, background: true },
+      execOf(bgRoot),
+    );
+    assert.equal(ctx.shell.resolveCalls.length, 1, "只起一条 zg");
+    assert.equal(
+      ctx.shell.resolveCalls[0]?.sandboxPolicy,
+      policy,
+      "后台索引进程的写边界也要跟会话走",
+    );
+    assert.equal(ctx.shell.resolveCalls[0].onExpiry, "none", "后台路径要无界执行");
   });
 });
 
@@ -6064,30 +6252,83 @@ describe("守护进程（zg server）就绪门槛", () => {
     assert.equal(ctx.shell.resolveCalls.length, before, "被拒的调用不该把命令发出去");
     assert.equal(ctx.shell.serverProbeCalls.length, 1, "为这一档起了一发就绪探测");
     assert.equal(
-      ctx.shell.serverProbeCalls[0]?.workdir,
-      tmpdir(),
-      "探测是纯读，不挂在被检索的工作区上（与工作区存在与否无关）",
+      ctx.shell.serverProbeCalls[0]?.url,
+      DEFAULT_DAEMON_URL,
+      "探测打的是 daemonUrl（HTTP initialize 握手），与被检索的工作区无关",
+    );
+    // 探测超时独立于检索超时：fetch init 必须带一个 AbortSignal（10s 档常量在 host 侧）。
+    assert.ok(
+      ctx.shell.serverProbeSignals[0] instanceof AbortSignal,
+      "探测请求必须带独立超时信号（AbortSignal），不能裸发",
     );
   });
 
-  it("hfEndpoint 为空时就绪探测不带 env", async () => {
+  it("没有内存 token 时探测不带 Authorization 头", async () => {
     const ctx = makeCtx();
     applyTo(ctx, { hfEndpoint: "" });
     await fetchAccess(ctx);
     assert.equal(ctx.shell.serverProbeCalls.length, 1);
-    assert.equal(ctx.shell.serverProbeCalls[0]?.env, undefined);
+    assert.equal(ctx.shell.serverProbeCalls[0]?.authorization, undefined);
   });
 
-  it("远程 embedding 配置让就绪探测带上 env", async () => {
+  it("守护进程 401：拉起成功但复探仍拒 → daemonStartFailed 说清 token 不匹配，且二探带了 Bearer", async () => {
     const ctx = makeCtx();
-    applyTo(ctx, { allowRemoteEmbedding: true, remoteEmbeddingEndpoint: REMOTE_ENDPOINT });
-    await fetchAccess(ctx);
-    assert.equal(ctx.shell.serverProbeCalls.length, 1);
-    assert.equal(
-      ctx.shell.serverProbeCalls[0]?.env?.["ZVEC_GREP_ENDPOINT"],
-      REMOTE_ENDPOINT,
-      "探测与三条工具共用同一份 zgEnv",
+    applyTo(ctx, { transport: "mcp" });
+    // 钉死 HTTP 应答 401：拉起命令本身成功，但 initialize 握手始终被拒（比如宿主上
+    // 已有一个用别的 token 的 daemon 占着端口）——这是 0.1.23 语义里最关键的一支。
+    ctx.shell.serverProbeStatus = 401;
+    const root = ws("bg-401");
+    ctx.shell.runResults.push({
+      exitCode: 0,
+      stdout: { text: "server on\n" },
+      stderr: { text: "" },
+    });
+    await assert.rejects(
+      () => backgroundSearch(ctx, root),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(
+          message,
+          /zg --server on exited 0 but the readiness probe still fails/u,
+          "拉起成功但探测仍失败要说清「另一个 daemon 在用别的 token」",
+        );
+        return true;
+      },
     );
+    // 两发探测：第一发无 token（未认领），第二发带 Bearer；且那枚 token 与
+    // 发给 `zg --server on` 子进程的 env 是同一位（四路同源）。
+    assert.equal(ctx.shell.serverProbeCalls.length, 2);
+    assert.equal(ctx.shell.serverProbeCalls[0]?.authorization, undefined);
+    const bearer = ctx.shell.serverProbeCalls[1]?.authorization;
+    assert.match(bearer ?? "", /^Bearer /u);
+    const startCall = ctx.shell.resolveCalls.find((row) => row.command === SERVER_START_COMMAND);
+    const issued = startCall?.env?.["ZVEC_GREP_SERVER_TOKEN"];
+    assert.ok(issued !== undefined, "拉起命令的 env 里应带着认领出的 token");
+    assert.equal(bearer, `Bearer ${issued}`);
+  });
+
+  it("200 但没有 mcp-session-id 应答头：对端不是预期的 MCP 面，同样算未就绪", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx);
+    // 端口上有个回 200 的 HTTP 面，却不是 MCP HTTP transport（不发会话头）——判 ready
+    // 会把随便一个占端口的进程当成 daemon，这一支必须按未就绪处理（与 daemon-client
+    // 的「无会话 id 直接失败」同源）。
+    ctx.shell.serverReady = true;
+    ctx.shell.serverProbeOmitSessionHeader = true;
+    const root = ws("bg-no-session");
+    await assert.rejects(() => backgroundSearch(ctx, root), /zg --server on/u);
+  });
+
+  it("notifications/initialized 补发失败不改判：就绪事实由 200+会话头确立", async () => {
+    const ctx = makeCtx();
+    applyTo(ctx, { transport: "cli" });
+    ctx.shell.serverReady = true;
+    ctx.shell.serverProbeNoticeThrows = true;
+    const root = ws("bg-notice-throw");
+    ctx.shell.runResults.push(okRun("hits: 1"));
+    const out = (await backgroundSearch(ctx, root)) as { text: string };
+    assert.match(out.text, /hits/u);
+    assert.match(String(ctx.shell.resolveCalls[0]?.command), /--refresh background/u);
   });
 
   it("守护进程就绪：background 照常下发 --refresh background（CLI 档；auto 档此时走 MCP，见传输判定组）", async () => {
@@ -7199,6 +7440,8 @@ describe("传输判定与 MCP lane", () => {
       row.command.startsWith(SERVER_START_COMMAND),
     );
     assert.equal(startCall?.command, "zg --server on --listen 127.0.0.1:17999");
+    // 就绪探测跟的是同一个自定义端点（比旧 CLI 判据更正确：--check-ready 不认 --listen）。
+    assert.equal(ctx.shell.serverProbeCalls[0]?.url, "http://127.0.0.1:17999/mcp");
     vi.unstubAllGlobals();
   });
 

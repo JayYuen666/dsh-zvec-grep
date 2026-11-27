@@ -105,6 +105,12 @@ export interface ZvecGrepMessages {
   readonly runnerFailed: string;
   /** 沙箱策略拒绝一次文件操作：`{facts}` 沙箱事实。 */
   readonly sandboxDenied: string;
+  /**
+   * 会话沙箱策略解析失败、本次 zg 子进程没带策略（0.1.20）：`{detail}` 是 resolve 抛出的
+   * 原始错误文本。作为成功结果尾注出现——检索照常出结果，但写入工作区可能被宿主默认
+   * 策略拒绝，这一事实必须对模型可见。
+   */
+  readonly sandboxPolicyDegradedNote: string;
   /** 超长错误首尾各留一段：`{head}`、`{tail}`。 */
   readonly detailMiddle: string;
   /** 执行超时（--refresh wait 的代价与出路）。 */
@@ -459,6 +465,8 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
     runnerFailed:
       "zg 未执行：沙箱 runner 启动失败{facts}。请检查沙箱后端配置（这与 zg 是否安装无关）。",
     sandboxDenied: "沙箱策略拒绝了一次文件操作{facts}",
+    sandboxPolicyDegradedNote:
+      "注：会话沙箱策略解析失败，本次 zg 子进程未带策略运行（写入工作区可能被宿主默认策略拒绝）：{detail}",
     detailMiddle: "{head} …[中间省略]… {tail}",
     timeoutFailure:
       "zg 执行超时：检索默认带 --refresh wait（同步刷新既有索引），大型工作区可能耗时过长。" +
@@ -813,6 +821,9 @@ export const MESSAGES: MessagesCatalog<ZvecGrepMessages> = {
       "zg never ran: the sandbox runner failed to start{facts}. Check the sandbox backend " +
       "configuration (this is unrelated to whether zg is installed).",
     sandboxDenied: "the sandbox policy denied a file operation{facts}",
+    sandboxPolicyDegradedNote:
+      "note: the session sandbox policy failed to resolve, so this zg subprocess ran without it " +
+      "(workspace writes may be denied by the host default policy): {detail}",
     detailMiddle: "{head} …[middle omitted]… {tail}",
     timeoutFailure:
       "zg timed out: search defaults to --refresh wait (it refreshes the existing index " +

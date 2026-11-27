@@ -12,8 +12,9 @@
 //      transport 档选传输：auto = daemon 就绪走 MCP（HTTP 直调守护进程，见
 //      lib/daemon-client.ts）、缺席落回 CLI；cli = 恒 CLI spawn；mcp = 恒 MCP、daemon 缺席
 //      由插件拉起。CLI spawn 的 --mode 取部署值 clientMode（缺省 auto：守护进程就绪走
-//      server、缺席由 zg 静默落回 direct），故本包另按 TTL 缓存 `zg --server status
-//      --check-ready` 的退出码，把这一档显式化并统一处理 refresh=background（见
+//      server、缺席由 zg 静默落回 direct），故本包另按 TTL 缓存对 daemonUrl 的一次
+//      MCP initialize 握手结果（HTTP 200 = 就绪，判据不受 PID-namespace 沙箱影响），
+//      把这一档显式化并统一处理 refresh=background（见
 //      createZgServerGate 与 backgroundSupportFor）。
 //   3. 注册 systemPrompt 硬规则段（routing，order 1550）+ tools.guard 安全兜底
 //      + search-first 门禁（工作区已建索引时 grep/rg 前必须先 zg_search，
@@ -86,6 +87,10 @@ import type { SessionStore, SessionHeader } from "@deepseek-ai/dsh-session";
 // dsh-shell 的执行词表直接用它交出的类型名；SystemPrompt / TimerService 是
 // cordis Service 类（private/protected 字段 → 名义比较），只能经 Pick<> 取方法子集投影。
 import type { ShellExecutor, ShellRunResult } from "@deepseek-ai/dsh-shell";
+// 只为类型（type-only，产物零运行时引用）：dsh-sandbox-policy 声明了
+// `Context.sandboxPolicy` 服务与 resolve({session}) 的返回类型。运行时服务由宿主注入，
+// host.get("sandboxPolicy") 拿不到就整段降级，不产生值依赖。
+import type { SandboxPolicyService } from "@deepseek-ai/dsh-sandbox-policy";
 import type { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 // 官方内容块（type-only：dsh-tools 自己也从这里取 ContentBlock，值导入会破坏 host.js 自包含）。
 // 只取 TextBlock 而不是 ContentBlock——理由见 textBlock 的注释。
@@ -129,7 +134,7 @@ import {
   INDEX_DIR_NAME,
   WORKSPACE_MANIFEST_FILE,
 } from "./lib/routing.ts";
-import type { GuardExecution } from "./lib/routing.ts";
+import type { GuardExecution, OfficialSession } from "./lib/routing.ts";
 // 判据层（解锁额度的形状与 root 归一化）定义在 lib/search-predicates.ts：宿主既按索引根建
 // 解锁表的键，也持有额度记录，取的都是判据侧而不是门禁编排侧。
 import { normalizeRoot, pathsRelated } from "./lib/search-predicates.ts";
@@ -336,6 +341,24 @@ export interface Config {
  *  增量永远不会再出现）语义都在官方 d.ts 里有原文。
  */
 type ShellService = Pick<ShellExecutor, "resolve" | "execute">;
+
+/**
+ * 一次会话沙箱策略（`SandboxPolicyService.resolve({session})` 的返回值）。会话的不可变
+ * cwd 成为 workspace-write 边界（写入边界跟着会话走，而不是跟着部署默认值走），运行期
+ * `registerWritableRoot` 的授权在 resolve 时快照进去。这里只经 `ReturnType` 取形状，
+ * 不重述官方字段——与上面 ShellService 的投影规则同一条。
+ */
+type SandboxPolicy = ReturnType<SandboxPolicyService["resolve"]>;
+
+/**
+ * `sandboxPolicyOf` 交回的一对值：`policy` 交给 `shell.resolve` 的 `sandboxPolicy` 字段
+ * （undefined = 不带字段，宿主回落到自己的默认链）；`degradedNote` 是 resolve 抛错时
+ * 「本次没带策略」这一事实的可读说明，随成功结果尾部附上（失败路径自有原文，不重复叠加）。
+ */
+interface SessionSandbox {
+  policy: SandboxPolicy | undefined;
+  degradedNote: string | undefined;
+}
 
 /**
  * 官方 ToolRuntime（installed `@deepseek-ai/dsh-tools/lib/types/index.d.ts` 里的
@@ -805,50 +828,124 @@ function createZgVersionGate(
 // 存在**。旧版本把这一整档能力差摊成了「检索超时给 5 分钟」和「改动搜不到」两条使用限制，
 // 却没有任何一处告诉使用者症结在哪。
 //
-// 就绪判据取上游自己的退出码：`zg --server status --check-ready` 就绪时正常退出、未就绪时
-// 以「Error: server is not ready」非零退出（实测原文；main 统一按退出码 1）。
-// 读 stdout 文本不行——那里是给人看的状态表，格式不在本包的依赖契约里。
+// 就绪判据是对 daemonUrl 做一次 MCP initialize 握手：HTTP 200 = 就绪，401/网络错/超时
+// 一律未就绪。为什么弃用 `zg --server status --check-ready`：那发 CLI 的判据链含 PID
+// 可见性——DSH 沙箱（bwrap --unshare-pid）里宿主 PID 不可见，活着、端口正常应答的
+// daemon 会被它判成 not ready（退出码恒 1），mcp 档于是反复拉起撞端口、auto 档被误判
+// 拖去 CLI 冷加载；网络栈不受 PID namespace 隔离，裸 fetch 实测 91ms 拿到应答（这是
+// --check-ready 唯一已知的失真场景）。`zg_status` 的 `--check-ready` 透传保留不动：
+// 那是给人看的诊断输出，不是判定输入。
+//
+// 判据取「initialize 握手 200 + mcp-session-id 应答头」而不是「端口可连」：后者会把任何
+// 占了 7999 的进程误判成 daemon，前者与 lib/daemon-client.ts 的 MCP 调用同源——对端不是
+// 预期的 MCP HTTP 面就不算就绪。401 明确算未就绪（token 不匹配时 MCP 调用必 401，判 ready
+// 是自欺）。
+// 探测请求形态与 lib/daemon-client.ts 的 initialize 同款但不 import 它——探测要独立于
+// 会话池（无会话状态、独立超时），且 daemon-client 的握手绑会话生命周期。
 //
 // **探测失败一律按未就绪**，且绝不影响别的通道：daemon 起不来时 `wait`/`off` 与穷举检索照旧
 // 能用，本包只是不再接受 `background` 这一档，并把这件事说清楚。
 
 /** 就绪态缓存时长：daemon 可被随时 `zg --server on/off` 起停，比版本探测勤得多。 */
 const SERVER_READY_TTL_MS = 60_000;
-/** 探测自身超时：`zg --server status` 是纯读，不该借检索超时。 */
+/** 探测自身超时：initialize 握手是纯读，不该借检索超时。语义与旧 CLI 探测不同——旧 10s 是
+ * 子进程墙钟（超时后 kill 收尾），新 10s 是 AbortSignal（超时后 abort 掉 fetch 本身）。 */
 const SERVER_READY_PROBE_TIMEOUT_MS = 10_000;
-/** 就绪探测命令行（0.3.0 旗标形态）：`--check-ready` 把「就绪与否」表达成退出码。 */
-const SERVER_READY_COMMAND = "zg --server status --check-ready";
+
+/**
+ * 就绪探测的 fetch 入口：缺省 undefined = 每次探测现取全局 fetch。不用 apply 期绑定，
+ * 是为了让测试能整条替换网络层（`setServerProbeFetch`）；生产路径零差异——同走 Node
+ * 全局 fetch，与 lib/daemon-client.ts 同款，不引入新依赖。
+ */
+let serverProbeFetch: typeof fetch | undefined;
+
+/**
+ * 仅测试使用：替换/还原就绪探测的 fetch（host.ts 单测不经真网络）。生产代码不调用；
+ * 传 undefined 还原为全局 fetch。
+ */
+export function setServerProbeFetch(impl: typeof fetch | undefined): void {
+  serverProbeFetch = impl;
+}
 
 /** 守护进程就绪门槛的执行上下文。 */
 interface ZgServerGate {
-  /** 就绪返回 true；未就绪、探测不出来、zg 没装都返回 false。**从不抛错**。 */
+  /** 就绪返回 true；未就绪、探测不出来（网络错/超时/非 200/401）都返回 false。**从不抛错**。 */
   ready: () => Promise<boolean>;
   /** 清空就绪缓存：插件自启 daemon 后立即重探，不等 TTL 走完。 */
   invalidate: () => void;
 }
 
-/** 探一次守护进程就绪态：退出码 0 = 就绪。任何异常与非零退出都算未就绪。
- *  注：插件自启的 daemon 带自生成 token，探测命令必须带上同一枚，否则 401 会被
- *  误读成「未就绪」并触发重复拉起。 */
+/**
+ * 探一次守护进程就绪态：对 daemonUrl 发 MCP initialize 握手，HTTP 200 = 就绪。
+ * 任何异常（网络错、超时 abort）与任何非 200（含 401：有内存 token 时凭据不匹配
+ * 算未就绪）都算未就绪——拉起流程与恢复文案照旧走 daemonStartFailed 那一侧。
+ * 注：插件自启的 daemon 带自生成 token，探测必须带同一枚 Bearer，否则 401 会被
+ * 误读成「未就绪」并触发重复拉起（四路同源纪律见 createDaemonHandle 头注）。
+ */
+/** 消费/释放应答 body，防止 SSE 200 长应答钉住连接；无 body（202 等）则无事可做。 */
+async function drain(res: Response): Promise<void> {
+  try {
+    await res.body?.cancel();
+  } catch {
+    // cancel 失败（连接已断/已消费）不是判据：释放失败不影响就绪判定。
+  }
+}
+
 async function probeServerReady(
-  host: HostCtx,
-  config: Config,
+  daemonUrl: string,
   tokenOf: () => string | undefined,
 ): Promise<boolean> {
+  const signal = AbortSignal.timeout(SERVER_READY_PROBE_TIMEOUT_MS);
   try {
     const token = tokenOf();
-    const env = zgEnv(config, token === undefined ? undefined : { ZVEC_GREP_SERVER_TOKEN: token });
-    // workdir 取系统临时目录：与工作区无关的纯读探测，不该因为某个会话的目录不存在而失败。
-    const spec = host.shell.resolve({
-      command: SERVER_READY_COMMAND,
-      workdir: tmpdir(),
-      timeoutMs: SERVER_READY_PROBE_TIMEOUT_MS,
-      stdoutMaxBytes: config.stdoutMaxBytes,
-      ...(env ? { env } : {}),
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      ...(token === undefined ? {} : { Authorization: `Bearer ${token}` }),
+    };
+    const res = await (serverProbeFetch ?? globalThis.fetch)(daemonUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 0,
+        method: "initialize",
+        params: {
+          // 协议版本与 lib/daemon-client.ts 的 PROTOCOL_VERSION 同值（"2025-06-18"，
+          // 上游实测接受）；独立抄一份而不是 import——本函数刻意不依赖 daemon-client。
+          protocolVersion: "2025-06-18",
+          capabilities: {},
+          clientInfo: { name: "dsh-zvec-grep-readiness-probe", version: "0.0.0" },
+        },
+      }),
+      signal,
     });
-    const execution = await host.shell.execute(spec);
-    const result = await execution.result();
-    return result.exitCode === 0;
+    // SSE 200 应答的 body 不消费就会钉住连接——判定期统一 cancel，收尾不做第二判据。
+    await drain(res);
+    if (res.status !== 200) {
+      return false;
+    }
+    // 头校验与 lib/daemon-client.ts 的 initialize 同源：无 mcp-session-id 的 200 说明
+    // 对端不是预期的 MCP HTTP 面（daemon-client 侧同为硬失败），不算就绪。
+    const sessionId = res.headers.get("mcp-session-id");
+    if (sessionId === null) {
+      return false;
+    }
+    // 补发 notifications/initialized（202 即可、不期待应答），避免每发一次探测就在
+    // daemon 侧遗留一条半开会话。失败不改判：就绪事实由上面 200+会话头确立。
+    try {
+      await drain(
+        await (serverProbeFetch ?? globalThis.fetch)(daemonUrl, {
+          method: "POST",
+          headers: { ...headers, "mcp-session-id": sessionId },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+          signal,
+        }),
+      );
+    } catch {
+      // 初始化通知发不出去不影响就绪判定（探测结论已确立）；半开会话由 daemon 侧超时收。
+    }
+    return true;
   } catch {
     return false;
   }
@@ -857,14 +954,10 @@ async function probeServerReady(
 /**
  * 建这道门槛。缓存挂闭包（随 apply 生死），TTL 到期后重探。
  *
- * **并发不合并**：两条检索同时撞上 TTL 边界会各探一次，多起一发纯读进程而已——
+ * **并发不合并**：两条检索同时撞上 TTL 边界会各探一次，多发一发纯读 HTTP 而已——
  * 换来的是没有「在途 Promise 该不该共享」这层状态可测（与版本下限同一种做法）。
  */
-function createZgServerGate(
-  host: HostCtx,
-  config: Config,
-  tokenOf: () => string | undefined,
-): ZgServerGate {
+function createZgServerGate(daemonUrl: string, tokenOf: () => string | undefined): ZgServerGate {
   let cachedAt = 0;
   let cachedReady = false;
   let probed = false;
@@ -874,7 +967,7 @@ function createZgServerGate(
       if (probed && now - cachedAt < SERVER_READY_TTL_MS) {
         return cachedReady;
       }
-      cachedReady = await probeServerReady(host, config, tokenOf);
+      cachedReady = await probeServerReady(daemonUrl, tokenOf);
       cachedAt = now;
       probed = true;
       return cachedReady;
@@ -894,9 +987,10 @@ function createZgServerGate(
  * 才是用户显式同意过的行为。
  *
  * token 纪律：只在插件自启时生成（crypto.randomBytes，仅存本插件内存），同一位经
- * env 喂给所有 CLI lane 子进程（含探测）、经 Bearer 喂给 MCP 调用——四路必须同源，
- * 否则 CLI 走 server 模式就会撞 401。用户自己起的 daemon（默认无鉴权）本插件不生成、
- * 不下发任何 token。已知限制写在 daemonStartFailed 文案里：插件重启后 token 失忆。
+ * env 喂给所有 CLI lane 子进程、经 Bearer 喂给就绪探测（HTTP initialize）与 MCP 调用
+ * ——四路必须同源，否则 CLI 走 server 模式与探测/MCP 都会撞 401。用户自己起的 daemon
+ * （默认无鉴权）本插件不生成、不下发任何 token。已知限制写在 daemonStartFailed 文案里：
+ * 插件重启后 token 失忆。
  */
 interface DaemonHandle {
   /** 仅插件自启 daemon 后非空；CLI lane env 与 MCP Bearer 同源。 */
@@ -1168,6 +1262,20 @@ class RebuildLockBusyError extends ZgToolError {
   }
 }
 
+/**
+ * 把策略降级说明拼进成功结果的注脚序列（0.1.20）：降级说明放最前（它是「这次结果怎么
+ * 来的」的限定），命中摘要照旧殿后。单独成函数除了可读性，还把两个条件分支移出
+ * runForegroundOnce——那个函数的圈复杂度已贴着上限。
+ */
+function withDegradedNote(
+  degradedNote: string | undefined,
+  summary: string | null,
+  notes: string[],
+): string[] {
+  const extras = degradedNote === undefined ? [] : [degradedNote];
+  return summary === null ? [...extras, ...notes] : [...extras, ...notes, summary];
+}
+
 async function runForegroundOnce(
   host: HostCtx,
   command: string,
@@ -1188,6 +1296,15 @@ async function runForegroundOnce(
      * 不吸收的返回 null 就照旧抛错，超时/中止/沙箱拒绝/锁忙仍各走原来的分支。
      */
     resolveFailure?: ((failure: string, result: ShellRunResult) => string | null) | undefined;
+    /**
+     * 会话沙箱策略（0.1.20）：按这次工具调用的 exec 现取（见 runtime.sandboxPolicyOf），
+     * undefined = 宿主没有 sandboxPolicy 服务、这次调用没有会话、或 resolve 降级——
+     * 三种情况都不带字段，宿主回落自己的默认策略链（与官方 bash 工具的
+     * `sandboxPolicy: request.sandboxPolicy ?? ctx.sandboxPolicy.resolve()` 回落顺序一致）。
+     */
+    sandboxPolicy?: SandboxPolicy | undefined;
+    /** 策略解析降级的事实说明；仅在成功路径尾部追加一句，让「没带策略」可见。 */
+    sandboxDegradedNote?: string | undefined;
   },
 ): Promise<string> {
   const spec = host.shell.resolve({
@@ -1197,6 +1314,7 @@ async function runForegroundOnce(
     stdoutMaxBytes: opts.stdoutMaxBytes,
     signal: opts.signal,
     ...(opts.env ? { env: opts.env } : {}),
+    ...(opts.sandboxPolicy ? { sandboxPolicy: opts.sandboxPolicy } : {}),
   });
   const exec = await host.shell.execute(spec);
   const result = await exec.result();
@@ -1242,7 +1360,7 @@ async function runForegroundOnce(
     opts.summaryLimit === undefined
       ? null
       : hitSummary(text, opts.summaryLimit, result.stdout.truncated, opts.messages);
-  const extras = summary === null ? notes : [...notes, summary];
+  const extras = withDegradedNote(opts.sandboxDegradedNote, summary, notes);
   return extras.length > 0 ? `${text}\n${extras.join("\n")}` : text;
 }
 
@@ -1321,6 +1439,9 @@ async function runForeground(
     rebuildWait?: { root: string; rebuilds: RebuildRegistry; maxWaitMs: number };
     /** 失败返回路径的旁路（语义见 runForegroundOnce 的同名项），转发给每一次执行尝试。 */
     resolveFailure?: ((failure: string, result: ShellRunResult) => string | null) | undefined;
+    /** 会话沙箱策略与降级说明（语义见 runForegroundOnce 的同名项），转发给每一次执行尝试。 */
+    sandboxPolicy?: SandboxPolicy | undefined;
+    sandboxDegradedNote?: string | undefined;
   },
 ): Promise<string> {
   const base = {
@@ -1330,6 +1451,8 @@ async function runForeground(
     messages: opts.messages,
     summaryLimit: opts.summaryLimit,
     resolveFailure: opts.resolveFailure,
+    sandboxPolicy: opts.sandboxPolicy,
+    sandboxDegradedNote: opts.sandboxDegradedNote,
   };
   const wait = opts.rebuildWait;
   if (wait === undefined) {
@@ -2221,6 +2344,20 @@ interface PluginRuntime {
    * 「表里没有即拒绝」这条边界不需要任何类型断言撑着。与 jobsOf 同一理由提到 runtime。
    */
   records: Map<string, RebuildRecord>;
+  /**
+   * 按一次工具执行现取会话沙箱策略（0.1.20）：`host.get("sandboxPolicy")` 服务在场且该次
+   * 执行带有会话时，`resolve({session})` 交回的策略让 zg 子进程的 workspace-write 边界
+   * 跟着会话 cwd 走（否则子进程按部署默认策略被 Landlock 圈成只读，写
+   * `.zvec-grep/locks/write-intent` 直接 os error 30）。对照官方 bash 工具的回落链
+   * `sandboxPolicy: request.sandboxPolicy ?? ctx.sandboxPolicy.resolve()`——本包在
+   * 「服务缺席 / 无会话 / resolve 抛错」三种情况下都不带字段并降级（降级事实进
+   * degradedNote），**不**像 bash 那样抛错：检索可用性优先于策略精确性。
+   *
+   * 每次调用现读服务、不缓存：官方服务在宿主侧可热替换，快照旧引用比少一次 get 更危险。
+   * 只影响 CLI 通道的 shell.resolve；版本/就绪探测（tmpdir 只读探测）、daemon 拉起与
+   * 设置卡重建路径**不**带策略（后者由 additionalWritableRoots 缓解，见 plan）。
+   */
+  sandboxPolicyOf: (exec: GuardExecution) => SessionSandbox;
 }
 
 /** 工具参数的返回类型：从本包 ToolSpec 投影，不重述官方 JSON Schema 形状。 */
@@ -2609,6 +2746,9 @@ async function runSearchTool(
     await backgroundSupportFor(runtime, args["refresh"], mode, channel === "indexed"),
   );
   // 超时/stdout 上限是部署值：现读 Config（非 volatile 普通值，行 config 可改）。
+  // 会话沙箱策略按这次 exec 现取（0.1.20）：CLI lane 的 zg 子进程 workspace-write 边界
+  // 跟会话 cwd 走，降级时由 degradedNote 在成功尾部说明（见 sandboxPolicyOf）。
+  const sandbox = runtime.sandboxPolicyOf(exec);
   const raw = await runForeground(host, command, workdir, config.searchTimeoutMs, {
     signal: exec.signal,
     env: zgEnv(config, runtime.daemonEnv()),
@@ -2617,6 +2757,8 @@ async function runSearchTool(
     // 命中摘要（仅 search）：limit 用与命令同一取值规则（省略回默认、越界拒绝），摘要规则与实际请求一致。
     // 穷举模式的输出没有 `hits:` 计数行，摘要会按「不数就不谎称」自动不出——不必特判。
     summaryLimit: resolveLimit(searchArgs.limit, messages),
+    sandboxPolicy: sandbox.policy,
+    sandboxDegradedNote: sandbox.degradedNote,
     // 重建感知：同根正在重建时等它落定后重试一次，而不是把该根的检索通道整个关掉。
     rebuildWait: {
       root: resolvedRoot,
@@ -2713,10 +2855,17 @@ function indexToolParameters(registered: ZvecGrepMessages): ToolParameters {
 async function startBackgroundIndex(
   runtime: PluginRuntime,
   root: string,
-  indexArgs: IndexArgs,
-  messages: ZvecGrepMessages,
-  claimed: ActiveRebuild,
+  job: {
+    indexArgs: IndexArgs;
+    messages: ZvecGrepMessages;
+    claimed: ActiveRebuild;
+    // 发起方的会话沙箱策略（0.1.20）：后台索引进程写 .zvec-grep 的边界同样要跟会话走。
+    // 降级说明不进后台路径——它是异步作业，说明无处可靠地附回发起对话，策略缺席时行为与
+    // 宿主默认链一致即可。
+    sandboxPolicy: SandboxPolicy | undefined;
+  },
 ): Promise<{ text: string }> {
+  const { indexArgs, messages, claimed, sandboxPolicy } = job;
   const routes: IndexWriteRoutes = {
     host: runtime.host,
     platform: runtime.platform,
@@ -2738,7 +2887,7 @@ async function startBackgroundIndex(
     throw new ZgToolError(ZG_TOOL_ERROR_CODES.daemonUnavailable, messages.endpointJobsUnavailable);
   }
   const embedding = readDefaultEmbedding(runtime.config);
-  const spawned = await spawnIndexWrite(routes, messages, indexArgs, embedding);
+  const spawned = await spawnIndexWrite(routes, messages, indexArgs, embedding, sandboxPolicy);
   if ("error" in spawned) {
     runtime.rebuilds.release(root, claimed);
     throw new ZgToolError(ZG_TOOL_ERROR_CODES.commandFailed, spawned.error);
@@ -2774,6 +2923,8 @@ async function runIndexTool(
   trackObservedRoot(ledger, exec);
   const root = rootOf(args, exec, messages, ledger, runtime.platform);
   const indexArgs: IndexArgs = { ...args, root, platform: runtime.platform };
+  // 会话沙箱策略按这次 exec 现取（0.1.20）：前台与后台两条索引路径共用同一份取值。
+  const sandbox = runtime.sandboxPolicyOf(exec);
   // 重建同样要与设置卡那条路径共用一份占位：两条入口各判各的，就会各起一条 zg，
   // 而 zg 对同根的并发写锁是直接失败的——后一条秒退还被报成「索引失败」。
   // 增量与删索引不占位：它们不重写整棵树，与重建互不排斥。
@@ -2802,7 +2953,12 @@ async function runIndexTool(
       return { text: fill(messages.indexRebuildInFlight, { root }) };
     }
     if (background) {
-      return startBackgroundIndex(runtime, root, indexArgs, messages, claimed);
+      return startBackgroundIndex(runtime, root, {
+        indexArgs,
+        messages,
+        claimed,
+        sandboxPolicy: sandbox.policy,
+      });
     }
     foregroundClaim = claimed;
   }
@@ -2827,6 +2983,8 @@ async function runIndexTool(
       env: zgEnv(config, runtime.daemonEnv()),
       stdoutMaxBytes: config.stdoutMaxBytes,
       messages,
+      sandboxPolicy: sandbox.policy,
+      sandboxDegradedNote: sandbox.degradedNote,
     });
     // 前台 zg_index 落定（建/重建/drop 都真删真建 .zvec-grep/）：该根的探测缓存当场
     // 失效——`result: true` 的条目若只等 TTL 过期，60 秒内门禁仍按「已建索引」拦
@@ -2902,11 +3060,15 @@ async function runStatusTool(
     messages,
     readClientMode(config, messages),
   );
+  // 会话沙箱策略按这次 exec 现取（0.1.20）：状态查询写 write-intent 锁，同样需要边界。
+  const sandbox = runtime.sandboxPolicyOf(exec);
   const text = await runForeground(host, command, workdir, config.statusTimeoutMs, {
     signal: exec.signal,
     env: zgEnv(config, runtime.daemonEnv()),
     stdoutMaxBytes: config.stdoutMaxBytes,
     messages,
+    sandboxPolicy: sandbox.policy,
+    sandboxDegradedNote: sandbox.degradedNote,
     // 与检索同一套等待：重建恰在这次查询前落定时，不必让模型看到一次无意义的失败。
     rebuildWait: { root, rebuilds, maxWaitMs: config.rebuildWaitMs },
     // `--check-ready` 的非零退出码**就是**答案：就绪报告仍在 stdout 上，走普通失败路径会
@@ -3169,7 +3331,7 @@ function apply(ctx: Context, config: Config): void {
   const daemonUrl = readDaemonUrl(config.daemonUrl, localeMessages());
   const tokenFile = tokenFilePath();
   const versionGate = createZgVersionGate(host, config, tokenOf);
-  const serverGate = createZgServerGate(host, config, tokenOf);
+  const serverGate = createZgServerGate(daemonUrl, tokenOf);
   const runtime: PluginRuntime = {
     host,
     platform,
@@ -3207,6 +3369,32 @@ function apply(ctx: Context, config: Config): void {
       const found =
         sessions === undefined ? undefined : sessions.list().find((entry) => entry.id === id);
       return found === undefined ? undefined : { parentSession: found.header.parentSession };
+    },
+    // 会话沙箱策略（0.1.20）：服务每次现读（可热替换，见接口注释）；resolve 只在
+    // SandboxInvalidRootError（会话 cwd 相对/NUL）这类输入病上抛错——那按降级处理并
+    // 把事实写进 degradedNote，检索继续走宿主默认策略链。agentless 执行（本包测试桩、
+    // 远程读取接口）没有会话，同样不带字段。
+    sandboxPolicyOf: (exec: GuardExecution): SessionSandbox => {
+      const service: SandboxPolicyService | undefined = host.get("sandboxPolicy");
+      const session = exec.agent?.session;
+      if (service === undefined || session === undefined) {
+        return { policy: undefined, degradedNote: undefined };
+      }
+      try {
+        // SessionFace（加宽替身）→ 官方 Session 是引用收窄：运行时对象就是宿主交来的
+        // 那个 session 实例，品牌差异只在编译期（同 sessionHeaderCwd 的读法理由）。
+        return {
+          // oxlint-disable-next-line typescript/no-unsafe-type-assertion -- 加宽替身收窄回官方名义类型：值就是宿主交来的同一实例，见上一行注释
+          policy: service.resolve({ session: session as unknown as OfficialSession }),
+          degradedNote: undefined,
+        };
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          policy: undefined,
+          degradedNote: fill(localeMessages().sandboxPolicyDegradedNote, { detail }),
+        };
+      }
     },
   };
 

@@ -216,7 +216,9 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读取接口的跨件契�
   }, 60_000);
 
   it("启动读取接口：白名单与绝对路径判据都过 ⇒ 真起一条后台作业进官方注册表", async () => {
-    const host = await startHost();
+    // sandboxPolicy: true 让「设置卡路径不带策略」成为**刻意**行为的负断言：服务在场
+    // （会话路径会带），这条 spawn 仍不带（用户侧决策：卡路径由 additionalWritableRoots 缓解）。
+    const host = await startHost({ sandboxPolicy: true });
     const ws = observedWorkspace(cleanups);
     try {
       await observe(ws, host);
@@ -236,6 +238,7 @@ describe.skipIf(!zgAvailable())("真实宿主：重建读取接口的跨件契�
       assert.ok(spawn !== undefined);
       assert.equal(spawn.request.timeoutMs, undefined);
       assert.equal(spawn.request.onExpiry, "none");
+      assert.strictEqual(spawn.request.sandboxPolicy, undefined, "设置卡重建路径不带会话策略");
       expect(spawn.spec.workdir).toBe(ws);
 
       const settled = await waitSettled(host, jobId, Date.now() + 60_000);

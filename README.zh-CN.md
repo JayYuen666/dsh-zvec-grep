@@ -12,7 +12,7 @@
   <a href="https://github.com/JayYuen666/dsh-zvec-grep/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JayYuen666/dsh-zvec-grep/ci.yml?branch=main&style=flat-square&label=ci" alt="ci" /></a>
   <img src="https://img.shields.io/badge/license-MIT-4c1?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/badge/node-%5E24.22.3%7C%7C%3E%3D26.13.1-4c1?style=flat-square&logo=nodedotjs&logoColor=white" alt="node" />
-  <img src="https://img.shields.io/badge/dsh-%5E0.2.3--alpha.2-658EFF?style=flat-square" alt="dsh" />
+  <img src="https://img.shields.io/badge/dsh-%5E0.2.2--rc.2-658EFF?style=flat-square" alt="dsh" />
   <a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://img.shields.io/badge/powered_by_dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white" alt="powered by dsh" /></a>
 </p>
 
@@ -79,8 +79,8 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 卸载用 `dsh plugin --profile web remove @jayyuen66/dsh-zvec-grep`。包在公共 npm registry 上，不需要凭据，也不需要 scoped-registry 配置行。
 
 - **Node.js `^24.22.3 || >=26.13.1`**（纯 ESM；正是这个下限让 `require()` 一枚 ESM 入口成为可能，`engines.node` 因此声明）。
-- **宿主 `dsh` 在 `0.2.3-alpha.2` 这条线上（含更晚的 `0.2.x`）。** 宿主读 `engines.dsh`（`^0.2.3-alpha.2`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.3-alpha.2` 的都通过宿主装载门；npm 的严格 peer 解析从 `0.2.3-alpha.2` 起算。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。
-- **按约定，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.3-alpha.2`），`devDependencies` 里的精确钉版才是防「第二份宿主类型」的编译期纪律——那不是宿主会去读的声明。
+- **宿主 `dsh` 在 `0.2.3-alpha.2` 这条线上（含更晚的 `0.2.x`）。** 宿主读 `engines.dsh`（`^0.2.2-rc.2 || ^0.2.3-alpha.2`）且**单独决定**——该字段在场时兼容性先于 `peerDependencies` 判定，prerelease 参与比较。`0.2.x` 里不低于 `0.2.3-alpha.2` 的都通过宿主装载门；npm 的严格 peer 解析从 `0.2.3-alpha.2` 起算。`0.3.0` 及以上需要风险授权 `dsh plugin --profile <p> allow-version <pkg>@<ver> --dsh-version <确切版本> --accept-risk`。支持窗口是滚动的：本包在发布时把窗口内的每个已发布宿主版本逐版取证（判据是宿主 `--dump-config` 里本包的层行；设置卡与它的命名空间调用另在发布基线上全量取证一次），窗口滚动后重新取证，不把这一句里的版本号当长期承诺。**仍在 `0.2.2-rc` 系宿主上的部署**：请固定 `@jayyuen66/dsh-zvec-grep@0.1.20`（rc 系窗口 `^0.2.2-rc.2`，即含会话沙箱策略修复的实发版）。
+- **按约定，`dependencies` 下不放任何 `@deepseek-ai/*`**（`test/publish-manifest.test.ts` 钉住）。profile 以 `nodeLinker: hoisted` 与 `autoInstallPeers: false` 安装，宿主包在那里会落成真实的第二份副本；`@deepseek-ai/dsh-tools` 用普通 `Symbol` 给调度器做键，那个 profile 里**每一次原生工具调用都抛错**，而构建、类型检查与覆盖率照绿。`@deepseek-ai/dsh*` 的 peer 写同一条支持窗口范围（`^0.2.2-rc.2 || ^0.2.3-alpha.2`），`devDependencies` 里的精确钉版才是防「第二份宿主类型」的编译期纪律——那不是宿主会去读的声明。
 - **值导入都是必需 peer。** `@deepseek-ai/schemastery` 是宿主 fork（只有它的 `resolve` 认 `.volatile()` 字段）；`@deepseek-ai/dsh-typert-protocol` 提供 `TypertRemoteService` 这个要 `extends` 的类；`@deepseek-ai/dsh-scope` 提供步骤准入判定用的 `scopeOf`；shared 的 `lib/text` 自己值导入 `@deepseek-ai/dsh-output-retention`。四者都落 peer 加同版精确钉的 devDependencies——缺一枚就是装载期 `ERR_MODULE_NOT_FOUND`，不是优雅降级。`dependencies` 里是 `@jayyuen66/dsh-plugin-shared` 与 `zod`（后者版本走伞根 catalog，供设置卡的 strict codec 校验）。
 - **随包发什么**：`host.js`、`client.js`、`cordis.patch.yml`、`icon.svg`、两份 README、`CHANGELOG.md`、`THIRD_PARTY_NOTICES.md`、`locale/zh.json` + `locale/en.json`、`docs/`（两份 DETAIL）。产物由 `prepack` 现产，不入库。
 
@@ -207,7 +207,7 @@ dsh plugin --profile web add @jayyuen66/dsh-zvec-grep
 - direct 与 server 是**两种能力**，不是快慢之分：direct 每次查询都冷加载 embedding 模型；增量刷新（watcher）、`refresh=background` 与常驻模型池只在 server 模式下存在。上游对 `auto` 只做就绪探测、不拉起 daemon。
 - 本包的拉起策略跟 `transport` 走：`auto` / `cli` 不拉；`mcp` 档会自启一个带随机 token 的 daemon（`zg --server on`，监听 `daemonUrl` 的 host:port，默认回环 7999），同一枚 token 经 env 喂给所有 CLI 子进程、经 Bearer 喂给 MCP 调用；卸载时用同一枚 token 执行 `zg --server off` 停掉**自己拉起**的那一个。用户自启的 daemon（默认无鉴权）本包只读就绪态，不会停它。token 持久化在 `<ZVEC_GREP_HOME 或 ~/.zvec-grep>/dsh-zvec-grep.token`（0600）：崩溃/重启或另一宿主能读回同一枚，并发冷启动经 O_EXCL 认领收敛到一枚，不会互相覆盖。
 - **多个 agent 可以同时检索。** 同一宿主内的冷启动合并成一发 `zg --server on`；共用 `ZVEC_GREP_HOME` 的多个宿主共用同一个 daemon（上游 `instance.lock`，重复启动退 0 并回同一个 PID）。每个并发工具调用各用一条 MCP 会话——同一条 zg 会话一次只处理一个 `tools/call`——空闲会话复用，agent 之间不排队。只有索引重建会占工作区写锁；检索最多等它 `rebuildWaitMs`（这是唯一的有界等待，不是启动等待）。不同 `ZVEC_GREP_HOME` 是不同 daemon，需各自配 `daemonUrl` 端口。
-- 就绪态按 60 秒 TTL 缓存 `zg --server status --check-ready` 的退出码（探测失败按未就绪统一处理，绝不外抛基础设施故障），据此统一处理 `refresh=background`，并在 `zg_status` 输出尾与卡片各回显一行。探测由 `roots()` 读取接口、`zg_status` 与 `backgroundSupportFor` 发出。
+- 就绪态按 60 秒 TTL 缓存一次对 `daemonUrl` 的 MCP initialize 握手（裸 HTTP POST，内存里有 token 时带 Bearer；HTTP 200 即就绪）的结果。网络错、超时或非 200（含 401——token 不匹配不算就绪）一律按未就绪统一处理，绝不外抛基础设施故障；据此统一处理 `refresh=background`，并在 `zg_status` 输出尾与卡片各回显一行。探测由 `roots()` 读取接口、`zg_status` 与 `backgroundSupportFor` 发出，且不经 shell 沙箱——PID-namespace 隔离下宿主 daemon 仍照常探到。
 - 卡片的 `serverReady` 在卡片层只可能是 `true` / `false`——探测失败按未就绪统一处理，就绪行恒渲染。`undefined` 只会出现在旧快照的 `roots()` 原始载荷里（那一次探测压根没跑），实时卡片把它折成 `false`。想手动起一个共享 daemon 就在终端里跑 `zg --server on`。
 
 ## <img src="https://api.iconify.design/lucide/network.svg?color=%23658EFF&height=22" height="22" width="22" align="absmiddle" alt="" /> 对外接口

@@ -38,6 +38,7 @@ import {
 import { ToolCallId as brandToolCallId } from "@deepseek-ai/dsh-llm";
 import { ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { ApprovalRequestEvent } from "@deepseek-ai/dsh-user-approval/types";
+import { SandboxPolicyService } from "@deepseek-ai/dsh-sandbox-policy";
 import { LocalJobRegistry } from "@deepseek-ai/dsh-jobs-local";
 import { LocalSubprocessRuntime } from "@deepseek-ai/dsh-subprocess-local";
 import { LocalBashExecutor } from "@deepseek-ai/dsh-bash-local";
@@ -91,7 +92,10 @@ export class StubSettings {
 /** 一枚会话替身：只带本包真正读的 `agent.session.header.cwd`（与 dsh-tool-fs-search 同模式）。 */
 function agentOf(cwd: string, id = "sess-1"): BatchAgent {
   // 本包只读 session.header.cwd；给的是官方 Agent 的最小投影，不是完整实现。
-  return { session: { id, header: { cwd } } } as unknown as BatchAgent;
+  // snapshotEvents 是 0.1.20 会话沙箱策略链（官方 SandboxPolicyService.resolve 的
+  // overrideOf 读会话的 sandbox/mode 事件）需要的最小面：替身恒报「无事件」，策略
+  // 随之落到部署默认档——这正是台架装载该服务时的配置（workspace-write）。
+  return { session: { id, header: { cwd }, snapshotEvents: () => [] } } as unknown as BatchAgent;
 }
 
 /** 官方批次里可选的 Agent 位（本包只读它的 session.header.cwd，用最小投影即可）。 */
@@ -147,6 +151,12 @@ export async function startHost(
     requireApprovalForExplicitRoot?: boolean;
     /** 一并装一枚审批服务（不装 = 宿主没有 approval，ask 由 dsh-tools fail-closed 成拒绝）。 */
     approval?: boolean;
+    /**
+     * 一并装官方 SandboxPolicyService（0.1.20 会话沙箱策略链；不装 = 宿主没有该服务，
+     * 插件按降级运行）。config 固定 `mode: workspace-write`——这里测的是「策略随会话走」，
+     * 不是部署默认档。
+     */
+    sandboxPolicy?: boolean;
   } = {},
 ): Promise<Host> {
   const spillDir = mkdtempSync(path.join(tmpdir(), "zg-spill-"));
@@ -180,6 +190,9 @@ export async function startHost(
     // 读不到 ⇒ 流水线的 ask 静默降级成拒绝。会话与投影都用官方件，不在台架里造替身。
     if (options.approval === true) {
       await load(ApprovalService, { policy: "never" });
+    }
+    if (options.sandboxPolicy === true) {
+      await load(SandboxPolicyService, { mode: "workspace-write" });
     }
     await load(LocalJobRegistry);
     await load(LocalSubprocessRuntime);
@@ -600,6 +613,28 @@ writeFileSync(${JSON.stringify(dumpFile)}, JSON.stringify({
   TERM: process.env.TERM ?? null,
 }));
 process.stdout.write("0.3.0\\n");
+`;
+  return installFakeBin(script).cleanup;
+}
+
+/**
+ * 一枚专测 **daemon 拉起请求形状** 的假 zg：`zg --server on` 成功应答（0.1.23 起就绪
+ * 判据是对 daemonUrl 的 HTTP initialize 握手，不再经 shell 的 `--check-ready`）。
+ * 就绪恒为否的唯一确定性来源是**消费者把 daemonUrl 钉到 127.0.0.1:9**——那一发的
+ * 握手吃 ECONNREFUSED；复用这枚假 zg 的前提就是 daemonUrl 必须指向一个不可达端点
+ * （指向默认 7999 时本机若真有 daemon 在跑，就绪会翻成 true，拉起路径根本不触发）。
+ * 于是 transport=mcp 的索引检索会真的走一遍 `runStartCommand`，随后就绪探测仍失败
+ * ⇒ daemonStartFailed；调用方要断言的是那条 `zg --server on` resolve 请求（尤其
+ * sandboxPolicy 位），不是检索结局。
+ */
+export function installDaemonStartZg(): () => void {
+  const script = `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv.includes("--version")) {
+  process.stdout.write("0.3.0\\n");
+  process.exit(0);
+}
+process.exit(0);
 `;
   return installFakeBin(script).cleanup;
 }
